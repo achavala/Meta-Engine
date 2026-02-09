@@ -62,6 +62,14 @@ def send_meta_email(
         logger.warning("Email not configured — set META_SMTP_USER, META_SMTP_PASSWORD, META_ALERT_EMAIL")
         return False
     
+    # Support multiple recipients (comma-separated)
+    if isinstance(recipient, str):
+        recipients = [r.strip() for r in recipient.split(",") if r.strip()]
+    elif isinstance(recipient, list):
+        recipients = recipient
+    else:
+        recipients = [str(recipient)]
+    
     try:
         msg = MIMEMultipart("mixed")
         
@@ -86,7 +94,7 @@ def send_meta_email(
             f"{datetime.now().strftime('%b %d %Y %I:%M %p ET')}"
         )
         msg["From"] = smtp_user
-        msg["To"] = recipient
+        msg["To"] = ", ".join(recipients)
         
         # === EMAIL BODY: Full .md report as HTML ===
         html_content = _build_full_html_email(summaries, report_md_path, chart_path)
@@ -146,9 +154,9 @@ def send_meta_email(
         with smtplib.SMTP(smtp_server, smtp_port, timeout=30) as server:
             server.starttls(context=context)
             server.login(smtp_user, smtp_password)
-            server.sendmail(smtp_user, recipient, msg.as_string())
+            server.sendmail(smtp_user, recipients, msg.as_string())
         
-        logger.info(f"✅ Email sent to {recipient} (HTML body + {'PDF + ' if pdf_attached else ''}chart)")
+        logger.info(f"✅ Email sent to {', '.join(recipients)} (HTML body + {'PDF + ' if pdf_attached else ''}chart)")
         return True
         
     except Exception as e:

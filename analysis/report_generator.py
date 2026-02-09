@@ -184,15 +184,58 @@ def generate_md_report(
         lines.append(f"> {s.get('summary', 'N/A')}")
         lines.append("")
 
-    # Conflict summaries
+    # Conflict summaries — DETAILED institutional resolution
     conflict_sums = summaries.get("conflict_summaries", [])
     if conflict_sums:
-        lines.append("### ⚠️ Conflict Zone Picks")
+        lines.append("### ⚡ Conflict Zone — Institutional Resolution")
         lines.append("")
         for s in conflict_sums:
             sym = s.get("symbol", "???")
-            lines.append(f"**{sym}**: {s.get('summary', 'N/A')}")
+            c_type = s.get("conflict_type", "Directional Divergence")
+            dominant = s.get("dominant_thesis", "N/A")
+            puts_sc = s.get("puts_score", 0)
+            moon_sc = s.get("moon_score", 0)
+            mws_sc = s.get("mws_score", 0)
+            cur_price = s.get("current_price", 0)
+            rsi_val = s.get("rsi", 0)
+            move_pct = s.get("recent_move_pct", 0)
+            bull_sens = s.get("bullish_sensors", 0)
+            bear_sens = s.get("bearish_sensors", 0)
+            exp_range = s.get("expected_range", [])
+            recs = s.get("recommendations", {})
+            
+            lines.append(f"#### ⚡ {sym} — {c_type}")
             lines.append("")
+            lines.append(f"| Metric | PutsEngine (Bear) | Moonshot (Bull) |")
+            lines.append(f"|--------|-------------------|-----------------|")
+            lines.append(f"| Score | {puts_sc:.2f} | {moon_sc:.2f} |")
+            lines.append(f"| Current Price | ${cur_price:.2f} | ${cur_price:.2f} |")
+            lines.append(f"| RSI | {'Overbought' if rsi_val > 65 else 'Neutral' if rsi_val > 35 else 'Oversold'} ({rsi_val:.1f}) | {'Overbought' if rsi_val > 65 else 'Neutral' if rsi_val > 35 else 'Oversold'} ({rsi_val:.1f}) |")
+            if mws_sc > 0:
+                lines.append(f"| MWS Score | — | {mws_sc:.0f}/100 |")
+                lines.append(f"| MWS Sensors | {bear_sens} bearish | {bull_sens} bullish |")
+            if move_pct != 0:
+                lines.append(f"| 5-Day Move | {move_pct:+.1f}% | {move_pct:+.1f}% |")
+            if exp_range and len(exp_range) >= 2:
+                lines.append(f"| Expected Range | ${exp_range[0]:.2f}–${exp_range[1]:.2f} | ${exp_range[0]:.2f}–${exp_range[1]:.2f} |")
+            lines.append(f"| **Dominant Thesis** | **{dominant}** | **{dominant}** |")
+            lines.append("")
+            
+            # Full narrative summary
+            lines.append(f"> {s.get('summary', 'N/A')}")
+            lines.append("")
+            
+            # Trading recommendations for each thesis
+            if recs:
+                lines.append("**Trading Recommendations:**")
+                lines.append("")
+                if recs.get("if_bullish"):
+                    lines.append(f"- 🟢 **If Bullish:** {recs['if_bullish']}")
+                if recs.get("if_bearish"):
+                    lines.append(f"- 🔴 **If Bearish:** {recs['if_bearish']}")
+                if recs.get("neutral_play"):
+                    lines.append(f"- ⚪ **Neutral/Theta:** {recs['neutral_play']}")
+                lines.append("")
 
     # Generated files
     lines.append("## 📁 Generated Files")

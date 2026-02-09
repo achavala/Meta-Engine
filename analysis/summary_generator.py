@@ -242,6 +242,240 @@ def generate_pick_summary(pick: Dict[str, Any], cross_analysis: Dict[str, Any] =
     return f"{sentence1} {sentence2} {sentence3}"
 
 
+def _build_conflict_resolution(
+    symbol: str,
+    puts_score: float,
+    moon_score: float,
+    cross_results: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Build institutional-grade conflict resolution for a ticker appearing in
+    both PutsEngine and Moonshot Top 10.
+    
+    Uses MWS sensor data, market data, and cross-analysis signals to determine:
+    1. WHY both engines flagged this ticker (not just that they did)
+    2. Which thesis is likely dominant in the 1-2 day timeframe
+    3. Specific trading recommendations for both sides
+    """
+    # Find the pick in both cross-analysis lists
+    puts_pick = None
+    moon_pick = None
+    
+    for p in cross_results.get("puts_through_moonshot", []):
+        if p["symbol"] == symbol:
+            puts_pick = p
+            break
+    
+    for m in cross_results.get("moonshot_through_puts", []):
+        if m["symbol"] == symbol:
+            moon_pick = m
+            break
+    
+    # Extract key data points
+    puts_signals = puts_pick.get("signals", []) if puts_pick else []
+    puts_engine_type = puts_pick.get("engine_type", "") if puts_pick else ""
+    moon_signals = moon_pick.get("signals", []) if moon_pick else []
+    puts_price = puts_pick.get("price", 0) if puts_pick else 0
+    moon_price = moon_pick.get("price", 0) if moon_pick else 0
+    
+    # MWS sensor data from puts cross-analysis
+    moonshot_cross = puts_pick.get("moonshot_analysis", {}) if puts_pick else {}
+    mws_score = moonshot_cross.get("mws_score", 0)
+    sensors = moonshot_cross.get("sensors", [])
+    expected_range = moonshot_cross.get("expected_range", [])
+    bullish_prob = moonshot_cross.get("bullish_probability", 0)
+    data_source = moonshot_cross.get("data_source", "")
+    
+    # PutsEngine cross-analysis from moonshot side
+    puts_cross = moon_pick.get("puts_analysis", {}) if moon_pick else {}
+    puts_risk = puts_cross.get("risk_level", "N/A")
+    puts_bearish_score = puts_cross.get("bearish_score", 0)
+    
+    # Market data (use whichever pick has it)
+    mkt = (puts_pick or moon_pick or {}).get("market_data", {})
+    current_price = mkt.get("price", moon_price or puts_price)
+    change_pct = mkt.get("change_pct", 0)
+    rsi = mkt.get("rsi", 50)
+    rvol = mkt.get("rvol", 1.0)
+    
+    # Analyze daily bars for recent price action
+    daily_bars = mkt.get("daily_bars", [])
+    
+    # Calculate recent move magnitude (last 5 bars)
+    recent_move_pct = 0
+    if len(daily_bars) >= 5:
+        close_5_ago = daily_bars[-5].get("c", 0)
+        latest_close = daily_bars[-1].get("c", 0)
+        if close_5_ago > 0:
+            recent_move_pct = ((latest_close - close_5_ago) / close_5_ago) * 100
+    
+    # Identify conflict pattern
+    puts_signals_str = " ".join(str(s).lower() for s in puts_signals)
+    moon_signals_str = " ".join(str(s).lower() for s in moon_signals)
+    
+    # Determine conflict type
+    if "pump_reversal" in puts_signals_str:
+        conflict_type = "Distribution Into Strength"
+        conflict_desc = (
+            f"PutsEngine detects a pump-reversal pattern (institutional selling "
+            f"into momentum rally), while Moonshot sees genuine momentum continuation. "
+            f"This is a classic 'smart money distribution into retail strength' setup."
+        )
+    elif "exhaustion" in puts_signals_str:
+        conflict_type = "Exhaustion vs Momentum"
+        conflict_desc = (
+            f"PutsEngine detects exhaustion signals (overextended move losing steam), "
+            f"while Moonshot sees continued momentum/catalyst drivers. "
+            f"The key question: is the momentum accelerating or decelerating?"
+        )
+    elif "gamma_drain" in puts_engine_type:
+        conflict_type = "Gamma Squeeze Unwind"
+        conflict_desc = (
+            f"PutsEngine detects gamma drain (options-driven reversal risk), "
+            f"while Moonshot sees options flow as bullish catalyst. "
+            f"This conflict often resolves violently — expect whipsaw action."
+        )
+    else:
+        conflict_type = "Directional Divergence"
+        conflict_desc = (
+            f"PutsEngine and Moonshot have fundamentally opposing views on direction. "
+            f"Market microstructure is divided between distribution and accumulation."
+        )
+    
+    # Extract sensor insights if MWS data available
+    sensor_summary = ""
+    bullish_sensors = 0
+    bearish_sensors = 0
+    if sensors:
+        for s in sensors:
+            sig = s.get("signal", "neutral")
+            if sig == "bullish":
+                bullish_sensors += 1
+            elif sig == "bearish":
+                bearish_sensors += 1
+        
+        # Key sensor highlights
+        key_sensors = []
+        for s in sensors:
+            name = s.get("name", "").replace("\U0001f3db\ufe0f", "").replace("\U0001f30a", "").replace("\u26a1", "").replace("\U0001f300", "").replace("\U0001f4ca", "").replace("\U0001f9e0", "").replace("\U0001f32a\ufe0f", "").strip()
+            score_val = s.get("score", 0)
+            sig = s.get("signal", "neutral")
+            key_sensors.append(f"{name} {score_val}/100 ({sig})")
+        sensor_summary = " | ".join(key_sensors[:4])
+    
+    # Determine dominant thesis for 1-2 day timeframe
+    # Scoring: higher puts_score with recent big move = puts wins (mean reversion)
+    # Higher moon_score with strong technicals = moon wins (continuation)
+    puts_conviction = puts_score
+    moon_conviction = moon_score
+    
+    # Adjust conviction based on MWS sensors
+    if mws_score > 60:
+        moon_conviction += 0.15  # MWS bullish supports moonshot
+    elif mws_score < 40:
+        puts_conviction += 0.15  # MWS bearish supports puts
+    
+    # Adjust for recent move magnitude
+    if abs(recent_move_pct) > 15:
+        puts_conviction += 0.10  # Extreme recent move favors mean reversion
+    
+    # Adjust for RSI
+    if rsi > 70:
+        puts_conviction += 0.10  # Overbought favors puts
+    elif rsi < 30:
+        moon_conviction += 0.10  # Oversold favors moonshot bounce
+    
+    # Determine which thesis wins
+    if puts_conviction > moon_conviction + 0.15:
+        dominant = "BEARISH"
+        dominant_detail = (
+            f"PutsEngine thesis likely dominant in 1-2 day timeframe "
+            f"(conviction {puts_conviction:.2f} vs {moon_conviction:.2f}). "
+            f"The distribution pattern combined with {'overbought RSI ' if rsi > 65 else ''}"
+            f"{'extreme recent move (+{:.0f}%) '.format(recent_move_pct) if recent_move_pct > 10 else ''}"
+            f"favors mean reversion. Moonshot momentum may provide one more leg up "
+            f"before reversal — ideal for put entry on the next spike."
+        )
+    elif moon_conviction > puts_conviction + 0.15:
+        dominant = "BULLISH"
+        dominant_detail = (
+            f"Moonshot thesis likely dominant in 1-2 day timeframe "
+            f"(conviction {moon_conviction:.2f} vs {puts_conviction:.2f}). "
+            f"Technical momentum and institutional flow outweigh the distribution signals. "
+            f"However, PutsEngine distribution warning suggests this rally has a shelf life — "
+            f"take profits aggressively and don't hold overnight without stops."
+        )
+    else:
+        dominant = "NEUTRAL — AVOID"
+        dominant_detail = (
+            f"Neither thesis has clear dominance (puts {puts_conviction:.2f} vs "
+            f"moon {moon_conviction:.2f}). This is a high-risk coin flip with "
+            f"institutional flow pulling in both directions. Experienced traders may "
+            f"play the expected range with iron condors; directional traders should WAIT "
+            f"for resolution before entering."
+        )
+    
+    # Build range info
+    range_str = ""
+    if expected_range and len(expected_range) >= 2:
+        range_str = f" Expected 1-2 day range: ${expected_range[0]:.2f}–${expected_range[1]:.2f}."
+    
+    # Build the full conflict summary
+    summary = (
+        f"⚡ CONFLICT — {symbol} ({conflict_type}): {conflict_desc} "
+        f"PutsEngine bearish score {puts_score:.2f} ({len(puts_signals)} signals: "
+        f"{', '.join(str(s) for s in puts_signals[:3])}) vs Moonshot bullish score "
+        f"{moon_score:.2f} ({len(moon_signals)} signals: "
+        f"{', '.join(str(s) for s in moon_signals[:3])}). "
+        f"{'MWS 7-Layer: ' + sensor_summary + '. ' if sensor_summary else ''}"
+        f"Dominant thesis: {dominant}. {dominant_detail}{range_str}"
+    )
+    
+    # Build trading recommendations for both sides
+    entry_low = moon_pick.get("entry_low", 0) if moon_pick else 0
+    entry_high = moon_pick.get("entry_high", 0) if moon_pick else 0
+    target = moon_pick.get("target", 0) if moon_pick else 0
+    stop = moon_pick.get("stop", 0) if moon_pick else 0
+    
+    recommendations = {
+        "if_bullish": (
+            f"CALL thesis: Entry ${entry_low:.2f}–${entry_high:.2f}, "
+            f"target ${target:.2f} (+{((target/current_price - 1)*100) if current_price > 0 and target > 0 else 0:.0f}%), "
+            f"stop ${stop:.2f}. Reduce size by 50% due to distribution risk. "
+            f"Use 7 DTE max, take profits at first sign of volume exhaustion."
+        ) if entry_low else "Entry data unavailable — wait for confirmation.",
+        "if_bearish": (
+            f"PUT thesis: Entry on spike above ${current_price:.2f}, target "
+            f"{'${:.2f}'.format(expected_range[0]) if expected_range else 'support level'}, "
+            f"stop {'${:.2f}'.format(expected_range[1]) if expected_range and len(expected_range) >= 2 else 'above today high'}. "
+            f"Score {puts_score:.2f} = high conviction, but wait for momentum "
+            f"exhaustion confirmation (RSI divergence, volume decline)."
+        ),
+        "neutral_play": (
+            f"IRON CONDOR/STRADDLE: Expected range "
+            f"{'${:.2f}–${:.2f}'.format(expected_range[0], expected_range[1]) if expected_range and len(expected_range) >= 2 else 'wide'}. "
+            f"Sell both sides of the conflict — let theta work while bulls and bears fight."
+        ),
+    }
+    
+    return {
+        "symbol": symbol,
+        "conflict_type": conflict_type,
+        "puts_score": puts_score,
+        "moon_score": moon_score,
+        "mws_score": mws_score,
+        "dominant_thesis": dominant,
+        "current_price": current_price,
+        "rsi": rsi,
+        "recent_move_pct": recent_move_pct,
+        "bullish_sensors": bullish_sensors,
+        "bearish_sensors": bearish_sensors,
+        "expected_range": expected_range,
+        "recommendations": recommendations,
+        "summary": summary,
+    }
+
+
 def generate_all_summaries(cross_results: Dict[str, Any]) -> Dict[str, Any]:
     """
     Generate 3-sentence summaries for all picks from cross-analysis results.
@@ -288,20 +522,17 @@ def generate_all_summaries(cross_results: Dict[str, Any]) -> Dict[str, Any]:
             "puts_risk": item.get("puts_analysis", {}).get("risk_level", "N/A"),
         })
     
-    # 3. Conflict summaries (tickers in both Top 10s)
+    # 3. Conflict summaries (tickers in both Top 10s) — institutional-grade resolution
     for entry in cross_results.get("conflict_matrix", []):
         if entry.get("in_puts_top10") and entry.get("in_moonshot_top10"):
             symbol = entry["symbol"]
-            summaries["conflict_summaries"].append({
-                "symbol": symbol,
-                "summary": (
-                    f"⚡ {symbol} appears in BOTH engine Top 10 lists — "
-                    f"PutsEngine bearish score {entry['puts_score']:.2f} vs "
-                    f"Moonshot bullish score {entry['moonshot_score']:.2f}. "
-                    f"This conflict signals extreme volatility; institutional "
-                    f"microstructure is divided. Trade with caution and reduced size."
-                ),
-            })
+            conflict_detail = _build_conflict_resolution(
+                symbol=symbol,
+                puts_score=entry.get("puts_score", 0),
+                moon_score=entry.get("moonshot_score", 0),
+                cross_results=cross_results,
+            )
+            summaries["conflict_summaries"].append(conflict_detail)
     
     # 4. Final meta-summary
     n_puts = len(summaries["puts_picks_summaries"])
