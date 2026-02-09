@@ -82,26 +82,81 @@ def generate_pick_summary(pick: Dict[str, Any], cross_analysis: Dict[str, Any] =
     if cross_analysis:
         cross_engine = cross_analysis.get("engine", "")
         if "Puts" in source:
-            # PutsEngine pick checked by Moonshot
+            # PutsEngine pick checked by Moonshot — use rich data if available
             opp_level = cross_analysis.get("opportunity_level", "LOW")
+            data_source = cross_analysis.get("data_source", "")
+            cross_score = cross_analysis.get("bullish_score", 0)
+            mws_score = cross_analysis.get("mws_score", 0)
+            cross_signals = cross_analysis.get("signals", [])
+            n_cross_sigs = len(cross_signals) if isinstance(cross_signals, list) else 0
+            uw_sentiment = cross_analysis.get("uw_sentiment", "")
+
             if opp_level == "HIGH":
-                sentence2 = (
-                    f"Cross-engine conflict: Moonshot Engine detects HIGH bullish signals "
-                    f"on the same ticker — this creates a volatile tug-of-war between "
-                    f"distribution sellers and momentum buyers, expect wide intraday ranges."
-                )
+                if "MWS" in data_source:
+                    exp_range = cross_analysis.get("expected_range", [])
+                    range_str = f", expected range ${exp_range[0]:.2f}–${exp_range[1]:.2f}" if len(exp_range) >= 2 else ""
+                    sentence2 = (
+                        f"Cross-engine CONFLICT: MWS 7-layer analysis detects HIGH bullish "
+                        f"signal (MWS {mws_score:.0f}/100, prob {cross_analysis.get('bullish_probability', 0)}%{range_str}) — "
+                        f"volatile tug-of-war between distribution sellers and institutional "
+                        f"buyers, expect wide intraday ranges."
+                    )
+                elif "Recommendations" in data_source:
+                    sentence2 = (
+                        f"Cross-engine CONFLICT: TradeNova recommends this as a BUY "
+                        f"(composite {cross_score*100:.0f}/100, UW sentiment: {uw_sentiment}, "
+                        f"{n_cross_sigs} bullish signals) — distribution sellers face active "
+                        f"buying resistance from momentum/catalyst engines."
+                    )
+                else:
+                    sentence2 = (
+                        f"Cross-engine CONFLICT: Moonshot Engine detects HIGH bullish signals "
+                        f"(score {cross_score:.2f}, {n_cross_sigs} signals) — volatile tug-of-war "
+                        f"between distribution sellers and momentum buyers, expect wide ranges."
+                    )
             elif opp_level == "MODERATE":
-                sentence2 = (
-                    f"Moonshot Engine shows moderate upside potential, suggesting the bearish "
-                    f"distribution may face buying resistance — the put thesis is intact but "
-                    f"monitor for failed breakdown if buyers defend key support levels."
-                )
+                if "MWS" in data_source:
+                    sentence2 = (
+                        f"Moonshot MWS shows MODERATE upside (MWS {mws_score:.0f}/100, "
+                        f"prob {cross_analysis.get('bullish_probability', 0)}%), suggesting "
+                        f"the bearish distribution may face buying resistance — put thesis "
+                        f"intact but monitor for failed breakdown if buyers defend support."
+                    )
+                elif "Recommendations" in data_source:
+                    sentence2 = (
+                        f"TradeNova shows MODERATE interest (composite {cross_score*100:.0f}/100, "
+                        f"UW: {uw_sentiment}) — some institutional buying present, the put "
+                        f"thesis is valid but reduce size; monitor for failed breakdown."
+                    )
+                else:
+                    sentence2 = (
+                        f"Moonshot Engine shows moderate upside ({cross_score:.2f}, "
+                        f"{n_cross_sigs} signals) — bearish distribution may face buying "
+                        f"resistance; put thesis intact but monitor for failed breakdown."
+                    )
             else:
-                sentence2 = (
-                    f"Moonshot Engine confirms no significant bullish counter-signal, "
-                    f"reinforcing the PutsEngine bearish thesis — the path of least "
-                    f"resistance is to the downside with limited buying interest."
-                )
+                if "MWS" in data_source:
+                    sentence2 = (
+                        f"MWS 7-layer confirms LOW bullish signal ({mws_score:.0f}/100, "
+                        f"prob {cross_analysis.get('bullish_probability', 0)}%), reinforcing "
+                        f"the PutsEngine bearish thesis — path of least resistance is "
+                        f"to the downside with limited institutional buying interest."
+                    )
+                elif "Standalone" in data_source:
+                    top_sigs = ", ".join(cross_signals[:3]) if cross_signals else "none"
+                    sentence2 = (
+                        f"Standalone Moonshot analysis confirms LOW bullish signal "
+                        f"(score {cross_score:.2f}, {n_cross_sigs} signals: {top_sigs}), "
+                        f"reinforcing the bearish thesis — no squeeze setup, no momentum "
+                        f"catalyst, path of least resistance is to the downside."
+                    )
+                else:
+                    sentence2 = (
+                        f"Moonshot Engine confirms no significant bullish counter-signal "
+                        f"(score {cross_score:.2f}), reinforcing the PutsEngine bearish "
+                        f"thesis — the path of least resistance is to the downside "
+                        f"with limited buying interest."
+                    )
         else:
             # Moonshot pick checked by PutsEngine
             risk_level = cross_analysis.get("risk_level", "LOW")

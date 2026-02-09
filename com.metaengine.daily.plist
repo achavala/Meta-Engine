@@ -5,7 +5,9 @@
     <!--
     META ENGINE — macOS launchd Auto-Start
     =======================================
-    This plist runs the Meta Engine scheduler at 9:35 AM ET every day.
+    This plist runs the Meta Engine at two times every trading day:
+      - 9:35 AM ET  (morning — opening scan)
+      - 3:15 PM ET  (afternoon — power hour scan)
     
     Installation:
     1. Copy this file to ~/Library/LaunchAgents/
@@ -22,6 +24,7 @@
     
     Note: The time is in LOCAL timezone. Adjust if you're not in ET.
     9:35 AM ET = Hour 9, Minute 35
+    3:15 PM ET = Hour 15, Minute 15
     -->
     
     <key>Label</key>
@@ -29,20 +32,31 @@
     
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/python3</string>
+        <string>/Users/chavala/Meta Engine/venv/bin/python3</string>
         <string>/Users/chavala/Meta Engine/run_meta_engine.py</string>
+        <string>--force</string>
     </array>
     
     <key>WorkingDirectory</key>
     <string>/Users/chavala/Meta Engine</string>
     
     <key>StartCalendarInterval</key>
-    <dict>
-        <key>Hour</key>
-        <integer>9</integer>
-        <key>Minute</key>
-        <integer>35</integer>
-    </dict>
+    <array>
+        <!-- 9:35 AM ET — Morning scan -->
+        <dict>
+            <key>Hour</key>
+            <integer>9</integer>
+            <key>Minute</key>
+            <integer>35</integer>
+        </dict>
+        <!-- 3:15 PM ET — Afternoon scan -->
+        <dict>
+            <key>Hour</key>
+            <integer>15</integer>
+            <key>Minute</key>
+            <integer>15</integer>
+        </dict>
+    </array>
     
     <key>StandardOutPath</key>
     <string>/Users/chavala/Meta Engine/logs/launchd_stdout.log</string>

@@ -50,7 +50,9 @@ class MetaConfig:
     X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN", "")
 
     # ========== SCHEDULE ==========
-    RUN_TIME_ET = os.getenv("META_RUN_TIME", "09:35")  # 9:35 AM EST
+    RUN_TIME_ET = os.getenv("META_RUN_TIME", "09:35")  # 9:35 AM EST (primary)
+    RUN_TIME_PM_ET = os.getenv("META_RUN_TIME_PM", "15:15")  # 3:15 PM EST (afternoon)
+    RUN_TIMES_ET = [RUN_TIME_ET, RUN_TIME_PM_ET]  # Both scheduled run times
     TIMEZONE = "US/Eastern"
 
     # ========== ENGINE SETTINGS ==========

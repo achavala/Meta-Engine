@@ -22,6 +22,7 @@ import sys
 import os
 import json
 import logging
+import fcntl
 from datetime import datetime, date
 from pathlib import Path
 from typing import Dict, Any, Optional
@@ -34,6 +35,9 @@ if str(META_DIR) not in sys.path:
     sys.path.insert(0, str(META_DIR))
 
 from config import MetaConfig
+
+# Lock file to prevent concurrent runs
+LOCK_FILE = META_DIR / ".meta_engine.lock"
 
 # Setup logging
 LOG_DIR = Path(MetaConfig.LOGS_DIR)
@@ -74,6 +78,40 @@ def is_trading_day(d: date = None) -> bool:
     return True
 
 
+def _acquire_lock() -> Optional[object]:
+    """
+    Acquire an exclusive file lock to prevent concurrent Meta Engine runs.
+    Returns the lock file object if acquired, None if another run is active.
+    """
+    try:
+        lock_fd = open(LOCK_FILE, "w")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Write PID and timestamp for diagnostics
+        lock_fd.write(f"pid={os.getpid()}\nstarted={datetime.now(EST).isoformat()}\n")
+        lock_fd.flush()
+        return lock_fd
+    except (IOError, OSError):
+        # Another process holds the lock
+        try:
+            with open(LOCK_FILE) as f:
+                lock_info = f.read().strip()
+            logger.warning(f"🔒 Another Meta Engine run is active: {lock_info}")
+        except Exception:
+            logger.warning("🔒 Another Meta Engine run is active (lock file exists)")
+        return None
+
+
+def _release_lock(lock_fd):
+    """Release the file lock."""
+    if lock_fd:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+            LOCK_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def run_meta_engine(force: bool = False) -> Dict[str, Any]:
     """
     Execute the full Meta Engine pipeline.
@@ -95,6 +133,20 @@ def run_meta_engine(force: bool = False) -> Dict[str, Any]:
         logger.info("📅 Not a trading day. Use --force to run anyway.")
         return {"status": "skipped", "reason": "not_trading_day"}
     
+    # Acquire lock to prevent concurrent runs
+    lock_fd = _acquire_lock()
+    if lock_fd is None:
+        logger.error("❌ Cannot start — another Meta Engine run is already in progress.")
+        return {"status": "skipped", "reason": "concurrent_run_blocked"}
+    
+    try:
+        return _run_pipeline(now, force)
+    finally:
+        _release_lock(lock_fd)
+
+
+def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
+    """Internal: Execute the pipeline after lock is acquired."""
     # Validate configuration
     config_status = MetaConfig.validate()
     logger.info(f"📋 Config: APIs={config_status['apis']} | "

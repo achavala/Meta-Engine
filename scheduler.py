@@ -1,7 +1,9 @@
 """
 Meta Engine Scheduler
 ======================
-Runs the Meta Engine at 9:35 AM EST every trading day.
+Runs the Meta Engine twice daily on every trading day:
+  - 9:35 AM ET  (morning — captures pre-market + opening signals)
+  - 3:15 PM ET  (afternoon — captures intraday action + power hour setup)
 
 Methods:
 1. APScheduler (preferred) — background daemon
@@ -9,7 +11,7 @@ Methods:
 3. Manual — run once via command line
 
 Usage:
-    # Start scheduler daemon (runs daily at 9:35 AM ET):
+    # Start scheduler daemon (runs at 9:35 AM + 3:15 PM ET):
     python scheduler.py
     
     # Run once immediately:
@@ -69,24 +71,28 @@ def _cleanup_pid(*args):
     sys.exit(0)
 
 
-def _scheduled_run():
-    """Wrapper called by APScheduler at 9:35 AM ET."""
+def _scheduled_run(session_label: str = ""):
+    """Wrapper called by APScheduler at each scheduled time."""
+    now_str = datetime.now(EST).strftime('%I:%M:%S %p ET')
+    label = f" [{session_label}]" if session_label else ""
     logger.info("=" * 60)
-    logger.info(f"⏰ Scheduled run triggered at {datetime.now(EST).strftime('%I:%M:%S %p ET')}")
+    logger.info(f"⏰ Scheduled run triggered at {now_str}{label}")
     logger.info("=" * 60)
     
     try:
         from meta_engine import run_meta_engine
         result = run_meta_engine(force=False)
-        status = result.get("status", "unknown")
-        logger.info(f"Run completed with status: {status}")
+        run_status = result.get("status", "unknown")
+        logger.info(f"Run completed with status: {run_status}")
     except Exception as e:
         logger.error(f"Scheduled run FAILED: {e}", exc_info=True)
 
 
 def start_scheduler():
     """
-    Start the APScheduler daemon that runs Meta Engine at 9:35 AM ET daily.
+    Start the APScheduler daemon that runs Meta Engine twice daily:
+      - 9:35 AM ET  (morning scan)
+      - 3:15 PM ET  (afternoon scan)
     """
     try:
         from apscheduler.schedulers.blocking import BlockingScheduler
@@ -95,13 +101,12 @@ def start_scheduler():
         logger.error("APScheduler not installed. Run: pip install apscheduler")
         sys.exit(1)
     
-    # Parse run time
-    run_time = MetaConfig.RUN_TIME_ET  # "09:35"
-    hour, minute = map(int, run_time.split(":"))
+    # Parse both run times
+    run_times = MetaConfig.RUN_TIMES_ET  # ["09:35", "15:15"]
     
     logger.info("=" * 60)
     logger.info("🏛️  META ENGINE SCHEDULER")
-    logger.info(f"   Run time: {run_time} ET (every trading day)")
+    logger.info(f"   Run times: {', '.join(run_times)} ET (every trading day)")
     logger.info(f"   PID: {os.getpid()}")
     logger.info("=" * 60)
     
@@ -115,22 +120,28 @@ def start_scheduler():
     # Create scheduler
     scheduler = BlockingScheduler(timezone=EST)
     
-    # Schedule daily at 9:35 AM ET, Monday-Friday
-    scheduler.add_job(
-        _scheduled_run,
-        trigger=CronTrigger(
-            hour=hour,
-            minute=minute,
-            day_of_week="mon-fri",
-            timezone=EST,
-        ),
-        id="meta_engine_daily",
-        name="Meta Engine Daily Run",
-        misfire_grace_time=300,  # 5 min grace period
-    )
+    # Schedule each run time (Mon-Fri)
+    session_labels = {0: "Morning", 1: "Afternoon"}
+    for idx, run_time in enumerate(run_times):
+        hour, minute = map(int, run_time.split(":"))
+        label = session_labels.get(idx, f"Session-{idx+1}")
+        
+        scheduler.add_job(
+            _scheduled_run,
+            trigger=CronTrigger(
+                hour=hour,
+                minute=minute,
+                day_of_week="mon-fri",
+                timezone=EST,
+            ),
+            kwargs={"session_label": label},
+            id=f"meta_engine_{label.lower()}",
+            name=f"Meta Engine {label} Run ({run_time} ET)",
+            misfire_grace_time=300,  # 5 min grace period
+        )
+        logger.info(f"  ✅ Job scheduled: {label} at {run_time} ET, Mon-Fri")
     
-    logger.info(f"✅ Job scheduled: {run_time} ET, Mon-Fri")
-    logger.info("Waiting for scheduled run time...")
+    logger.info("Waiting for next scheduled run time...")
     logger.info("(Press Ctrl+C to stop)")
     
     try:

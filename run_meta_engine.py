@@ -73,7 +73,9 @@ def check_config():
         print(f"  {icon} {name}")
     
     print("\n⏰ Schedule:")
-    print(f"  Run time: {MetaConfig.RUN_TIME_ET} ET (Mon-Fri)")
+    for i, rt in enumerate(MetaConfig.RUN_TIMES_ET):
+        label = "Morning" if i == 0 else "Afternoon"
+        print(f"  {label}: {rt} ET (Mon-Fri)")
     print(f"  Top N picks: {MetaConfig.TOP_N_PICKS}")
     
     # Check required env vars
