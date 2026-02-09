@@ -1,0 +1,25 @@
+# Environment & Secrets
+.env
+*.pid
+
+# Virtual Environment
+venv/
+
+# Output Files
+output/
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# macOS
+.DS_Store
+
+# IDE
+.cursor/
+.vscode/

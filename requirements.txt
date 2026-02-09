@@ -1,0 +1,29 @@
+# Meta Engine Dependencies
+# ========================
+# Most dependencies are inherited from PutsEngine and TradeNova venvs.
+# Install these in a shared or Meta Engine-specific venv.
+
+# Core
+python-dotenv>=1.0.0
+requests>=2.31.0
+pytz>=2024.1
+
+# Data Processing
+pandas>=2.1.0
+numpy>=1.26.0
+
+# Charting
+matplotlib>=3.8.0
+
+# Scheduling
+apscheduler>=3.10.0
+
+# Twitter/X API
+tweepy>=4.14.0
+
+# PutsEngine dependencies (if not installed globally)
+# pydantic>=2.5.0
+# pydantic-settings>=2.1.0
+# loguru>=0.7.2
+# aiohttp>=3.9.0
+# alpaca-py>=0.21.0

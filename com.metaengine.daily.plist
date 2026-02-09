@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+    META ENGINE — macOS launchd Auto-Start
+    =======================================
+    This plist runs the Meta Engine scheduler at 9:35 AM ET every day.
+    
+    Installation:
+    1. Copy this file to ~/Library/LaunchAgents/
+       cp com.metaengine.daily.plist ~/Library/LaunchAgents/
+    
+    2. Load the agent:
+       launchctl load ~/Library/LaunchAgents/com.metaengine.daily.plist
+    
+    3. Verify it's loaded:
+       launchctl list | grep metaengine
+    
+    4. To unload/stop:
+       launchctl unload ~/Library/LaunchAgents/com.metaengine.daily.plist
+    
+    Note: The time is in LOCAL timezone. Adjust if you're not in ET.
+    9:35 AM ET = Hour 9, Minute 35
+    -->
+    
+    <key>Label</key>
+    <string>com.metaengine.daily</string>
+    
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/chavala/Meta Engine/run_meta_engine.py</string>
+    </array>
+    
+    <key>WorkingDirectory</key>
+    <string>/Users/chavala/Meta Engine</string>
+    
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>35</integer>
+    </dict>
+    
+    <key>StandardOutPath</key>
+    <string>/Users/chavala/Meta Engine/logs/launchd_stdout.log</string>
+    
+    <key>StandardErrorPath</key>
+    <string>/Users/chavala/Meta Engine/logs/launchd_stderr.log</string>
+    
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <key>HOME</key>
+        <string>/Users/chavala</string>
+    </dict>
+    
+    <key>RunAtLoad</key>
+    <false/>
+    
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>
