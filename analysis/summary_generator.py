@@ -337,99 +337,31 @@ def generate_all_summaries(cross_results: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def format_summaries_for_telegram(summaries: Dict[str, Any]) -> str:
-    """Format summaries for Telegram message (plain text, max 4096 chars)."""
+    """
+    Legacy format for Telegram.
+    NOTE: Telegram now uses its own formatter in telegram_sender.py.
+    This is kept for backward compatibility only.
+    """
     lines = []
-    lines.append("🏛️ *META ENGINE DAILY REPORT*")
-    lines.append(f"_{datetime.now().strftime('%B %d, %Y — %I:%M %p ET')}_")
+    lines.append("🏛️ META ENGINE DAILY REPORT")
+    lines.append(f"{datetime.now().strftime('%B %d, %Y — %I:%M %p ET')}")
     lines.append("")
-    
-    # Final summary
     lines.append(summaries.get("final_summary", ""))
     lines.append("")
     
-    # Top puts picks
-    lines.append("🔴 *TOP PUT PICKS:*")
     for i, p in enumerate(summaries.get("puts_picks_summaries", [])[:5], 1):
-        lines.append(f"{i}. *{p['symbol']}* (Score: {p['puts_score']:.2f})")
-        # Truncate summary for Telegram
+        lines.append(f"{i}. {p['symbol']} (Score: {p['puts_score']:.2f})")
         short = p["summary"][:200] + "..." if len(p["summary"]) > 200 else p["summary"]
         lines.append(f"   {short}")
         lines.append("")
     
-    # Top moonshot picks
-    lines.append("🟢 *TOP MOONSHOT PICKS:*")
     for i, m in enumerate(summaries.get("moonshot_picks_summaries", [])[:5], 1):
-        lines.append(f"{i}. *{m['symbol']}* (Score: {m['moonshot_score']:.2f})")
+        lines.append(f"{i}. {m['symbol']} (Score: {m['moonshot_score']:.2f})")
         short = m["summary"][:200] + "..." if len(m["summary"]) > 200 else m["summary"]
         lines.append(f"   {short}")
         lines.append("")
     
-    # Conflicts
-    conflicts = summaries.get("conflict_summaries", [])
-    if conflicts:
-        lines.append("⚡ *CONFLICT ZONES:*")
-        for c in conflicts:
-            lines.append(f"• {c['summary']}")
-        lines.append("")
-    
-    lines.append("_⚠️ Not financial advice. Options involve substantial risk._")
-    
     text = "\n".join(lines)
-    
-    # Telegram message limit is 4096 chars
     if len(text) > 4090:
         text = text[:4087] + "..."
-    
     return text
-
-
-def format_summaries_for_x(summaries: Dict[str, Any]) -> List[str]:
-    """
-    Format summaries for X/Twitter posts (280 chars per tweet).
-    Returns a list of tweets (thread).
-    """
-    tweets = []
-    
-    # Tweet 1: Header
-    now = datetime.now().strftime('%b %d')
-    final = summaries.get("final_summary", "")
-    n_puts = len(summaries.get("puts_picks_summaries", []))
-    n_moon = len(summaries.get("moonshot_picks_summaries", []))
-    
-    tweet1 = (
-        f"🏛️ Meta Engine Daily ({now})\n\n"
-        f"🔴 {n_puts} PUT candidates\n"
-        f"🟢 {n_moon} MOONSHOT candidates\n\n"
-        f"Cross-engine analysis complete. Thread 🧵👇"
-    )
-    tweets.append(tweet1)
-    
-    # Tweet 2-3: Top puts
-    for i, p in enumerate(summaries.get("puts_picks_summaries", [])[:3], 1):
-        tweet = f"🔴 PUT #{i}: ${p['symbol']} (Score: {p['puts_score']:.2f})\n\n"
-        # Fit summary into remaining chars
-        remaining = 280 - len(tweet) - 20
-        short = p["summary"][:remaining]
-        if len(p["summary"]) > remaining:
-            short = short[:short.rfind(' ')] + "..."
-        tweet += short
-        tweets.append(tweet)
-    
-    # Tweet 4-5: Top moonshots
-    for i, m in enumerate(summaries.get("moonshot_picks_summaries", [])[:3], 1):
-        tweet = f"🟢 MOONSHOT #{i}: ${m['symbol']} (Score: {m['moonshot_score']:.2f})\n\n"
-        remaining = 280 - len(tweet) - 20
-        short = m["summary"][:remaining]
-        if len(m["summary"]) > remaining:
-            short = short[:short.rfind(' ')] + "..."
-        tweet += short
-        tweets.append(tweet)
-    
-    # Final tweet: disclaimer
-    tweets.append(
-        "⚠️ Disclaimer: This is algorithmic signal analysis, not financial advice. "
-        "Options trading involves substantial risk. Past performance ≠ future results.\n\n"
-        "#Trading #Options #MetaEngine"
-    )
-    
-    return tweets

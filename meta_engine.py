@@ -269,7 +269,29 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
         logger.error(f"Chart generation failed: {e}")
     
     # ================================================================
-    # STEP 6: Send Email
+    # STEP 5b: Generate Markdown Report
+    # ================================================================
+    logger.info("\n" + "=" * 50)
+    logger.info("STEP 5b: Generating Markdown Report...")
+    logger.info("=" * 50)
+    
+    report_md_path = None
+    try:
+        from analysis.report_generator import generate_md_report
+        report_md_path = generate_md_report(
+            puts_picks=puts_top10,
+            moon_picks=moonshot_top10,
+            cross_data=cross_results,
+            summaries=summaries,
+            output_dir=str(output_dir),
+            date_str=now.strftime('%Y%m%d'),
+        )
+        results["report_md_path"] = report_md_path
+    except Exception as e:
+        logger.error(f"Report generation failed: {e}")
+    
+    # ================================================================
+    # STEP 6: Send Email (Full .md as HTML + PDF attachment)
     # ================================================================
     logger.info("\n" + "=" * 50)
     logger.info("STEP 6: Sending Email...")
@@ -280,6 +302,7 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
         email_sent = send_meta_email(
             summaries=summaries,
             chart_path=chart_path,
+            report_md_path=report_md_path,
             smtp_server=MetaConfig.SMTP_SERVER,
             smtp_port=MetaConfig.SMTP_PORT,
             smtp_user=MetaConfig.SMTP_USER,
@@ -291,10 +314,10 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
         logger.error(f"Email failed: {e}")
     
     # ================================================================
-    # STEP 7: Send Telegram
+    # STEP 7: Send Telegram (Summaries + Conflict Matrix ONLY)
     # ================================================================
     logger.info("\n" + "=" * 50)
-    logger.info("STEP 7: Sending Telegram...")
+    logger.info("STEP 7: Sending Telegram (Summaries + Conflicts)...")
     logger.info("=" * 50)
     
     try:
@@ -310,15 +333,18 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
         logger.error(f"Telegram failed: {e}")
     
     # ================================================================
-    # STEP 8: Post to X/Twitter
+    # STEP 8: Post to X/Twitter (Top 3 Puts + Top 3 Calls)
     # ================================================================
     logger.info("\n" + "=" * 50)
-    logger.info("STEP 8: Posting to X/Twitter...")
+    logger.info("STEP 8: Posting to X/Twitter (Top 3 each)...")
     logger.info("=" * 50)
     
     try:
         from notifications.x_poster import post_meta_to_x
-        x_posted = post_meta_to_x(summaries)
+        x_posted = post_meta_to_x(
+            summaries=summaries,
+            cross_results=cross_results,
+        )
         results["notifications"]["x_twitter"] = x_posted
     except Exception as e:
         logger.error(f"X/Twitter failed: {e}")

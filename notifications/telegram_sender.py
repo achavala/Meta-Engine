@@ -1,47 +1,43 @@
 """
 Meta Engine Telegram Sender
 =============================
-Sends 3-sentence summaries and alerts via Telegram Bot API.
+Sends focused alerts via Telegram Bot API:
+  - 3-Sentence Institutional Summaries (all picks)
+  - Conflict Matrix
+  - NO chart, NO executive summary (email handles the full report)
 
 Setup:
 1. Create a bot via @BotFather on Telegram
 2. Get your bot token
 3. Get your chat_id (send /start to your bot, then check
    https://api.telegram.org/bot<TOKEN>/getUpdates)
-4. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env
+4. Set META_TELEGRAM_BOT_TOKEN and META_TELEGRAM_CHAT_ID in .env
 """
 
 import requests
 from datetime import datetime
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from pathlib import Path
 import logging
 
 logger = logging.getLogger(__name__)
 
 TELEGRAM_API_BASE = "https://api.telegram.org/bot{token}"
+MAX_MESSAGE_LENGTH = 4096
 
 
 def send_telegram_message(
     message: str,
     bot_token: str = "",
     chat_id: str = "",
-    parse_mode: str = "Markdown",
+    parse_mode: str = "HTML",
 ) -> bool:
     """
     Send a text message via Telegram Bot API.
-    
-    Args:
-        message: Message text (supports Markdown or HTML)
-        bot_token: Telegram bot token
-        chat_id: Target chat ID
-        parse_mode: 'Markdown' or 'HTML'
-        
-    Returns:
-        True if message sent successfully
+    Uses HTML parse mode by default (more reliable than Markdown for complex formatting).
     """
     if not bot_token or not chat_id:
-        logger.warning("Telegram not configured — set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
+        logger.warning("Telegram not configured — set META_TELEGRAM_BOT_TOKEN and META_TELEGRAM_CHAT_ID")
         return False
     
     try:
@@ -60,12 +56,13 @@ def send_telegram_message(
             return True
         else:
             logger.error(f"Telegram API error: {resp.status_code} — {resp.text[:200]}")
-            # If Markdown fails, try without parse_mode
-            if parse_mode == "Markdown":
-                logger.info("Retrying without Markdown formatting...")
+            # If HTML fails, try plain text
+            if parse_mode:
+                logger.info("Retrying without formatting...")
                 payload["parse_mode"] = None
-                # Strip markdown
-                clean_text = message.replace("*", "").replace("_", "").replace("`", "")
+                # Strip HTML tags
+                import re
+                clean_text = re.sub(r'<[^>]+>', '', message)
                 payload["text"] = clean_text
                 resp2 = requests.post(url, json=payload, timeout=15)
                 if resp2.status_code == 200:
@@ -78,55 +75,141 @@ def send_telegram_message(
         return False
 
 
-def send_telegram_photo(
-    photo_path: str,
-    caption: str = "",
-    bot_token: str = "",
-    chat_id: str = "",
+def _send_multiple_messages(
+    messages: List[str],
+    bot_token: str,
+    chat_id: str,
 ) -> bool:
-    """
-    Send a photo (chart) via Telegram Bot API.
+    """Send a list of messages sequentially (for long content that exceeds 4096 chars)."""
+    import time
     
-    Args:
-        photo_path: Path to the image file
-        caption: Photo caption (max 1024 chars)
-        bot_token: Telegram bot token
-        chat_id: Target chat ID
-        
+    all_sent = True
+    for i, msg in enumerate(messages):
+        success = send_telegram_message(msg, bot_token, chat_id, parse_mode="HTML")
+        if not success:
+            all_sent = False
+            logger.warning(f"  Message {i+1}/{len(messages)} failed")
+        if i < len(messages) - 1:
+            time.sleep(0.5)  # Small delay between messages
+    
+    return all_sent
+
+
+def _format_telegram_summaries(summaries: Dict[str, Any]) -> List[str]:
+    """
+    Format summaries for Telegram: ONLY 3-sentence institutional summaries + conflict matrix.
+    Splits into multiple messages if content exceeds 4096 chars.
+    
     Returns:
-        True if photo sent successfully
+        List of message strings, each ≤ 4096 chars
     """
-    if not bot_token or not chat_id:
-        logger.warning("Telegram not configured")
-        return False
+    messages = []
     
-    if not Path(photo_path).exists():
-        logger.error(f"Photo not found: {photo_path}")
-        return False
+    # ===== MESSAGE 1: Header + Conflict Matrix =====
+    msg1_lines = []
+    msg1_lines.append("🏛️ <b>META ENGINE — INSTITUTIONAL SUMMARIES</b>")
+    msg1_lines.append(f"<i>{datetime.now().strftime('%B %d, %Y -- %I:%M %p ET')}</i>")
+    msg1_lines.append("")
     
-    try:
-        url = f"{TELEGRAM_API_BASE.format(token=bot_token)}/sendPhoto"
+    # Conflict Matrix
+    conflicts = summaries.get("conflict_summaries", [])
+    if conflicts:
+        msg1_lines.append("⚠️ <b>CONFLICT ZONES (Both Engines):</b>")
+        msg1_lines.append("")
+        for c in conflicts:
+            sym = c.get("symbol", "???")
+            msg1_lines.append(f"⚡ <b>{sym}</b>: {_clean_for_telegram(c.get('summary', 'N/A'))}")
+            msg1_lines.append("")
+    else:
+        msg1_lines.append("✅ <b>No conflict zones</b> — no overlapping tickers between engines")
+        msg1_lines.append("")
+    
+    msg1_lines.append("━━━━━━━━━━━━━━━━━━━━")
+    messages.append("\n".join(msg1_lines))
+    
+    # ===== MESSAGES 2+: Puts Summaries =====
+    puts_summaries = summaries.get("puts_picks_summaries", [])
+    if puts_summaries:
+        current_msg_lines = []
+        current_msg_lines.append("🔴 <b>BEARISH PICKS (PutsEngine)</b>")
+        current_msg_lines.append("")
         
-        with open(photo_path, "rb") as photo:
-            files = {"photo": photo}
-            data = {
-                "chat_id": chat_id,
-                "caption": caption[:1024],  # Telegram limit
-                "parse_mode": "Markdown",
-            }
+        for i, p in enumerate(puts_summaries, 1):
+            sym = p["symbol"]
+            score = p.get("puts_score", 0)
+            moon_lvl = p.get("moonshot_level", "N/A")
+            summary_text = _clean_for_telegram(p.get("summary", "N/A"))
             
-            resp = requests.post(url, files=files, data=data, timeout=30)
+            pick_block = []
+            pick_block.append(f"<b>#{i} {sym}</b> | Puts: {score:.2f} | Moon: {moon_lvl}")
+            pick_block.append(f"<i>{summary_text}</i>")
+            pick_block.append("")
+            
+            pick_text = "\n".join(pick_block)
+            current_text = "\n".join(current_msg_lines)
+            
+            # Check if adding this pick would exceed limit
+            if len(current_text) + len(pick_text) + 50 > MAX_MESSAGE_LENGTH:
+                # Send current message and start new one
+                messages.append(current_text)
+                current_msg_lines = []
+                current_msg_lines.append("🔴 <b>BEARISH PICKS (cont.)</b>")
+                current_msg_lines.append("")
+            
+            current_msg_lines.extend(pick_block)
         
-        if resp.status_code == 200:
-            logger.info("✅ Telegram chart sent")
-            return True
-        else:
-            logger.error(f"Telegram photo error: {resp.status_code} — {resp.text[:200]}")
-            return False
+        if current_msg_lines:
+            messages.append("\n".join(current_msg_lines))
+    
+    # ===== MESSAGES N+: Moonshot Summaries =====
+    moon_summaries = summaries.get("moonshot_picks_summaries", [])
+    if moon_summaries:
+        current_msg_lines = []
+        current_msg_lines.append("🟢 <b>BULLISH PICKS (Moonshot)</b>")
+        current_msg_lines.append("")
+        
+        for i, m in enumerate(moon_summaries, 1):
+            sym = m["symbol"]
+            score = m.get("moonshot_score", 0)
+            puts_risk = m.get("puts_risk", "N/A")
+            summary_text = _clean_for_telegram(m.get("summary", "N/A"))
             
-    except Exception as e:
-        logger.error(f"❌ Telegram photo send failed: {e}")
-        return False
+            pick_block = []
+            pick_block.append(f"<b>#{i} {sym}</b> | Moon: {score:.2f} | Puts Risk: {puts_risk}")
+            pick_block.append(f"<i>{summary_text}</i>")
+            pick_block.append("")
+            
+            pick_text = "\n".join(pick_block)
+            current_text = "\n".join(current_msg_lines)
+            
+            if len(current_text) + len(pick_text) + 50 > MAX_MESSAGE_LENGTH:
+                messages.append(current_text)
+                current_msg_lines = []
+                current_msg_lines.append("🟢 <b>BULLISH PICKS (cont.)</b>")
+                current_msg_lines.append("")
+            
+            current_msg_lines.extend(pick_block)
+        
+        if current_msg_lines:
+            messages.append("\n".join(current_msg_lines))
+    
+    # ===== FINAL MESSAGE: Disclaimer =====
+    messages.append(
+        "⚠️ <i>Not financial advice. Options involve substantial risk of loss. "
+        "Past performance does not guarantee future results.</i>\n\n"
+        "🏛️ <i>Meta Engine — Cross-Engine Institutional Analysis</i>"
+    )
+    
+    return messages
+
+
+def _clean_for_telegram(text: str) -> str:
+    """Clean text for Telegram HTML format — escape special chars."""
+    # Telegram HTML supports: <b>, <i>, <code>, <pre>, <a>
+    # Need to escape &, <, > that are NOT part of HTML tags
+    text = text.replace("&", "&amp;")
+    # Don't escape < and > that might be in text (they shouldn't be in summaries)
+    return text
 
 
 def send_meta_telegram(
@@ -136,32 +219,31 @@ def send_meta_telegram(
     chat_id: str = "",
 ) -> bool:
     """
-    Send the complete Meta Engine report via Telegram.
-    Sends the summary message first, then the chart as a photo.
+    Send the Meta Engine alert via Telegram.
+    
+    Sends ONLY:
+      1. Conflict Matrix
+      2. All 3-sentence institutional summaries (puts + moonshots)
+    
+    Does NOT send: chart, executive summary, tables (those are in the email).
     
     Args:
         summaries: Output from summary_generator.generate_all_summaries()
-        chart_path: Path to the technical chart PNG
+        chart_path: Path to chart (unused — email handles chart delivery)
         bot_token: Telegram bot token
         chat_id: Target chat ID
         
     Returns:
         True if all messages sent successfully
     """
-    from analysis.summary_generator import format_summaries_for_telegram
+    if not bot_token or not chat_id:
+        logger.warning("Telegram not configured — set META_TELEGRAM_BOT_TOKEN and META_TELEGRAM_CHAT_ID")
+        return False
     
-    # 1. Send text summary
-    message = format_summaries_for_telegram(summaries)
-    text_sent = send_telegram_message(message, bot_token, chat_id)
+    # Format the focused Telegram messages
+    messages = _format_telegram_summaries(summaries)
     
-    # 2. Send chart photo
-    chart_sent = False
-    if chart_path and Path(chart_path).exists():
-        caption = (
-            f"📊 Meta Engine Technical Chart\n"
-            f"_{datetime.now().strftime('%B %d, %Y')}_\n"
-            f"Top picks from PutsEngine (bearish) & Moonshot (bullish)"
-        )
-        chart_sent = send_telegram_photo(chart_path, caption, bot_token, chat_id)
+    logger.info(f"  📱 Sending {len(messages)} Telegram messages (summaries + conflicts only)")
     
-    return text_sent
+    # Send all messages
+    return _send_multiple_messages(messages, bot_token, chat_id)

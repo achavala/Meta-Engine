@@ -18,6 +18,10 @@ matplotlib>=3.8.0
 # Scheduling
 apscheduler>=3.10.0
 
+# Email: MD→HTML + PDF attachment
+markdown2>=2.4.0
+fpdf2>=2.7.0
+
 # Twitter/X API
 tweepy>=4.14.0
 
