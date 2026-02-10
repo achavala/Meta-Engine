@@ -1626,6 +1626,14 @@ def cross_analyze(
             "moonshot_analysis": moonshot_view,
             "market_data": market_data,
         }
+        # ALWAYS use real-time Polygon price — cached prices can be hours stale
+        if market_data.get("price", 0) > 0:
+            old_price = cross_result.get("price", 0)
+            cross_result["price"] = market_data["price"]
+            if old_price > 0 and old_price != market_data["price"]:
+                pct = ((market_data["price"] - old_price) / old_price) * 100
+                if abs(pct) > 1:
+                    logger.info(f"  {symbol}: price ${old_price:.2f}→${market_data['price']:.2f} ({pct:+.1f}%)")
         results["puts_through_moonshot"].append(cross_result)
         logger.info(f"  {symbol}: Puts={pick['score']:.2f} | Moonshot={moonshot_view['opportunity_level']}")
     
@@ -1641,6 +1649,14 @@ def cross_analyze(
             "puts_analysis": puts_view,
             "market_data": market_data,
         }
+        # ALWAYS use real-time Polygon price — cached prices can be hours stale
+        if market_data.get("price", 0) > 0:
+            old_price = cross_result.get("price", 0)
+            cross_result["price"] = market_data["price"]
+            if old_price > 0 and old_price != market_data["price"]:
+                pct = ((market_data["price"] - old_price) / old_price) * 100
+                if abs(pct) > 1:
+                    logger.info(f"  {symbol}: price ${old_price:.2f}→${market_data['price']:.2f} ({pct:+.1f}%)")
         results["moonshot_through_puts"].append(cross_result)
         logger.info(f"  {symbol}: Moonshot={pick['score']:.2f} | Puts Risk={puts_view['risk_level']}")
     
@@ -1680,24 +1696,32 @@ def cross_analyze(
     combined = []
     
     for item in results["puts_through_moonshot"]:
+        # Use market data price as fallback if pick price is 0
+        price = item.get("price", 0)
+        if price == 0:
+            price = item.get("market_data", {}).get("price", 0)
         combined.append({
             "symbol": item["symbol"],
             "source_engine": "PutsEngine",
             "source_score": item["score"],
             "cross_analysis": item["moonshot_analysis"]["analysis"],
             "cross_level": item["moonshot_analysis"]["opportunity_level"],
-            "price": item.get("price", 0),
+            "price": price,
             "combined_signal": f"PUT {item['score']:.2f} | Moonshot: {item['moonshot_analysis']['opportunity_level']}",
         })
     
     for item in results["moonshot_through_puts"]:
+        # Use market data price as fallback if pick price is 0
+        price = item.get("price", 0)
+        if price == 0:
+            price = item.get("market_data", {}).get("price", 0)
         combined.append({
             "symbol": item["symbol"],
             "source_engine": "Moonshot",
             "source_score": item["score"],
             "cross_analysis": item["puts_analysis"]["analysis"],
             "cross_level": item["puts_analysis"]["risk_level"],
-            "price": item.get("price", 0),
+            "price": price,
             "combined_signal": f"MOONSHOT {item['score']:.2f} | Puts Risk: {item['puts_analysis']['risk_level']}",
         })
     

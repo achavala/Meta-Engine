@@ -112,6 +112,49 @@ def _release_lock(lock_fd):
             pass
 
 
+def _backfill_prices_from_cross(
+    picks: list,
+    cross_items: list,
+) -> None:
+    """
+    ALWAYS update prices in the original pick list using the real-time
+    market data from the cross-analysis step (which fetched 30-day bars
+    from Polygon API).
+
+    This ensures saved files and report tables show the most current
+    prices, even when the initial picks came from cached PutsEngine
+    files with stale prices (e.g. RBLX $66 cached → $73 real-time).
+
+    Unlike the previous version, this does NOT check for price==0 first.
+    Stale non-zero prices are just as dangerous as zero prices for
+    trading decisions.
+    """
+    cross_map = {item["symbol"]: item for item in cross_items}
+    updated = 0
+    for pick in picks:
+        sym = pick["symbol"]
+        cx = cross_map.get(sym, {})
+        # The cross-analysis market_data uses the latest Polygon 30-day bars
+        md_price = cx.get("market_data", {}).get("price", 0)
+        if md_price > 0:
+            old_price = pick.get("price", 0)
+            if old_price != md_price:
+                if old_price > 0:
+                    pct_diff = ((md_price - old_price) / old_price) * 100
+                    if abs(pct_diff) > 1:
+                        logger.debug(
+                            f"    {sym}: ${old_price:.2f} → ${md_price:.2f} "
+                            f"({pct_diff:+.1f}%)"
+                        )
+                pick["price"] = md_price
+                updated += 1
+    if updated > 0:
+        logger.info(
+            f"  ✅ Updated prices for {updated} picks from cross-analysis "
+            f"Polygon market data (most current)"
+        )
+
+
 def run_meta_engine(force: bool = False) -> Dict[str, Any]:
     """
     Execute the full Meta Engine pipeline.
@@ -217,11 +260,25 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
     )
     results["cross_analysis"] = cross_results
     
+    # Back-fill prices from cross-analysis market data into the original picks
+    # (so the saved top10 files and report tables show real prices)
+    _backfill_prices_from_cross(puts_top10, cross_results.get("puts_through_moonshot", []))
+    _backfill_prices_from_cross(moonshot_top10, cross_results.get("moonshot_through_puts", []))
+    
+    # Re-save top10 files with enriched prices
+    with open(puts_file, "w") as f:
+        json.dump({"timestamp": now.isoformat(), "picks": puts_top10}, f, indent=2, default=str)
+    with open(moon_file, "w") as f:
+        json.dump({"timestamp": now.isoformat(), "picks": moonshot_top10}, f, indent=2, default=str)
+    
     # Save cross-analysis
     cross_file = output_dir / f"cross_analysis_{now.strftime('%Y%m%d')}.json"
     with open(cross_file, "w") as f:
         json.dump(cross_results, f, indent=2, default=str)
     logger.info(f"  💾 Saved: {cross_file}")
+    # Save latest cross-analysis (always reflects most recent run)
+    with open(output_dir / "cross_analysis_latest.json", "w") as f:
+        json.dump(cross_results, f, indent=2, default=str)
     
     # ================================================================
     # STEP 4: Generate 3-Sentence Summaries
@@ -239,6 +296,9 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
     with open(summary_file, "w") as f:
         json.dump(summaries, f, indent=2, default=str)
     logger.info(f"  💾 Saved: {summary_file}")
+    # Save latest summaries (always reflects most recent run)
+    with open(output_dir / "summaries_latest.json", "w") as f:
+        json.dump(summaries, f, indent=2, default=str)
     
     # Print summaries to log
     logger.info(f"\n📊 FINAL SUMMARY:\n{summaries.get('final_summary', '')}")

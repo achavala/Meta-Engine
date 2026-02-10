@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+    META ENGINE — APScheduler Daemon (macOS launchd)
+    =================================================
+    Keeps the Meta Engine scheduler running at ALL times.
+    The APScheduler inside handles:
+      - 9:35 AM ET  Mon-Fri (morning scan)
+      - 3:15 PM ET  Mon-Fri (afternoon scan)
+      - Timezone-aware (US/Eastern)
+      - Misfire recovery: if Mac was sleeping, fires within 60 min of wake
+      - Weekday-only: never runs on weekends or US holidays
+
+    KeepAlive: true  → launchd restarts if process exits/crashes
+    RunAtLoad: true  → starts automatically on login/reboot
+
+    Management:
+      launchctl load   ~/Library/LaunchAgents/com.metaengine.scheduler.plist
+      launchctl unload ~/Library/LaunchAgents/com.metaengine.scheduler.plist
+      launchctl list | grep metaengine
+    -->
+
+    <key>Label</key>
+    <string>com.metaengine.scheduler</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/chavala/Meta Engine/start_scheduler.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/chavala/Meta Engine</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/chavala/Meta Engine/logs/scheduler_stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/chavala/Meta Engine/logs/scheduler_stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <key>HOME</key>
+        <string>/Users/chavala</string>
+    </dict>
+
+    <!-- Auto-start on login/reboot -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Auto-restart if process exits for any reason -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Wait 10 seconds before restarting after a crash -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+</dict>
+</plist>

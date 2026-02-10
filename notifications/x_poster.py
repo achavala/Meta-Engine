@@ -213,14 +213,15 @@ def format_tweets_institutional(
     moon_through = cross_results.get("moonshot_through_puts", [])[:3]
     
     # ===== TWEET 1: Thread Header =====
-    n_puts = len(cross_results.get("puts_through_moonshot", []))
-    n_moon = len(cross_results.get("moonshot_through_puts", []))
+    # Include time to ensure AM and PM posts are unique (avoids duplicate content error)
+    puts_top3_syms = ", ".join(p["symbol"] for p in puts_through) or "N/A"
+    moon_top3_syms = ", ".join(p["symbol"] for p in moon_through) or "N/A"
     
     tweet1 = (
-        f"🏛️ Meta Engine Daily Alert ({now.strftime('%b %d')})\n\n"
-        f"🔴 {n_puts} PUT candidates scanned\n"
-        f"🟢 {n_moon} MOONSHOT candidates scanned\n\n"
-        f"Top 3 from each engine below 🧵👇\n\n"
+        f"🏛️ Meta Engine Daily Alert ({now.strftime('%b %d — %I:%M %p')} ET)\n\n"
+        f"🔴 Top 3 PUT candidates: {puts_top3_syms}\n"
+        f"🟢 Top 3 MOONSHOT candidates: {moon_top3_syms}\n\n"
+        f"Details below 🧵👇\n\n"
         f"#Trading #Options #MetaEngine"
     )
     tweets.append(tweet1)
@@ -233,17 +234,12 @@ def format_tweets_institutional(
         entry_range = _compute_entry_range(pick, is_puts=True)
         target_str, rr_str = _compute_target_and_rr(pick, is_puts=True)
         
-        # Get cross-analysis insight
-        moon_analysis = pick.get("moonshot_analysis", {})
-        moon_opp = moon_analysis.get("opportunity_level", "N/A")
-        
         tweet = (
             f"🔴 PUT #{i}:\n\n"
             f"{sym} ({signal_type})\n"
             f"Entry: {entry_range}\n"
             f"Target: {target_str}\n"
-            f"R:R: {rr_str} | Score: {score:.2f}\n\n"
-            f"Cross-check: Moon {moon_opp}"
+            f"R:R: {rr_str} | Score: {score:.2f}"
         )
         
         # Ensure within 280 chars
@@ -260,17 +256,12 @@ def format_tweets_institutional(
         entry_range = _compute_entry_range(pick, is_puts=False)
         target_str, rr_str = _compute_target_and_rr(pick, is_puts=False)
         
-        # Get cross-analysis insight
-        puts_analysis = pick.get("puts_analysis", {})
-        puts_risk = puts_analysis.get("risk_level", "N/A")
-        
         tweet = (
             f"🟢 CALL #{i}:\n\n"
             f"{sym} ({signal_type})\n"
             f"Entry: {entry_range}\n"
             f"Target: {target_str}\n"
-            f"R:R: {rr_str} | Score: {score:.2f}\n\n"
-            f"Cross-check: Puts Risk {puts_risk}"
+            f"R:R: {rr_str} | Score: {score:.2f}"
         )
         
         if len(tweet) > 280:

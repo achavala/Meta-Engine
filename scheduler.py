@@ -137,7 +137,7 @@ def start_scheduler():
             kwargs={"session_label": label},
             id=f"meta_engine_{label.lower()}",
             name=f"Meta Engine {label} Run ({run_time} ET)",
-            misfire_grace_time=300,  # 5 min grace period
+            misfire_grace_time=3600,  # 60 min grace period (handles sleep/wake)
         )
         logger.info(f"  ✅ Job scheduled: {label} at {run_time} ET, Mon-Fri")
     
