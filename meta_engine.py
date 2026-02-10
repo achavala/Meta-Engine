@@ -410,6 +410,27 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
         logger.error(f"X/Twitter failed: {e}")
     
     # ================================================================
+    # STEP 9: Automated Trading (Alpaca Options)
+    # ================================================================
+    logger.info("\n" + "=" * 50)
+    logger.info("STEP 9: Executing Trades (Alpaca Paper)...")
+    logger.info("=" * 50)
+
+    results["trading"] = {"status": "skipped"}
+    try:
+        from trading.executor import execute_trades
+        # Determine session label from current time
+        session_label = "AM" if now.hour < 12 else "PM"
+        trade_result = execute_trades(
+            cross_results=cross_results,
+            session_label=session_label,
+        )
+        results["trading"] = trade_result
+    except Exception as e:
+        logger.error(f"Trading execution failed: {e}", exc_info=True)
+        results["trading"] = {"status": "error", "error": str(e)}
+
+    # ================================================================
     # FINAL STATUS
     # ================================================================
     results["status"] = "completed"
@@ -420,6 +441,9 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
     with open(final_file, "w") as f:
         json.dump(results, f, indent=2, default=str)
     
+    trading_status = results.get("trading", {})
+    trades_placed = trading_status.get("trades_placed", 0)
+
     logger.info("\n" + "=" * 70)
     logger.info("🏛️  META ENGINE — COMPLETED")
     logger.info(f"   Puts picks: {len(puts_top10)}")
@@ -428,6 +452,7 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
     logger.info(f"   Telegram: {'✅' if results['notifications']['telegram'] else '❌'}")
     logger.info(f"   X/Twitter: {'✅' if results['notifications']['x_twitter'] else '❌'}")
     logger.info(f"   Chart: {'✅' if chart_path else '❌'}")
+    logger.info(f"   Trading: {'✅' if trades_placed > 0 else '⏸️'} ({trades_placed} orders)")
     logger.info(f"   Output: {output_dir}")
     logger.info("=" * 70)
     

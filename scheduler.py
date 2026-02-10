@@ -25,6 +25,7 @@ import sys
 import os
 import signal
 import logging
+import subprocess
 from datetime import datetime, date
 from pathlib import Path
 
@@ -88,11 +89,95 @@ def _scheduled_run(session_label: str = ""):
         logger.error(f"Scheduled run FAILED: {e}", exc_info=True)
 
 
+def _start_dashboard_thread():
+    """Start the Flask trading dashboard in a background thread (port 5050)."""
+    try:
+        import threading
+        from trading.dashboard import start_dashboard
+        t = threading.Thread(target=start_dashboard, daemon=True, name="dashboard")
+        t.start()
+        logger.info("  🖥️  Flask dashboard started on http://localhost:5050")
+    except Exception as e:
+        logger.warning(f"  Flask dashboard failed to start: {e} (non-critical)")
+
+
+def _start_streamlit_dashboard():
+    """Start the Streamlit trading dashboard as a subprocess (port 8511)."""
+    try:
+        venv_streamlit = str(META_DIR / "venv" / "bin" / "streamlit")
+        app_path = str(META_DIR / "trading" / "streamlit_dashboard.py")
+        proc = subprocess.Popen(
+            [
+                venv_streamlit, "run", app_path,
+                "--server.port", "8511",
+                "--server.headless", "true",
+                "--server.address", "0.0.0.0",
+                "--browser.gatherUsageStats", "false",
+                "--theme.base", "dark",
+            ],
+            cwd=str(META_DIR),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        logger.info(f"  🖥️  Streamlit dashboard started on http://localhost:8511 (PID {proc.pid})")
+    except Exception as e:
+        logger.warning(f"  Streamlit dashboard failed to start: {e} (non-critical)")
+
+
+# ═══════════════════════════════════════════════════════
+# Power management — keep Mac awake during market hours
+# ═══════════════════════════════════════════════════════
+_caffeinate_proc: subprocess.Popen = None  # type: ignore
+
+
+def _keep_awake_market_hours():
+    """
+    Prevent the Mac from idle-sleeping during market hours.
+    Called at 9:20 AM ET by APScheduler; keeps awake for ~7 hours
+    (covers both 9:35 AM and 3:15 PM runs, plus market close at 4 PM).
+    Uses macOS `caffeinate` — no sudo needed.
+    """
+    global _caffeinate_proc
+    # Kill any previous caffeinate if still running
+    if _caffeinate_proc and _caffeinate_proc.poll() is None:
+        _caffeinate_proc.terminate()
+        _caffeinate_proc = None
+
+    duration = 25200  # 7 hours in seconds (9:20 AM → 4:20 PM)
+    try:
+        _caffeinate_proc = subprocess.Popen(
+            ["caffeinate", "-dims", "-t", str(duration)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        logger.info(f"  ☕ caffeinate started (7h) — Mac stays awake until market close "
+                     f"(PID {_caffeinate_proc.pid})")
+    except Exception as e:
+        logger.warning(f"  caffeinate failed: {e} (Mac may sleep during trading hours)")
+
+
+def _midday_position_check():
+    """
+    Mid-day check of open positions (take-profit / stop-loss / time-stop).
+    Runs at 12:00 PM ET to catch intraday moves between the AM and PM scans.
+    """
+    now_str = datetime.now(EST).strftime('%I:%M:%S %p ET')
+    logger.info(f"📋 Mid-day position check at {now_str}")
+    try:
+        from trading.executor import check_and_manage_positions
+        result = check_and_manage_positions()
+        logger.info(f"   Positions checked: {result.get('checked', 0)} | "
+                     f"Closed: {result.get('closed', 0)}")
+    except Exception as e:
+        logger.error(f"   Position check failed: {e}")
+
+
 def start_scheduler():
     """
     Start the APScheduler daemon that runs Meta Engine twice daily:
       - 9:35 AM ET  (morning scan)
       - 3:15 PM ET  (afternoon scan)
+    Also starts the trading dashboard on port 5050.
     """
     try:
         from apscheduler.schedulers.blocking import BlockingScheduler
@@ -109,6 +194,10 @@ def start_scheduler():
     logger.info(f"   Run times: {', '.join(run_times)} ET (every trading day)")
     logger.info(f"   PID: {os.getpid()}")
     logger.info("=" * 60)
+
+    # Start dashboards in background
+    _start_dashboard_thread()         # Flask on :5050
+    _start_streamlit_dashboard()      # Streamlit on :8511
     
     # Write PID
     _write_pid()
@@ -120,7 +209,21 @@ def start_scheduler():
     # Create scheduler
     scheduler = BlockingScheduler(timezone=EST)
     
-    # Schedule each run time (Mon-Fri)
+    # ── Job 0: Keep Mac awake during market hours (9:20 AM) ──
+    scheduler.add_job(
+        _keep_awake_market_hours,
+        trigger=CronTrigger(
+            hour=9, minute=20,
+            day_of_week="mon-fri",
+            timezone=EST,
+        ),
+        id="caffeinate_market_hours",
+        name="Keep Mac awake 9:20 AM - 4:20 PM ET",
+        misfire_grace_time=3600,
+    )
+    logger.info("  ✅ Job scheduled: caffeinate at 9:20 AM ET, Mon-Fri")
+
+    # ── Job 1 & 2: Meta Engine runs (scan + trade) ──
     session_labels = {0: "Morning", 1: "Afternoon"}
     for idx, run_time in enumerate(run_times):
         hour, minute = map(int, run_time.split(":"))
@@ -140,7 +243,26 @@ def start_scheduler():
             misfire_grace_time=3600,  # 60 min grace period (handles sleep/wake)
         )
         logger.info(f"  ✅ Job scheduled: {label} at {run_time} ET, Mon-Fri")
-    
+
+    # ── Job 3: Mid-day position check (12:00 PM) ──
+    scheduler.add_job(
+        _midday_position_check,
+        trigger=CronTrigger(
+            hour=12, minute=0,
+            day_of_week="mon-fri",
+            timezone=EST,
+        ),
+        id="midday_position_check",
+        name="Mid-day Position Check (12:00 PM ET)",
+        misfire_grace_time=3600,
+    )
+    logger.info("  ✅ Job scheduled: Position check at 12:00 PM ET, Mon-Fri")
+
+    # If Mac is currently awake and it's market hours, start caffeinate now
+    now_et = datetime.now(EST)
+    if now_et.weekday() < 5 and 9 <= now_et.hour < 16:
+        _keep_awake_market_hours()
+
     logger.info("Waiting for next scheduled run time...")
     logger.info("(Press Ctrl+C to stop)")
     

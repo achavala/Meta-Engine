@@ -25,16 +25,15 @@ mkdir -p "${LOG_DIR}"
 # Change to the Meta Engine directory (so .env load works)
 cd "${META_DIR}"
 
-# Load environment variables from Meta Engine .env
-if [ -f "${META_DIR}/.env" ]; then
-    export $(grep -v '^#' "${META_DIR}/.env" | grep -v '^\s*$' | xargs)
-fi
-
-# Also load PutsEngine .env for live scan API keys (POLYGON, ALPACA, UW)
-# These are needed for the PutsEngine live scan to work
-PUTSENGINE_ENV="/Users/chavala/PutsEngine/.env"
+# Load PutsEngine .env FIRST (base keys: POLYGON, UW, etc.)
+PUTSENGINE_ENV="/Users/cla/PutsEngine/.env"
 if [ -f "${PUTSENGINE_ENV}" ]; then
     export $(grep -v '^#' "${PUTSENGINE_ENV}" | grep -v '^\s*$' | xargs)
+fi
+
+# Load Meta Engine .env LAST so its keys take priority (ALPACA, TELEGRAM, X, etc.)
+if [ -f "${META_DIR}/.env" ]; then
+    export $(grep -v '^#' "${META_DIR}/.env" | grep -v '^\s*$' | xargs)
 fi
 
 # Log startup

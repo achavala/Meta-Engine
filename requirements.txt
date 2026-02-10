@@ -25,9 +25,12 @@ fpdf2>=2.7.0
 # Twitter/X API
 tweepy>=4.14.0
 
+# Trading Dashboard
+flask>=3.0.0
+
 # PutsEngine dependencies (if not installed globally)
 pydantic>=2.5.0
 pydantic-settings>=2.1.0
-# loguru>=0.7.2
-# aiohttp>=3.9.0
-# alpaca-py>=0.21.0
+loguru>=0.7.2
+aiohttp>=3.9.0
+alpaca-py>=0.21.0
