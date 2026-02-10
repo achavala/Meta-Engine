@@ -45,6 +45,34 @@ def generate_md_report(
     lines.append(f"**Date:** {datetime.now().strftime('%B %d, %Y %I:%M %p ET')}")
     lines.append(f"**Run Type:** Scheduled (9:35 AM / 3:15 PM ET)")
     lines.append("")
+
+    # Signal freshness summary — warn if data is stale
+    freshness_warnings = []
+    for label, picks_list in [("Moonshot", moon_picks), ("PutsEngine", puts_picks)]:
+        ages = [p.get("data_age_days", -1) for p in picks_list if p.get("data_age_days", -1) >= 0]
+        if ages:
+            max_age = max(ages)
+            avg_age = sum(ages) / len(ages)
+            if max_age >= 3:
+                freshness_warnings.append(
+                    f"🔴 **{label}**: Oldest data is **{max_age} days old** — "
+                    f"picks may be stale. Avg age: {avg_age:.1f}d."
+                )
+            elif max_age >= 1:
+                freshness_warnings.append(
+                    f"🟡 **{label}**: Data is {max_age}d old (avg {avg_age:.1f}d)."
+                )
+            else:
+                freshness_warnings.append(
+                    f"🟢 **{label}**: Fresh data (today's scan)."
+                )
+    if freshness_warnings:
+        lines.append("### 📡 Data Freshness")
+        lines.append("")
+        for w in freshness_warnings:
+            lines.append(f"- {w}")
+        lines.append("")
+
     lines.append("---")
     lines.append("")
 
@@ -57,22 +85,37 @@ def generate_md_report(
     # Puts Engine Top 10
     lines.append("## 🔴 PutsEngine Top 10 (Bearish Picks)")
     lines.append("")
-    lines.append("| # | Ticker | Price | Score | Signals | Engine Type |")
-    lines.append("|---|--------|-------|-------|---------|-------------|")
+    low_conviction_count = sum(1 for p in puts_picks if p["score"] < 0.20)
+    if low_conviction_count > 0:
+        lines.append(
+            f"> ⚠️ **{low_conviction_count}/{len(puts_picks)} picks are below the 0.20 "
+            f"conviction threshold** — treat these as low-confidence signals. "
+            f"Only scores ≥ 0.20 have historically shown actionable edge."
+        )
+        lines.append("")
+    lines.append("| # | Ticker | Price | Score | Conviction | Signals | Engine Type |")
+    lines.append("|---|--------|-------|-------|------------|---------|-------------|")
     for i, p in enumerate(puts_picks, 1):
         sym = p["symbol"]
         price = p.get("price", 0)
         score = p["score"]
         sig_count = len(p.get("signals", []))
         etype = p.get("engine_type", "N/A")
-        lines.append(f"| {i} | **{sym}** | ${price:.2f} | {score:.3f} | {sig_count} | {etype} |")
+        # Score threshold gate: flag low conviction picks
+        if score >= 0.40:
+            conviction = "🟢 HIGH"
+        elif score >= 0.20:
+            conviction = "🟡 MED"
+        else:
+            conviction = "🔻 LOW"
+        lines.append(f"| {i} | **{sym}** | ${price:.2f} | {score:.3f} | {conviction} | {sig_count} | {etype} |")
     lines.append("")
 
     # Moonshot Engine Top 10
     lines.append("## 🟢 Moonshot Top 10 (Bullish/Catalyst Picks)")
     lines.append("")
-    lines.append("| # | Ticker | Price | Score | Signals | Sentiment | Target | Source |")
-    lines.append("|---|--------|-------|-------|---------|-----------|--------|--------|")
+    lines.append("| # | Ticker | Price | Score | Signals | Sentiment | Target | Data Age |")
+    lines.append("|---|--------|-------|-------|---------|-----------|--------|----------|")
     for i, p in enumerate(moon_picks, 1):
         sym = p["symbol"]
         price = p.get("price", 0)
@@ -80,9 +123,19 @@ def generate_md_report(
         sig_count = len(p.get("signals", []))
         sentiment = p.get("uw_sentiment", "N/A")
         target = p.get("target", 0)
-        src = p.get("source", p.get("engine", "N/A"))
         target_str = f"${target:.2f}" if target else "N/A"
-        lines.append(f"| {i} | **{sym}** | ${price:.2f} | {score:.3f} | {sig_count} | {sentiment} | {target_str} | {src} |")
+        age = p.get("data_age_days", -1)
+        if age < 0:
+            age_str = "—"
+        elif age == 0:
+            age_str = "🟢 Today"
+        elif age == 1:
+            age_str = "🟡 1d"
+        elif age <= 3:
+            age_str = f"🟠 {age}d"
+        else:
+            age_str = f"🔴 {age}d stale"
+        lines.append(f"| {i} | **{sym}** | ${price:.2f} | {score:.3f} | {sig_count} | {sentiment} | {target_str} | {age_str} |")
     lines.append("")
 
     # Cross Analysis
@@ -156,6 +209,34 @@ def generate_md_report(
         lines.append(f"**HIGH Conflicts:** {' | '.join(high_conf) if high_conf else 'None'}")
         lines.append(f"**MODERATE Conflicts:** {' | '.join(mod_conf) if mod_conf else 'None'}")
     lines.append("")
+
+    # Overnight Gap Alerts
+    gap_alerts = []
+    for item in ptm_list + mtp_list:
+        alert = item.get("overnight_gap_alert")
+        if alert:
+            gap_alerts.append(alert)
+
+    if gap_alerts:
+        lines.append("### 🚨 Overnight Gap Alerts")
+        lines.append("")
+        lines.append(
+            "> Large overnight price gaps can invalidate the original pick thesis. "
+            "Entries based on the original scan price may no longer offer the expected "
+            "risk/reward ratio."
+        )
+        lines.append("")
+        lines.append("| Ticker | Pick Price | Open | Gap% | Severity | Impact |")
+        lines.append("|--------|-----------|------|------|----------|--------|")
+        for alert in gap_alerts:
+            gap_pct = alert["gap_pct"]
+            impact = "Thesis likely invalidated" if abs(gap_pct) >= 10 else "Reassess entry"
+            lines.append(
+                f"| **{alert['symbol']}** | ${alert['pick_price']:.2f} | "
+                f"${alert['today_open']:.2f} | {gap_pct:+.1f}% | "
+                f"{alert['severity']} | {impact} |"
+            )
+        lines.append("")
 
     # Summaries
     lines.append("## 📝 3-Sentence Institutional Summaries")

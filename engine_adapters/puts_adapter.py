@@ -21,6 +21,15 @@ PUTSENGINE_PATH = str(Path.home() / "PutsEngine")
 if PUTSENGINE_PATH not in sys.path:
     sys.path.insert(0, PUTSENGINE_PATH)
 
+# Load PutsEngine's .env for API keys (needed for live scan)
+_putsengine_env = Path(PUTSENGINE_PATH) / ".env"
+if _putsengine_env.exists():
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(_putsengine_env, override=False)  # Don't override existing vars
+    except ImportError:
+        pass
+
 
 def get_top_puts(top_n: int = 10) -> List[Dict[str, Any]]:
     """
@@ -133,6 +142,7 @@ def _fallback_from_cached_results(top_n: int = 10) -> List[Dict[str, Any]]:
     """
     all_candidates = []
     source_used = "none"
+    data_age_days = -1  # Track freshness of the source file
     
     # ── Tier 1: scheduled_scan_results.json ──────────────────────────
     try:
@@ -140,7 +150,13 @@ def _fallback_from_cached_results(top_n: int = 10) -> List[Dict[str, Any]]:
         if results_file.exists():
             with open(results_file) as f:
                 data = json.load(f)
-            
+
+            # Calculate data age from file modification time
+            file_mtime = datetime.fromtimestamp(results_file.stat().st_mtime)
+            data_age_days = (datetime.now() - file_mtime).days
+            scan_ts = data.get("scan_time", data.get("timestamp", ""))
+            data_source_label = f"scheduled_scan_results ({scan_ts or file_mtime.strftime('%Y-%m-%d %H:%M')})"
+
             for engine_key in ["gamma_drain", "distribution", "liquidity"]:
                 for c in data.get(engine_key, []):
                     all_candidates.append({
@@ -156,18 +172,18 @@ def _fallback_from_cached_results(top_n: int = 10) -> List[Dict[str, Any]]:
                         "engine": f"PutsEngine ({engine_key})",
                         "engine_type": engine_key,
                         # Preserve pattern data for score enrichment
-                        # (PutsEngine's pattern integration may not have
-                        #  run yet when we read this file, so base scores
-                        #  can be uniform until pattern_boost is applied)
                         "pattern_boost": c.get("pattern_boost", 0),
                         "pattern_enhanced": c.get("pattern_enhanced", False),
                         "vol_ratio": c.get("vol_ratio", 0),
                         "tier": c.get("tier", ""),
+                        "data_source": data_source_label,
+                        "data_age_days": data_age_days,
                     })
             
             if all_candidates:
                 source_used = "scheduled_scan_results.json"
-                logger.info(f"  Tier 1 (scheduled_scan): {len(all_candidates)} candidates")
+                age_tag = f" [{data_age_days}d old]" if data_age_days > 0 else " [fresh]"
+                logger.info(f"  Tier 1 (scheduled_scan): {len(all_candidates)} candidates{age_tag}")
     except Exception as e:
         logger.debug(f"  Tier 1 failed: {e}")
     
@@ -191,6 +207,13 @@ def _fallback_from_cached_results(top_n: int = 10) -> List[Dict[str, Any]]:
                         scan_ts = scan.get("timestamp", "unknown")
                         logger.info(f"  Tier 2: Found scan with {total_picks} picks from {scan_ts}")
                         
+                        # Calculate age from scan timestamp
+                        try:
+                            scan_dt = datetime.fromisoformat(scan_ts) if scan_ts and scan_ts != "unknown" else None
+                            tier2_age = (datetime.now() - scan_dt).days if scan_dt else -1
+                        except (ValueError, TypeError):
+                            tier2_age = -1
+
                         for engine_key, picks in [("gamma_drain", gamma), ("distribution", dist), ("liquidity", liq)]:
                             for c in picks:
                                 all_candidates.append({
@@ -210,6 +233,8 @@ def _fallback_from_cached_results(top_n: int = 10) -> List[Dict[str, Any]]:
                                     "pattern_enhanced": c.get("pattern_enhanced", False),
                                     "vol_ratio": c.get("vol_ratio", 0),
                                     "tier": c.get("tier", ""),
+                                    "data_source": f"scan_history ({scan_ts})",
+                                    "data_age_days": tier2_age,
                                 })
                         
                         source_used = f"scan_history.json ({scan_ts})"
@@ -363,14 +388,26 @@ def _validate_picks(picks: List[Dict[str, Any]], source: str) -> None:
             f"data came from a minimal source"
         )
 
+    # Score threshold gate: warn about low-conviction puts
+    low_conviction = [p for p in picks if p["score"] < 0.20]
+    if low_conviction:
+        syms = ", ".join(p["symbol"] for p in low_conviction)
+        logger.warning(
+            f"  ⚠️ LOW CONVICTION ({source}): {len(low_conviction)}/{len(picks)} "
+            f"picks have score < 0.20 — [{syms}]. "
+            f"These should be treated as noise, not actionable signals."
+        )
+
     # Log the final pick summary for audit trail
     for i, p in enumerate(picks, 1):
+        conv_tag = " ⚠️LOW" if p["score"] < 0.20 else ""
         logger.info(
             f"    #{i:2d} {p['symbol']:6s} "
             f"score={p['score']:.3f} "
             f"price=${p.get('price', 0):.2f} "
             f"signals={len(p.get('signals', []))} "
             f"engine={p.get('engine_type', '?')}"
+            f"{conv_tag}"
         )
 
 

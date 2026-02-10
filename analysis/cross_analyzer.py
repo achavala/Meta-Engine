@@ -1582,6 +1582,64 @@ def _basic_moonshot_assessment(
     return result
 
 
+def _detect_overnight_gap(
+    symbol: str,
+    pick: Dict[str, Any],
+    market_data: Dict[str, Any],
+    gap_threshold_pct: float = 5.0,
+) -> Optional[Dict[str, Any]]:
+    """
+    Detect large overnight gaps that may invalidate the original pick thesis.
+
+    Example: TSLA picked at $448.10, but opened at $409.90 (-8.5%).
+    Such a gap fundamentally changes the risk/reward — the entry is
+    completely different from what the engine analyzed.
+
+    Args:
+        symbol: Ticker symbol
+        pick: Original pick dict (contains the price at scan time)
+        market_data: Live market data from Polygon (contains today's open)
+        gap_threshold_pct: Percentage threshold to trigger alert (default 5%)
+
+    Returns:
+        Alert dict if gap detected, None otherwise.
+    """
+    pick_price = pick.get("price", 0)
+    today_open = market_data.get("open", 0)
+
+    if pick_price <= 0 or today_open <= 0:
+        return None
+
+    gap_pct = ((today_open - pick_price) / pick_price) * 100
+
+    if abs(gap_pct) < gap_threshold_pct:
+        return None
+
+    direction = "DOWN" if gap_pct < 0 else "UP"
+    severity = "CRITICAL" if abs(gap_pct) >= 10 else "WARNING"
+
+    alert = {
+        "symbol": symbol,
+        "pick_price": pick_price,
+        "today_open": today_open,
+        "gap_pct": gap_pct,
+        "direction": direction,
+        "severity": severity,
+        "message": (
+            f"⚠️ OVERNIGHT GAP {severity}: {symbol} opened {gap_pct:+.1f}% "
+            f"from pick price (${pick_price:.2f} → ${today_open:.2f}). "
+            f"Original thesis may be invalidated — reassess entry."
+        ),
+    }
+
+    logger.warning(
+        f"  🚨 {symbol}: Overnight gap {direction} {abs(gap_pct):.1f}% "
+        f"(pick ${pick_price:.2f} → open ${today_open:.2f}) [{severity}]"
+    )
+
+    return alert
+
+
 def cross_analyze(
     puts_top10: List[Dict[str, Any]],
     moonshot_top10: List[Dict[str, Any]],
@@ -1634,6 +1692,12 @@ def cross_analyze(
                 pct = ((market_data["price"] - old_price) / old_price) * 100
                 if abs(pct) > 1:
                     logger.info(f"  {symbol}: price ${old_price:.2f}→${market_data['price']:.2f} ({pct:+.1f}%)")
+
+        # Overnight gap anomaly detection
+        gap_alert = _detect_overnight_gap(symbol, pick, market_data)
+        if gap_alert:
+            cross_result["overnight_gap_alert"] = gap_alert
+
         results["puts_through_moonshot"].append(cross_result)
         logger.info(f"  {symbol}: Puts={pick['score']:.2f} | Moonshot={moonshot_view['opportunity_level']}")
     
@@ -1657,6 +1721,12 @@ def cross_analyze(
                 pct = ((market_data["price"] - old_price) / old_price) * 100
                 if abs(pct) > 1:
                     logger.info(f"  {symbol}: price ${old_price:.2f}→${market_data['price']:.2f} ({pct:+.1f}%)")
+
+        # Overnight gap anomaly detection
+        gap_alert = _detect_overnight_gap(symbol, pick, market_data)
+        if gap_alert:
+            cross_result["overnight_gap_alert"] = gap_alert
+
         results["moonshot_through_puts"].append(cross_result)
         logger.info(f"  {symbol}: Moonshot={pick['score']:.2f} | Puts Risk={puts_view['risk_level']}")
     
@@ -1700,7 +1770,7 @@ def cross_analyze(
         price = item.get("price", 0)
         if price == 0:
             price = item.get("market_data", {}).get("price", 0)
-        combined.append({
+        entry = {
             "symbol": item["symbol"],
             "source_engine": "PutsEngine",
             "source_score": item["score"],
@@ -1708,14 +1778,23 @@ def cross_analyze(
             "cross_level": item["moonshot_analysis"]["opportunity_level"],
             "price": price,
             "combined_signal": f"PUT {item['score']:.2f} | Moonshot: {item['moonshot_analysis']['opportunity_level']}",
-        })
+        }
+        # Propagate overnight gap alert if present
+        if item.get("overnight_gap_alert"):
+            entry["overnight_gap_alert"] = item["overnight_gap_alert"]
+        # Propagate data freshness
+        if item.get("data_source"):
+            entry["data_source"] = item["data_source"]
+        if item.get("data_age_days") is not None:
+            entry["data_age_days"] = item["data_age_days"]
+        combined.append(entry)
     
     for item in results["moonshot_through_puts"]:
         # Use market data price as fallback if pick price is 0
         price = item.get("price", 0)
         if price == 0:
             price = item.get("market_data", {}).get("price", 0)
-        combined.append({
+        entry = {
             "symbol": item["symbol"],
             "source_engine": "Moonshot",
             "source_score": item["score"],
@@ -1723,7 +1802,16 @@ def cross_analyze(
             "cross_level": item["puts_analysis"]["risk_level"],
             "price": price,
             "combined_signal": f"MOONSHOT {item['score']:.2f} | Puts Risk: {item['puts_analysis']['risk_level']}",
-        })
+        }
+        # Propagate overnight gap alert if present
+        if item.get("overnight_gap_alert"):
+            entry["overnight_gap_alert"] = item["overnight_gap_alert"]
+        # Propagate data freshness
+        if item.get("data_source"):
+            entry["data_source"] = item["data_source"]
+        if item.get("data_age_days") is not None:
+            entry["data_age_days"] = item["data_age_days"]
+        combined.append(entry)
     
     combined.sort(key=lambda x: x["source_score"], reverse=True)
     results["combined_ranking"] = combined
