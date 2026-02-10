@@ -11,8 +11,6 @@
 #   launchctl load ~/Library/LaunchAgents/com.metaengine.scheduler.plist
 # ============================================================
 
-set -euo pipefail
-
 # Paths
 META_DIR="/Users/chavala/Meta Engine"
 VENV_PYTHON="${META_DIR}/venv/bin/python3"
@@ -25,15 +23,27 @@ mkdir -p "${LOG_DIR}"
 # Change to the Meta Engine directory (so .env load works)
 cd "${META_DIR}"
 
+# ── Cleanup stale processes from previous run ────────────
+# Kill any leftover Flask/Streamlit from a crashed predecessor
+# (prevents port-conflict crash loops on restart)
+lsof -ti:5050 2>/dev/null | xargs kill -9 2>/dev/null || true
+lsof -ti:8511 2>/dev/null | xargs kill -9 2>/dev/null || true
+sleep 1
+
+# ── Load environment variables ───────────────────────────
 # Load PutsEngine .env FIRST (base keys: POLYGON, UW, etc.)
-PUTSENGINE_ENV="/Users/cla/PutsEngine/.env"
+PUTSENGINE_ENV="/Users/chavala/PutsEngine/.env"
 if [ -f "${PUTSENGINE_ENV}" ]; then
-    export $(grep -v '^#' "${PUTSENGINE_ENV}" | grep -v '^\s*$' | xargs)
+    set +e  # don't exit on bad lines
+    export $(grep -v '^#' "${PUTSENGINE_ENV}" | grep -v '^\s*$' | xargs) 2>/dev/null
+    set -e
 fi
 
 # Load Meta Engine .env LAST so its keys take priority (ALPACA, TELEGRAM, X, etc.)
 if [ -f "${META_DIR}/.env" ]; then
-    export $(grep -v '^#' "${META_DIR}/.env" | grep -v '^\s*$' | xargs)
+    set +e
+    export $(grep -v '^#' "${META_DIR}/.env" | grep -v '^\s*$' | xargs) 2>/dev/null
+    set -e
 fi
 
 # Log startup

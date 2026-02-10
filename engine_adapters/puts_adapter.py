@@ -9,10 +9,22 @@ import sys
 import os
 import asyncio
 import json
+import signal as _signal
 from pathlib import Path
 from datetime import datetime, date, timedelta
 from typing import List, Dict, Any, Optional
 import logging
+
+# Timeout for PutsEngine live scan (seconds).
+# The scan of 361 tickers can take 25+ minutes via Polygon API.
+# If it exceeds this, fall back to cached data so the pipeline continues.
+# FEB 10 FIX: Reduced from 300s (5 min) to 30s.
+# Rationale: PutsEngine's scheduler already scans all 361 tickers at 9:00 AM
+# and saves fresh results to scheduled_scan_results.json by ~9:21 AM.
+# At 9:35 AM, Meta Engine should quickly fall back to that cached data (only 14 min old)
+# instead of doing a redundant 25-minute live scan.
+# Similarly, the 2:45 PM market_pulse scan feeds the 3:15 PM Meta Engine run.
+LIVE_SCAN_TIMEOUT_SEC = 30  # 30 seconds — then fall back to cached data
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +77,10 @@ def get_top_puts(top_n: int = 10) -> List[Dict[str, Any]]:
             errors = 0
             
             for symbol in all_tickers:
+                # FEB 10 FIX: Yield control to the event loop between tickers
+                # so that asyncio.wait_for() can check the timeout.
+                # Without this, the loop blocks and the timeout never fires.
+                await asyncio.sleep(0)
                 try:
                     candidate = await engine.run_single_symbol(symbol)
                     scanned += 1
@@ -102,10 +118,28 @@ def get_top_puts(top_n: int = 10) -> List[Dict[str, Any]]:
             
             logger.info(f"  Scanned {scanned}/{len(all_tickers)}, errors: {errors}")
         
-        # Run async scan
+        # Run async scan with timeout
+        async def _scan_with_timeout():
+            """Run the scan with a hard timeout."""
+            await asyncio.wait_for(_scan_all(), timeout=LIVE_SCAN_TIMEOUT_SEC)
+        
         loop = asyncio.new_event_loop()
         try:
-            loop.run_until_complete(_scan_all())
+            loop.run_until_complete(_scan_with_timeout())
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"  ⏱️ PutsEngine live scan timed out after "
+                f"{LIVE_SCAN_TIMEOUT_SEC}s — using {len(results)} partial "
+                f"results + cached fallback"
+            )
+            if len(results) < top_n:
+                # Supplement partial results with cached data
+                partial_syms = {r["symbol"] for r in results}
+                cached = _fallback_from_cached_results(top_n)
+                for c in cached:
+                    if c["symbol"] not in partial_syms:
+                        results.append(c)
+                        partial_syms.add(c["symbol"])
         finally:
             loop.close()
         
@@ -113,6 +147,25 @@ def get_top_puts(top_n: int = 10) -> List[Dict[str, Any]]:
         results.sort(key=lambda x: x["score"], reverse=True)
         
         top_picks = results[:top_n]
+        
+        # ──────────────────────────────────────────────────────────
+        # CRITICAL FIX: If live scan returned 0 picks (all tickers
+        # had composite_score <= 0), fall back to cached data.
+        # This commonly happens on the PM scan when PutsEngine's
+        # real-time analysis doesn't find passing candidates due to
+        # different intraday conditions or API exhaustion.
+        # ──────────────────────────────────────────────────────────
+        if not top_picks:
+            logger.warning(
+                "  ⚠️ PutsEngine live scan returned 0 picks "
+                "(all tickers scored ≤ 0) — falling back to cached data"
+            )
+            fallback_picks = _fallback_from_cached_results(top_n)
+            if fallback_picks:
+                _validate_picks(fallback_picks, "cached fallback (live scan empty)")
+                return fallback_picks
+            logger.warning("  ⚠️ Cached fallback also empty — returning empty list")
+        
         logger.info(f"🔴 PutsEngine: Top {len(top_picks)} picks selected")
         for i, p in enumerate(top_picks, 1):
             logger.info(f"  #{i} {p['symbol']} — Score: {p['score']:.3f} — ${p['price']:.2f}")

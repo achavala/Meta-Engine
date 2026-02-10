@@ -78,11 +78,49 @@ def is_trading_day(d: date = None) -> bool:
     return True
 
 
+LOCK_STALE_MINUTES = 30  # Auto-release lock if older than 30 min
+
+
 def _acquire_lock() -> Optional[object]:
     """
     Acquire an exclusive file lock to prevent concurrent Meta Engine runs.
     Returns the lock file object if acquired, None if another run is active.
+    
+    Stale lock detection: if the lock file is > LOCK_STALE_MINUTES old,
+    assume the previous holder crashed and force-release the lock.
     """
+    # ── Stale lock detection ──────────────────────────────────
+    if LOCK_FILE.exists():
+        try:
+            lock_age_sec = (datetime.now() - datetime.fromtimestamp(
+                LOCK_FILE.stat().st_mtime)).total_seconds()
+            if lock_age_sec > LOCK_STALE_MINUTES * 60:
+                # Read old lock info for diagnostics
+                try:
+                    old_info = LOCK_FILE.read_text().strip()
+                except Exception:
+                    old_info = "(unreadable)"
+                logger.warning(
+                    f"🔓 Stale lock detected ({lock_age_sec/60:.0f} min old). "
+                    f"Force-releasing. Old lock: {old_info}"
+                )
+                # Try to kill the stale process if PID is available
+                for line in old_info.split("\n"):
+                    if line.startswith("pid="):
+                        try:
+                            stale_pid = int(line.split("=")[1])
+                            os.kill(stale_pid, 0)  # Check if alive
+                            os.kill(stale_pid, 9)  # Force kill
+                            logger.warning(f"  Killed stale process PID {stale_pid}")
+                        except (ProcessLookupError, ValueError):
+                            pass  # Already dead
+                        except PermissionError:
+                            logger.warning(f"  Cannot kill PID (permission denied)")
+                LOCK_FILE.unlink(missing_ok=True)
+        except Exception as e:
+            logger.debug(f"  Stale lock check error: {e}")
+    
+    # ── Normal lock acquisition ───────────────────────────────
     try:
         lock_fd = open(LOCK_FILE, "w")
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -110,6 +148,55 @@ def _release_lock(lock_fd):
             LOCK_FILE.unlink(missing_ok=True)
         except Exception:
             pass
+
+
+def _read_market_direction() -> Optional[Dict[str, Any]]:
+    """
+    Read the latest market direction from PutsEngine's market_direction.json.
+    
+    This file is updated hourly by PutsEngine's MarketPulse engine.
+    Contains: regime, direction, confidence, GEX, VIX, best/avoid plays.
+    
+    Returns:
+        Dict with market direction data, or None if unavailable.
+    """
+    md_path = Path(MetaConfig.PUTSENGINE_PATH) / "logs" / "market_direction.json"
+    try:
+        if md_path.exists():
+            with open(md_path, "r") as f:
+                data = json.load(f)
+            # Only use if not too stale (< 2 hours old)
+            ts_str = data.get("timestamp", "")
+            if ts_str:
+                from datetime import timezone
+                ts = datetime.fromisoformat(ts_str)
+                # Ensure timezone-aware comparison
+                if ts.tzinfo is None:
+                    ts = EST.localize(ts)
+                now_et = datetime.now(EST)
+                age_minutes = (now_et - ts).total_seconds() / 60
+                if age_minutes > 120:
+                    logger.warning(f"  Market direction data is {age_minutes:.0f} min old — using anyway")
+            return {
+                "regime": data.get("regime", "N/A"),
+                "regime_score": data.get("regime_score", 0),
+                "direction": data.get("direction", "N/A"),
+                "confidence": data.get("confidence", "N/A"),
+                "confidence_pct": data.get("confidence_pct", 0),
+                "spy_signal": data.get("spy_signal", 0),
+                "vix_signal": data.get("vix_signal", 0),
+                "gex_regime": data.get("gex_regime", "N/A"),
+                "gex_value": data.get("gex_value", 0),
+                "best_plays": data.get("best_plays", []),
+                "avoid_plays": data.get("avoid_plays", []),
+                "timestamp": ts_str,
+            }
+        else:
+            logger.warning(f"  Market direction file not found: {md_path}")
+            return None
+    except Exception as e:
+        logger.error(f"  Error reading market direction: {e}")
+        return None
 
 
 def _backfill_prices_from_cross(
@@ -277,8 +364,38 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
         json.dump(cross_results, f, indent=2, default=str)
     logger.info(f"  💾 Saved: {cross_file}")
     # Save latest cross-analysis (always reflects most recent run)
-    with open(output_dir / "cross_analysis_latest.json", "w") as f:
+    # Use atomic write (write to temp then rename) so the dashboard never reads partial data
+    latest_cross_path = output_dir / "cross_analysis_latest.json"
+    latest_cross_tmp = output_dir / "cross_analysis_latest.json.tmp"
+    with open(latest_cross_tmp, "w") as f:
         json.dump(cross_results, f, indent=2, default=str)
+    latest_cross_tmp.rename(latest_cross_path)
+    
+    # ================================================================
+    # STEP 3b: Inject Market Direction from PutsEngine
+    # ================================================================
+    logger.info("\n" + "=" * 50)
+    logger.info("STEP 3b: Reading Market Direction...")
+    logger.info("=" * 50)
+    market_direction = _read_market_direction()
+    if market_direction:
+        cross_results["market_direction"] = market_direction
+        logger.info(f"  🌊 Regime: {market_direction.get('regime', 'N/A')} | "
+                     f"Direction: {market_direction.get('direction', 'N/A')} | "
+                     f"Confidence: {market_direction.get('confidence', 'N/A')}")
+        if market_direction.get("best_plays"):
+            logger.info(f"  📈 Best plays: {market_direction['best_plays'][:3]}")
+    else:
+        logger.warning("  ⚠️ Market direction data not available")
+        cross_results["market_direction"] = {}
+    results["market_direction"] = market_direction or {}
+    
+    # Re-save cross_analysis with market direction included
+    with open(cross_file, "w") as f:
+        json.dump(cross_results, f, indent=2, default=str)
+    with open(latest_cross_tmp, "w") as f:
+        json.dump(cross_results, f, indent=2, default=str)
+    latest_cross_tmp.rename(latest_cross_path)
     
     # ================================================================
     # STEP 4: Generate 3-Sentence Summaries
@@ -287,18 +404,56 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
     logger.info("STEP 4: Generating Summaries...")
     logger.info("=" * 50)
     
-    from analysis.summary_generator import generate_all_summaries
-    summaries = generate_all_summaries(cross_results)
+    summaries = {
+        "timestamp": now.isoformat(),
+        "puts_picks_summaries": [],
+        "moonshot_picks_summaries": [],
+        "conflict_summaries": [],
+        "final_summary": f"Meta Engine Daily Analysis ({now.strftime('%B %d, %Y')}): "
+                         f"{len(puts_top10)} put and {len(moonshot_top10)} moonshot "
+                         f"candidates identified.",
+    }
+    try:
+        from analysis.summary_generator import generate_all_summaries
+        summaries = generate_all_summaries(cross_results)
+        results["summaries"] = summaries
+    except Exception as e:
+        logger.error(f"Summary generation failed: {e}", exc_info=True)
+        logger.warning("  ⚠️ Continuing pipeline with basic summaries — "
+                       "email/telegram/X will still be sent.")
+        # Build minimal summaries so downstream steps have data
+        for item in cross_results.get("puts_through_moonshot", []):
+            summaries["puts_picks_summaries"].append({
+                "symbol": item["symbol"],
+                "summary": f"{item['symbol']} at ${float(item.get('price', 0)):.2f}, "
+                           f"PutsEngine score {float(item.get('score', 0)):.2f}.",
+                "puts_score": float(item.get("score", 0)),
+                "moonshot_level": item.get("moonshot_analysis", {}).get(
+                    "opportunity_level", "N/A"),
+            })
+        for item in cross_results.get("moonshot_through_puts", []):
+            summaries["moonshot_picks_summaries"].append({
+                "symbol": item["symbol"],
+                "summary": f"{item['symbol']} at ${float(item.get('price', 0)):.2f}, "
+                           f"Moonshot score {float(item.get('score', 0)):.2f}.",
+                "moonshot_score": float(item.get("score", 0)),
+                "puts_risk": item.get("puts_analysis", {}).get("risk_level", "N/A"),
+            })
     results["summaries"] = summaries
     
     # Save summaries
-    summary_file = output_dir / f"summaries_{now.strftime('%Y%m%d')}.json"
-    with open(summary_file, "w") as f:
-        json.dump(summaries, f, indent=2, default=str)
-    logger.info(f"  💾 Saved: {summary_file}")
-    # Save latest summaries (always reflects most recent run)
-    with open(output_dir / "summaries_latest.json", "w") as f:
-        json.dump(summaries, f, indent=2, default=str)
+    try:
+        summary_file = output_dir / f"summaries_{now.strftime('%Y%m%d')}.json"
+        with open(summary_file, "w") as f:
+            json.dump(summaries, f, indent=2, default=str)
+        logger.info(f"  💾 Saved: {summary_file}")
+        # Save latest summaries (always reflects most recent run)
+        latest_sum_tmp = output_dir / "summaries_latest.json.tmp"
+        with open(latest_sum_tmp, "w") as f:
+            json.dump(summaries, f, indent=2, default=str)
+        latest_sum_tmp.rename(output_dir / "summaries_latest.json")
+    except Exception as e:
+        logger.error(f"  Summary save failed: {e}")
     
     # Print summaries to log
     logger.info(f"\n📊 FINAL SUMMARY:\n{summaries.get('final_summary', '')}")

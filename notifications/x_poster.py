@@ -111,12 +111,18 @@ def _classify_moonshot_signal_type(pick: Dict[str, Any]) -> str:
 
 def _compute_entry_range(pick: Dict[str, Any], is_puts: bool = False) -> str:
     """Compute entry price range for display."""
-    price = pick.get("price", 0)
+    try:
+        price = float(pick.get("price", 0) or 0)
+    except (ValueError, TypeError):
+        price = 0.0
     
     if not is_puts:
         # Moonshot picks have entry_low/entry_high from the engine
-        entry_low = pick.get("entry_low", 0)
-        entry_high = pick.get("entry_high", 0)
+        try:
+            entry_low = float(pick.get("entry_low", 0) or 0)
+            entry_high = float(pick.get("entry_high", 0) or 0)
+        except (ValueError, TypeError):
+            entry_low, entry_high = 0.0, 0.0
         if entry_low and entry_high:
             return f"${entry_low:.2f}−${entry_high:.2f}"
     
@@ -136,8 +142,14 @@ def _compute_target_and_rr(pick: Dict[str, Any], is_puts: bool = False) -> tuple
     Returns:
         (target_str, rr_str) e.g. ("+7% by Feb 11", "3.2x")
     """
-    price = pick.get("price", 0)
-    score = pick.get("score", 0)
+    try:
+        price = float(pick.get("price", 0) or 0)
+    except (ValueError, TypeError):
+        price = 0.0
+    try:
+        score = float(pick.get("score", 0) or 0)
+    except (ValueError, TypeError):
+        score = 0.0
     now = datetime.now()
     
     # Target date: 1-2 trading days from now
@@ -149,8 +161,14 @@ def _compute_target_and_rr(pick: Dict[str, Any], is_puts: bool = False) -> tuple
     
     if not is_puts:
         # Moonshot picks: use target from engine data
-        target_price = pick.get("target", 0)
-        stop_price = pick.get("stop", 0)
+        try:
+            target_price = float(pick.get("target", 0) or 0)
+        except (ValueError, TypeError):
+            target_price = 0.0
+        try:
+            stop_price = float(pick.get("stop", 0) or 0)
+        except (ValueError, TypeError):
+            stop_price = 0.0
         
         if target_price and price and price > 0:
             target_pct = ((target_price - price) / price) * 100

@@ -29,6 +29,16 @@ import requests
 
 logger = logging.getLogger(__name__)
 
+
+def _to_float(val, default: float = 0.0) -> float:
+    """Safely convert any value to float (handles str, None, etc.)."""
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
 # Paths
 PUTSENGINE_PATH = str(Path.home() / "PutsEngine")
 TRADENOVA_PATH = str(Path.home() / "TradeNova")
@@ -1685,13 +1695,14 @@ def cross_analyze(
             "market_data": market_data,
         }
         # ALWAYS use real-time Polygon price — cached prices can be hours stale
-        if market_data.get("price", 0) > 0:
-            old_price = cross_result.get("price", 0)
-            cross_result["price"] = market_data["price"]
-            if old_price > 0 and old_price != market_data["price"]:
-                pct = ((market_data["price"] - old_price) / old_price) * 100
+        mkt_price = _to_float(market_data.get("price", 0))
+        if mkt_price > 0:
+            old_price = _to_float(cross_result.get("price", 0))
+            cross_result["price"] = mkt_price
+            if old_price > 0 and old_price != mkt_price:
+                pct = ((mkt_price - old_price) / old_price) * 100
                 if abs(pct) > 1:
-                    logger.info(f"  {symbol}: price ${old_price:.2f}→${market_data['price']:.2f} ({pct:+.1f}%)")
+                    logger.info(f"  {symbol}: price ${old_price:.2f}→${mkt_price:.2f} ({pct:+.1f}%)")
 
         # Overnight gap anomaly detection
         gap_alert = _detect_overnight_gap(symbol, pick, market_data)
@@ -1699,7 +1710,7 @@ def cross_analyze(
             cross_result["overnight_gap_alert"] = gap_alert
 
         results["puts_through_moonshot"].append(cross_result)
-        logger.info(f"  {symbol}: Puts={pick['score']:.2f} | Moonshot={moonshot_view['opportunity_level']}")
+        logger.info(f"  {symbol}: Puts={_to_float(pick.get('score', 0)):.2f} | Moonshot={moonshot_view['opportunity_level']}")
     
     # 2. Run Moonshot Top 10 through PutsEngine lens
     logger.info("\n📊 Running Moonshot picks through PutsEngine analysis...")
@@ -1714,13 +1725,14 @@ def cross_analyze(
             "market_data": market_data,
         }
         # ALWAYS use real-time Polygon price — cached prices can be hours stale
-        if market_data.get("price", 0) > 0:
-            old_price = cross_result.get("price", 0)
-            cross_result["price"] = market_data["price"]
-            if old_price > 0 and old_price != market_data["price"]:
-                pct = ((market_data["price"] - old_price) / old_price) * 100
+        mkt_price = _to_float(market_data.get("price", 0))
+        if mkt_price > 0:
+            old_price = _to_float(cross_result.get("price", 0))
+            cross_result["price"] = mkt_price
+            if old_price > 0 and old_price != mkt_price:
+                pct = ((mkt_price - old_price) / old_price) * 100
                 if abs(pct) > 1:
-                    logger.info(f"  {symbol}: price ${old_price:.2f}→${market_data['price']:.2f} ({pct:+.1f}%)")
+                    logger.info(f"  {symbol}: price ${old_price:.2f}→${mkt_price:.2f} ({pct:+.1f}%)")
 
         # Overnight gap anomaly detection
         gap_alert = _detect_overnight_gap(symbol, pick, market_data)
@@ -1728,7 +1740,7 @@ def cross_analyze(
             cross_result["overnight_gap_alert"] = gap_alert
 
         results["moonshot_through_puts"].append(cross_result)
-        logger.info(f"  {symbol}: Moonshot={pick['score']:.2f} | Puts Risk={puts_view['risk_level']}")
+        logger.info(f"  {symbol}: Moonshot={_to_float(pick.get('score', 0)):.2f} | Puts Risk={puts_view['risk_level']}")
     
     # 3. Build conflict matrix
     logger.info("\n📊 Building conflict matrix...")
@@ -1767,17 +1779,18 @@ def cross_analyze(
     
     for item in results["puts_through_moonshot"]:
         # Use market data price as fallback if pick price is 0
-        price = item.get("price", 0)
+        price = _to_float(item.get("price", 0))
         if price == 0:
-            price = item.get("market_data", {}).get("price", 0)
+            price = _to_float(item.get("market_data", {}).get("price", 0))
+        score_val = _to_float(item.get("score", 0))
         entry = {
             "symbol": item["symbol"],
             "source_engine": "PutsEngine",
-            "source_score": item["score"],
+            "source_score": score_val,
             "cross_analysis": item["moonshot_analysis"]["analysis"],
             "cross_level": item["moonshot_analysis"]["opportunity_level"],
             "price": price,
-            "combined_signal": f"PUT {item['score']:.2f} | Moonshot: {item['moonshot_analysis']['opportunity_level']}",
+            "combined_signal": f"PUT {score_val:.2f} | Moonshot: {item['moonshot_analysis']['opportunity_level']}",
         }
         # Propagate overnight gap alert if present
         if item.get("overnight_gap_alert"):
@@ -1791,17 +1804,18 @@ def cross_analyze(
     
     for item in results["moonshot_through_puts"]:
         # Use market data price as fallback if pick price is 0
-        price = item.get("price", 0)
+        price = _to_float(item.get("price", 0))
         if price == 0:
-            price = item.get("market_data", {}).get("price", 0)
+            price = _to_float(item.get("market_data", {}).get("price", 0))
+        score_val = _to_float(item.get("score", 0))
         entry = {
             "symbol": item["symbol"],
             "source_engine": "Moonshot",
-            "source_score": item["score"],
+            "source_score": score_val,
             "cross_analysis": item["puts_analysis"]["analysis"],
             "cross_level": item["puts_analysis"]["risk_level"],
             "price": price,
-            "combined_signal": f"MOONSHOT {item['score']:.2f} | Puts Risk: {item['puts_analysis']['risk_level']}",
+            "combined_signal": f"MOONSHOT {score_val:.2f} | Puts Risk: {item['puts_analysis']['risk_level']}",
         }
         # Propagate overnight gap alert if present
         if item.get("overnight_gap_alert"):
@@ -1813,7 +1827,7 @@ def cross_analyze(
             entry["data_age_days"] = item["data_age_days"]
         combined.append(entry)
     
-    combined.sort(key=lambda x: x["source_score"], reverse=True)
+    combined.sort(key=lambda x: _to_float(x.get("source_score", 0)), reverse=True)
     results["combined_ranking"] = combined
     
     logger.info(f"\n✅ Cross-analysis complete: {len(combined)} total entries")

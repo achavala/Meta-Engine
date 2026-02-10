@@ -17,6 +17,16 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _sf(val, default: float = 0.0) -> float:
+    """Safely convert any value to float (handles str, None, etc.)."""
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+
 def _classify_puts_signal(score: float, signals: list) -> str:
     """Classify PutsEngine signal strength."""
     if score >= 0.68:
@@ -57,8 +67,8 @@ def generate_pick_summary(pick: Dict[str, Any], cross_analysis: Dict[str, Any] =
         3-sentence summary string
     """
     symbol = pick.get("symbol", "???")
-    price = pick.get("price", 0)
-    score = pick.get("score", 0)
+    price = _sf(pick.get("price", 0))
+    score = _sf(pick.get("score", 0))
     source = pick.get("engine", "Unknown")
     signals = pick.get("signals", [])
     
@@ -85,8 +95,8 @@ def generate_pick_summary(pick: Dict[str, Any], cross_analysis: Dict[str, Any] =
             # PutsEngine pick checked by Moonshot — use rich data if available
             opp_level = cross_analysis.get("opportunity_level", "LOW")
             data_source = cross_analysis.get("data_source", "")
-            cross_score = cross_analysis.get("bullish_score", 0)
-            mws_score = cross_analysis.get("mws_score", 0)
+            cross_score = _sf(cross_analysis.get("bullish_score", 0))
+            mws_score = _sf(cross_analysis.get("mws_score", 0))
             cross_signals = cross_analysis.get("signals", [])
             n_cross_sigs = len(cross_signals) if isinstance(cross_signals, list) else 0
             uw_sentiment = cross_analysis.get("uw_sentiment", "")
@@ -94,7 +104,7 @@ def generate_pick_summary(pick: Dict[str, Any], cross_analysis: Dict[str, Any] =
             if opp_level == "HIGH":
                 if "MWS" in data_source:
                     exp_range = cross_analysis.get("expected_range", [])
-                    range_str = f", expected range ${exp_range[0]:.2f}–${exp_range[1]:.2f}" if len(exp_range) >= 2 else ""
+                    range_str = f", expected range ${_sf(exp_range[0]):.2f}–${_sf(exp_range[1]):.2f}" if len(exp_range) >= 2 else ""
                     sentence2 = (
                         f"Cross-engine CONFLICT: MWS 7-layer analysis detects HIGH bullish "
                         f"signal (MWS {mws_score:.0f}/100, prob {cross_analysis.get('bullish_probability', 0)}%{range_str}) — "
@@ -160,7 +170,7 @@ def generate_pick_summary(pick: Dict[str, Any], cross_analysis: Dict[str, Any] =
         else:
             # Moonshot pick checked by PutsEngine
             risk_level = cross_analysis.get("risk_level", "LOW")
-            cross_score = cross_analysis.get("bearish_score", 0)
+            cross_score = _sf(cross_analysis.get("bearish_score", 0))
             cross_signals = cross_analysis.get("signals", [])
             n_sigs = len(cross_signals) if isinstance(cross_signals, list) else 0
             top_sigs_str = ", ".join(cross_signals[:3]) if cross_signals else ""
@@ -257,6 +267,9 @@ def _build_conflict_resolution(
     2. Which thesis is likely dominant in the 1-2 day timeframe
     3. Specific trading recommendations for both sides
     """
+    # Ensure scores are numeric
+    puts_score = _sf(puts_score)
+    moon_score = _sf(moon_score)
     # Find the pick in both cross-analysis lists
     puts_pick = None
     moon_pick = None
@@ -271,41 +284,42 @@ def _build_conflict_resolution(
             moon_pick = m
             break
     
-    # Extract key data points
+    # Extract key data points (safe-cast everything to float)
     puts_signals = puts_pick.get("signals", []) if puts_pick else []
     puts_engine_type = puts_pick.get("engine_type", "") if puts_pick else ""
     moon_signals = moon_pick.get("signals", []) if moon_pick else []
-    puts_price = puts_pick.get("price", 0) if puts_pick else 0
-    moon_price = moon_pick.get("price", 0) if moon_pick else 0
+    puts_price = _sf(puts_pick.get("price", 0)) if puts_pick else 0.0
+    moon_price = _sf(moon_pick.get("price", 0)) if moon_pick else 0.0
     
     # MWS sensor data from puts cross-analysis
     moonshot_cross = puts_pick.get("moonshot_analysis", {}) if puts_pick else {}
-    mws_score = moonshot_cross.get("mws_score", 0)
+    mws_score = _sf(moonshot_cross.get("mws_score", 0))
     sensors = moonshot_cross.get("sensors", [])
-    expected_range = moonshot_cross.get("expected_range", [])
-    bullish_prob = moonshot_cross.get("bullish_probability", 0)
+    raw_range = moonshot_cross.get("expected_range", [])
+    expected_range = [_sf(v) for v in raw_range] if raw_range else []
+    bullish_prob = _sf(moonshot_cross.get("bullish_probability", 0))
     data_source = moonshot_cross.get("data_source", "")
     
     # PutsEngine cross-analysis from moonshot side
     puts_cross = moon_pick.get("puts_analysis", {}) if moon_pick else {}
     puts_risk = puts_cross.get("risk_level", "N/A")
-    puts_bearish_score = puts_cross.get("bearish_score", 0)
+    puts_bearish_score = _sf(puts_cross.get("bearish_score", 0))
     
     # Market data (use whichever pick has it)
     mkt = (puts_pick or moon_pick or {}).get("market_data", {})
-    current_price = mkt.get("price", moon_price or puts_price)
-    change_pct = mkt.get("change_pct", 0)
-    rsi = mkt.get("rsi", 50)
-    rvol = mkt.get("rvol", 1.0)
+    current_price = _sf(mkt.get("price", moon_price or puts_price))
+    change_pct = _sf(mkt.get("change_pct", 0))
+    rsi = _sf(mkt.get("rsi", 50))
+    rvol = _sf(mkt.get("rvol", 1.0))
     
     # Analyze daily bars for recent price action
     daily_bars = mkt.get("daily_bars", [])
     
     # Calculate recent move magnitude (last 5 bars)
-    recent_move_pct = 0
+    recent_move_pct = 0.0
     if len(daily_bars) >= 5:
-        close_5_ago = daily_bars[-5].get("c", 0)
-        latest_close = daily_bars[-1].get("c", 0)
+        close_5_ago = _sf(daily_bars[-5].get("c", 0))
+        latest_close = _sf(daily_bars[-1].get("c", 0))
         if close_5_ago > 0:
             recent_move_pct = ((latest_close - close_5_ago) / close_5_ago) * 100
     
@@ -431,11 +445,11 @@ def _build_conflict_resolution(
         f"Dominant thesis: {dominant}. {dominant_detail}{range_str}"
     )
     
-    # Build trading recommendations for both sides
-    entry_low = moon_pick.get("entry_low", 0) if moon_pick else 0
-    entry_high = moon_pick.get("entry_high", 0) if moon_pick else 0
-    target = moon_pick.get("target", 0) if moon_pick else 0
-    stop = moon_pick.get("stop", 0) if moon_pick else 0
+    # Build trading recommendations for both sides (safe-cast all numerics)
+    entry_low = _sf(moon_pick.get("entry_low", 0)) if moon_pick else 0.0
+    entry_high = _sf(moon_pick.get("entry_high", 0)) if moon_pick else 0.0
+    target = _sf(moon_pick.get("target", 0)) if moon_pick else 0.0
+    stop = _sf(moon_pick.get("stop", 0)) if moon_pick else 0.0
     
     recommendations = {
         "if_bullish": (
@@ -505,7 +519,7 @@ def generate_all_summaries(cross_results: Dict[str, Any]) -> Dict[str, Any]:
         summaries["puts_picks_summaries"].append({
             "symbol": item["symbol"],
             "summary": summary,
-            "puts_score": item.get("score", 0),
+            "puts_score": _sf(item.get("score", 0)),
             "moonshot_level": item.get("moonshot_analysis", {}).get("opportunity_level", "N/A"),
         })
     
@@ -518,7 +532,7 @@ def generate_all_summaries(cross_results: Dict[str, Any]) -> Dict[str, Any]:
         summaries["moonshot_picks_summaries"].append({
             "symbol": item["symbol"],
             "summary": summary,
-            "moonshot_score": item.get("score", 0),
+            "moonshot_score": _sf(item.get("score", 0)),
             "puts_risk": item.get("puts_analysis", {}).get("risk_level", "N/A"),
         })
     
@@ -528,8 +542,8 @@ def generate_all_summaries(cross_results: Dict[str, Any]) -> Dict[str, Any]:
             symbol = entry["symbol"]
             conflict_detail = _build_conflict_resolution(
                 symbol=symbol,
-                puts_score=entry.get("puts_score", 0),
-                moon_score=entry.get("moonshot_score", 0),
+                puts_score=_sf(entry.get("puts_score", 0)),
+                moon_score=_sf(entry.get("moonshot_score", 0)),
                 cross_results=cross_results,
             )
             summaries["conflict_summaries"].append(conflict_detail)

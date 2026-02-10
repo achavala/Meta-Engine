@@ -15,6 +15,16 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _sf(val, default: float = 0.0) -> float:
+    """Safely convert any value to float (handles str, None, etc.)."""
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+
 def generate_md_report(
     puts_picks: List[Dict],
     moon_picks: List[Dict],
@@ -97,8 +107,8 @@ def generate_md_report(
     lines.append("|---|--------|-------|-------|------------|---------|-------------|")
     for i, p in enumerate(puts_picks, 1):
         sym = p["symbol"]
-        price = p.get("price", 0)
-        score = p["score"]
+        price = _sf(p.get("price", 0))
+        score = _sf(p.get("score", 0))
         sig_count = len(p.get("signals", []))
         etype = p.get("engine_type", "N/A")
         # Score threshold gate: flag low conviction picks
@@ -118,11 +128,11 @@ def generate_md_report(
     lines.append("|---|--------|-------|-------|---------|-----------|--------|----------|")
     for i, p in enumerate(moon_picks, 1):
         sym = p["symbol"]
-        price = p.get("price", 0)
-        score = p["score"]
+        price = _sf(p.get("price", 0))
+        score = _sf(p.get("score", 0))
         sig_count = len(p.get("signals", []))
         sentiment = p.get("uw_sentiment", "N/A")
-        target = p.get("target", 0)
+        target = _sf(p.get("target", 0))
         target_str = f"${target:.2f}" if target else "N/A"
         age = p.get("data_age_days", -1)
         if age < 0:
@@ -157,7 +167,7 @@ def generate_md_report(
             ms_score = 0
         ds = ms_analysis.get("data_source", "N/A")
         conflict = "⚠️ YES" if opp == "HIGH" else ("⚡ MIXED" if opp == "MODERATE" else "No")
-        lines.append(f"| **{sym}** | {p['score']:.3f} | {opp} | {ms_score:.2f} | {ds} | {conflict} |")
+        lines.append(f"| **{sym}** | {_sf(p['score']):.3f} | {opp} | {ms_score:.2f} | {ds} | {conflict} |")
     lines.append("")
 
     # Moonshot analyzed by PutsEngine
@@ -183,7 +193,7 @@ def generate_md_report(
             bd_str = " ".join(bd_parts)
         else:
             bd_str = str(bd)[:40]
-        lines.append(f"| **{sym}** | {p['score']:.3f} | {risk} | {ps:.2f} | {nsigs} signals | {bd_str} |")
+        lines.append(f"| **{sym}** | {_sf(p['score']):.3f} | {risk} | {ps:.2f} | {nsigs} signals | {bd_str} |")
     lines.append("")
 
     # Conflict matrix
@@ -229,12 +239,12 @@ def generate_md_report(
         lines.append("| Ticker | Pick Price | Open | Gap% | Severity | Impact |")
         lines.append("|--------|-----------|------|------|----------|--------|")
         for alert in gap_alerts:
-            gap_pct = alert["gap_pct"]
+            gap_pct = _sf(alert.get("gap_pct", 0))
             impact = "Thesis likely invalidated" if abs(gap_pct) >= 10 else "Reassess entry"
             lines.append(
-                f"| **{alert['symbol']}** | ${alert['pick_price']:.2f} | "
-                f"${alert['today_open']:.2f} | {gap_pct:+.1f}% | "
-                f"{alert['severity']} | {impact} |"
+                f"| **{alert['symbol']}** | ${_sf(alert.get('pick_price', 0)):.2f} | "
+                f"${_sf(alert.get('today_open', 0)):.2f} | {gap_pct:+.1f}% | "
+                f"{alert.get('severity', 'N/A')} | {impact} |"
             )
         lines.append("")
 
@@ -274,15 +284,16 @@ def generate_md_report(
             sym = s.get("symbol", "???")
             c_type = s.get("conflict_type", "Directional Divergence")
             dominant = s.get("dominant_thesis", "N/A")
-            puts_sc = s.get("puts_score", 0)
-            moon_sc = s.get("moon_score", 0)
-            mws_sc = s.get("mws_score", 0)
-            cur_price = s.get("current_price", 0)
-            rsi_val = s.get("rsi", 0)
-            move_pct = s.get("recent_move_pct", 0)
+            puts_sc = _sf(s.get("puts_score", 0))
+            moon_sc = _sf(s.get("moon_score", 0))
+            mws_sc = _sf(s.get("mws_score", 0))
+            cur_price = _sf(s.get("current_price", 0))
+            rsi_val = _sf(s.get("rsi", 0))
+            move_pct = _sf(s.get("recent_move_pct", 0))
             bull_sens = s.get("bullish_sensors", 0)
             bear_sens = s.get("bearish_sensors", 0)
-            exp_range = s.get("expected_range", [])
+            raw_range = s.get("expected_range", [])
+            exp_range = [_sf(v) for v in raw_range] if raw_range else []
             recs = s.get("recommendations", {})
             
             lines.append(f"#### ⚡ {sym} — {c_type}")

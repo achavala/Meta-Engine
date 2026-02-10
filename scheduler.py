@@ -98,12 +98,19 @@ def _start_dashboard_thread():
         t.start()
         logger.info("  🖥️  Flask dashboard started on http://localhost:5050")
     except Exception as e:
-        logger.warning(f"  Flask dashboard failed to start: {e} (non-critical)")
+        logger.warning(f"  Flask dashboard skipped: {e} (non-critical)")
 
 
 def _start_streamlit_dashboard():
     """Start the Streamlit trading dashboard as a subprocess (port 8511)."""
     try:
+        import socket
+        # Quick check — skip if port already occupied (avoids crash-loop)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if s.connect_ex(("127.0.0.1", 8511)) == 0:
+                logger.info("  🖥️  Streamlit dashboard already running on :8511 — skipping")
+                return
+
         venv_streamlit = str(META_DIR / "venv" / "bin" / "streamlit")
         app_path = str(META_DIR / "trading" / "streamlit_dashboard.py")
         proc = subprocess.Popen(
@@ -121,7 +128,7 @@ def _start_streamlit_dashboard():
         )
         logger.info(f"  🖥️  Streamlit dashboard started on http://localhost:8511 (PID {proc.pid})")
     except Exception as e:
-        logger.warning(f"  Streamlit dashboard failed to start: {e} (non-critical)")
+        logger.warning(f"  Streamlit dashboard skipped: {e} (non-critical)")
 
 
 # ═══════════════════════════════════════════════════════

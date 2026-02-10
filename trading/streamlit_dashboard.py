@@ -125,6 +125,7 @@ def get_closed_trades():
         return pd.DataFrame()
 
 
+@st.cache_data(ttl=8)
 def load_latest_run():
     files = sorted(glob.glob(str(OUTPUT_DIR / "meta_engine_run_*.json")))
     if not files:
@@ -133,14 +134,19 @@ def load_latest_run():
         return json.load(f)
 
 
+@st.cache_data(ttl=8)
 def load_latest_cross():
     path = OUTPUT_DIR / "cross_analysis_latest.json"
     if path.exists():
+        mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=EST)
         with open(path) as f:
-            return json.load(f)
+            data = json.load(f)
+        data["_file_mtime"] = mtime.isoformat()
+        return data
     return {}
 
 
+@st.cache_data(ttl=8)
 def load_latest_summaries():
     path = OUTPUT_DIR / "summaries_latest.json"
     if path.exists():
@@ -472,7 +478,7 @@ with tabs[0]:
                         "P&L %": f"{pnl_pct:+.1f}%",
                     }
                 )
-            st.dataframe(pd.DataFrame(pos_data), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(pos_data), hide_index=True, width="stretch")
         elif not open_df.empty:
             display_cols = [
                 "symbol",
@@ -488,7 +494,7 @@ with tabs[0]:
                 "status",
             ]
             existing = [c for c in display_cols if c in open_df.columns]
-            st.dataframe(open_df[existing], use_container_width=True, hide_index=True)
+            st.dataframe(open_df[existing], hide_index=True, width="stretch")
 
     # ── Trade Statistics ──────────────────────────────
     st.markdown("#### Trade Statistics")
@@ -514,7 +520,7 @@ with tabs[0]:
 
 
 # ─────────────────────────────────────────────────────
-#  TAB 2: Current Picks
+#  TAB 2: Current Picks (auto-updating)
 # ─────────────────────────────────────────────────────
 with tabs[1]:
     st.markdown("# 📈 Latest Engine Picks")
@@ -523,7 +529,51 @@ with tabs[1]:
     latest_run = load_latest_run()
     run_ts = latest_run.get("timestamp", "")
 
-    if run_ts:
+    # ── Data freshness banner ─────────────────────────
+    file_mtime_str = cross.get("_file_mtime", "")
+    if file_mtime_str:
+        try:
+            file_mtime = datetime.fromisoformat(file_mtime_str)
+            age = datetime.now(EST) - file_mtime
+            age_mins = int(age.total_seconds() // 60)
+            age_hrs = age_mins // 60
+            age_remaining = age_mins % 60
+
+            if age_mins < 15:
+                freshness_color = "#00e676"
+                freshness_label = "LIVE"
+                freshness_icon = "🟢"
+            elif age_mins < 120:
+                freshness_color = "#ffa726"
+                freshness_label = "RECENT"
+                freshness_icon = "🟡"
+            else:
+                freshness_color = "#ff1744"
+                freshness_label = "STALE"
+                freshness_icon = "🔴"
+
+            if age_hrs > 0:
+                age_str = f"{age_hrs}h {age_remaining}m ago"
+            else:
+                age_str = f"{age_mins}m ago"
+
+            scan_time_fmt = file_mtime.strftime("%b %d, %I:%M:%S %p ET")
+
+            st.markdown(
+                f'<div style="background:rgba(26,31,46,0.85); border:1px solid {freshness_color}40; '
+                f'border-radius:8px; padding:10px 20px; display:flex; justify-content:space-between; '
+                f'align-items:center; margin-bottom:16px;">'
+                f'<span style="color:{freshness_color}; font-weight:700; font-size:14px;">'
+                f'{freshness_icon} {freshness_label} — Last scan: {scan_time_fmt} ({age_str})</span>'
+                f'<span style="color:#78909c; font-size:12px;">Auto-updates on every scan '
+                f'(9:35 AM &amp; 3:15 PM ET)</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+        except Exception:
+            if run_ts:
+                st.caption(f"From scan: {run_ts}")
+    elif run_ts:
         st.caption(f"From scan: {run_ts}")
 
     col_p, col_m = st.columns(2)
@@ -546,7 +596,7 @@ with tabs[1]:
                         "Gap Alert": "⚠️" if p.get("overnight_gap_alert") else "",
                     }
                 )
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
         else:
             st.info("No puts picks available yet.")
 
@@ -568,7 +618,7 @@ with tabs[1]:
                         "Gap Alert": "⚠️" if p.get("overnight_gap_alert") else "",
                     }
                 )
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
         else:
             st.info("No moonshot picks available yet.")
 
@@ -577,7 +627,7 @@ with tabs[1]:
     st.markdown("### 🔀 Conflict Matrix")
     conflicts = cross.get("conflict_matrix", [])
     if conflicts:
-        st.dataframe(pd.DataFrame(conflicts), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(conflicts), hide_index=True, width="stretch")
     else:
         st.info("No conflicts detected.")
 
@@ -597,56 +647,246 @@ with tabs[1]:
 
 
 # ─────────────────────────────────────────────────────
-#  TAB 3: Trade History
+#  TAB 3: Trade History  (Persistent P&L Dashboard)
 # ─────────────────────────────────────────────────────
 with tabs[2]:
-    st.markdown("# 📋 Trade History (6 Months)")
+    st.markdown("# 📋 Persistent Trade History")
+    st.caption("All trades stored in SQLite database — persists across restarts (last 6 months)")
+
+    # ── Toolbar row ───────────────────────────────────
+    tb1, tb2, tb3, tb4, tb5 = st.columns([2, 1, 1, 1, 2])
+    with tb1:
+        time_range = st.selectbox(
+            "Time Range",
+            ["Last 7 days", "Last 30 days", "Last 90 days", "Last 180 days", "All"],
+            index=2,
+            key="th_time_range",
+        )
+    with tb2:
+        only_closed = st.checkbox("Closed Only", value=False, key="th_closed_only")
+    with tb3:
+        puts_only = st.checkbox("Puts Only", value=False, key="th_puts_only")
+    with tb4:
+        calls_only = st.checkbox("Calls Only", value=False, key="th_calls_only")
+    with tb5:
+        col_btn1, col_btn2 = st.columns(2)
+        with col_btn1:
+            if st.button("🔄 Refresh Trade History", key="th_refresh"):
+                st.cache_data.clear()
+                st.rerun()
+        with col_btn2:
+            if st.button("⚡ Force Sync from Alpaca", key="th_sync"):
+                try:
+                    from trading.executor import check_and_manage_positions
+                    sync_result = check_and_manage_positions()
+                    st.toast(f"Synced: {sync_result.get('checked', 0)} checked, "
+                             f"{sync_result.get('closed', 0)} closed")
+                    st.cache_data.clear()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Sync failed: {e}")
+
+    st.caption("🔄 Auto-sync active (syncs every 5 min)")
+
+    # ── Compute time range ────────────────────────────
+    range_days_map = {
+        "Last 7 days": 7, "Last 30 days": 30, "Last 90 days": 90,
+        "Last 180 days": 180, "All": 9999,
+    }
+    range_days = range_days_map.get(time_range, 90)
+    cutoff_date = (date.today() - timedelta(days=range_days)).isoformat()
 
     all_df = get_all_trades()
+
     if all_df.empty:
         st.markdown(
             '<div class="info-box">No trade history yet — trades will appear after the first market-hours scan</div>',
             unsafe_allow_html=True,
         )
     else:
-        # Filters
-        fc1, fc2, fc3 = st.columns(3)
-        with fc1:
-            status_filter = st.multiselect(
-                "Status",
-                options=all_df["status"].unique().tolist(),
-                default=all_df["status"].unique().tolist(),
-            )
-        with fc2:
-            type_filter = st.multiselect(
-                "Type",
-                options=all_df["option_type"].unique().tolist() if "option_type" in all_df.columns else [],
-                default=all_df["option_type"].unique().tolist() if "option_type" in all_df.columns else [],
-            )
-        with fc3:
-            session_filter = st.multiselect(
-                "Session",
-                options=all_df["session"].unique().tolist() if "session" in all_df.columns else [],
-                default=all_df["session"].unique().tolist() if "session" in all_df.columns else [],
-            )
-
+        # Apply time filter
         filtered = all_df.copy()
-        if status_filter:
-            filtered = filtered[filtered["status"].isin(status_filter)]
-        if type_filter and "option_type" in filtered.columns:
-            filtered = filtered[filtered["option_type"].isin(type_filter)]
-        if session_filter and "session" in filtered.columns:
-            filtered = filtered[filtered["session"].isin(session_filter)]
+        if "scan_date" in filtered.columns and range_days < 9999:
+            filtered = filtered[filtered["scan_date"] >= cutoff_date]
+        if only_closed:
+            filtered = filtered[filtered["status"] == "closed"]
+        if puts_only and "option_type" in filtered.columns:
+            filtered = filtered[filtered["option_type"] == "put"]
+        if calls_only and "option_type" in filtered.columns:
+            filtered = filtered[filtered["option_type"] == "call"]
+
+        # ── Trade Statistics ──────────────────────────
+        st.markdown("### 📊 Trade Statistics")
+        closed_in_range = filtered[filtered["status"] == "closed"] if "status" in filtered.columns else pd.DataFrame()
+        total_entries = len(filtered)
+        total_closed = len(closed_in_range)
+        wins_ct = len(closed_in_range[closed_in_range["pnl"] > 0]) if not closed_in_range.empty and "pnl" in closed_in_range.columns else 0
+        losses_ct = len(closed_in_range[closed_in_range["pnl"] <= 0]) if not closed_in_range.empty and "pnl" in closed_in_range.columns else 0
+        win_rate = (wins_ct / total_closed * 100) if total_closed > 0 else 0.0
+        total_pnl_val = closed_in_range["pnl"].sum() if not closed_in_range.empty and "pnl" in closed_in_range.columns else 0.0
+        avg_win_val = closed_in_range[closed_in_range["pnl"] > 0]["pnl"].mean() if wins_ct > 0 else 0.0
+        avg_loss_val = closed_in_range[closed_in_range["pnl"] <= 0]["pnl"].mean() if losses_ct > 0 else 0.0
+
+        wr_delta_str = f"{'↓' if win_rate < 50 else '↑'} {abs(win_rate - 50):.1f}%"
+        pnl_label = "↑ + Profit" if total_pnl_val >= 0 else "↑ ↓ Loss"
+
+        s1, s2, s3, s4, s5, s6 = st.columns(6)
+        s1.metric("Total Entries", f"{total_entries:,}")
+        s2.metric("Closed Trades", f"{total_closed:,}")
+        s3.metric("Win Rate", f"{win_rate:.1f}%", delta=wr_delta_str,
+                  delta_color="normal" if win_rate >= 50 else "inverse")
+        s4.metric("Total P&L", f"${total_pnl_val:+,.2f}", delta=pnl_label,
+                  delta_color="normal" if total_pnl_val >= 0 else "inverse")
+        s5.metric("Avg Win", f"${avg_win_val:+,.2f}")
+        s6.metric("Avg Loss", f"${avg_loss_val:+,.2f}")
+
+        st.markdown("---")
+
+        # ── Daily P&L Summary (charts) ────────────────
+        st.markdown("### 📈 Daily P&L Summary")
+
+        # Build daily summary from filtered closed trades
+        if not closed_in_range.empty and "scan_date" in closed_in_range.columns and "pnl" in closed_in_range.columns:
+            daily_agg = (
+                closed_in_range.groupby("scan_date")
+                .agg(
+                    trades=("pnl", "count"),
+                    daily_pnl=("pnl", "sum"),
+                    wins=("pnl", lambda x: (x > 0).sum()),
+                    losses=("pnl", lambda x: (x <= 0).sum()),
+                )
+                .reset_index()
+                .rename(columns={"scan_date": "Date"})
+                .sort_values("Date")
+            )
+            daily_agg["Win Rate"] = daily_agg.apply(
+                lambda r: f"{(r['wins']/(r['wins']+r['losses'])*100):.1f}%"
+                if (r["wins"] + r["losses"]) > 0 else "0.0%", axis=1
+            )
+            daily_agg["cumulative_pnl"] = daily_agg["daily_pnl"].cumsum()
+
+            # Two charts side by side
+            ch1, ch2 = st.columns(2)
+            with ch1:
+                st.markdown("##### Daily P&L")
+                colors = ["#00e676" if v >= 0 else "#ff1744" for v in daily_agg["daily_pnl"]]
+                fig_daily = go.Figure(
+                    go.Bar(
+                        x=daily_agg["Date"],
+                        y=daily_agg["daily_pnl"],
+                        marker_color=colors,
+                        text=[f"${v:+,.0f}" for v in daily_agg["daily_pnl"]],
+                        textposition="outside",
+                        textfont=dict(size=10),
+                    )
+                )
+                fig_daily.update_layout(
+                    template="plotly_dark",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    height=320,
+                    margin=dict(l=20, r=20, t=10, b=40),
+                    xaxis=dict(gridcolor="rgba(255,255,255,0.04)"),
+                    yaxis=dict(gridcolor="rgba(255,255,255,0.04)", tickprefix="$"),
+                    showlegend=False,
+                )
+                st.plotly_chart(fig_daily, width="stretch", key="th_daily_pnl_bar")
+
+            with ch2:
+                st.markdown("##### Cumulative P&L")
+                last_cum = daily_agg["cumulative_pnl"].iloc[-1] if len(daily_agg) > 0 else 0
+                line_color = "#00e676" if last_cum >= 0 else "#448aff"
+                fill_color = "rgba(0,230,118,0.08)" if last_cum >= 0 else "rgba(68,138,255,0.08)"
+                fig_cum = go.Figure(
+                    go.Scatter(
+                        x=daily_agg["Date"],
+                        y=daily_agg["cumulative_pnl"],
+                        mode="lines",
+                        fill="tozeroy",
+                        line=dict(color=line_color, width=2),
+                        fillcolor=fill_color,
+                    )
+                )
+                fig_cum.update_layout(
+                    template="plotly_dark",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    height=320,
+                    margin=dict(l=20, r=20, t=10, b=40),
+                    xaxis=dict(gridcolor="rgba(255,255,255,0.04)"),
+                    yaxis=dict(gridcolor="rgba(255,255,255,0.04)", tickprefix="$"),
+                    showlegend=False,
+                )
+                st.plotly_chart(fig_cum, width="stretch", key="th_cum_pnl_line")
+
+            # ── Daily Summary Table ───────────────────
+            st.markdown("##### Daily Summary")
+            daily_display = daily_agg[["Date", "trades", "daily_pnl", "wins", "losses", "Win Rate"]].copy()
+            daily_display.columns = ["Date", "Trades", "P&L ($)", "Wins", "Losses", "Win Rate"]
+            daily_display["P&L ($)"] = daily_display["P&L ($)"].apply(lambda v: f"${v:+,.2f}")
+            daily_display = daily_display.sort_values("Date", ascending=False).reset_index(drop=True)
+            st.dataframe(daily_display, hide_index=True, width="stretch")
+        else:
+            st.info("No closed trades in the selected range — daily P&L will appear after positions are closed.")
+
+        st.markdown("---")
+
+        # ── All Trades Table ──────────────────────────
+        st.markdown("### 📂 All Trades")
 
         display_cols = [
             "scan_date", "session", "symbol", "option_type", "option_symbol",
-            "strike_price", "entry_price", "exit_price", "contracts",
+            "strike_price", "contracts", "entry_price", "exit_price",
             "pnl", "pnl_pct", "exit_reason", "status", "source_engine",
+            "meta_score",
         ]
         existing = [c for c in display_cols if c in filtered.columns]
-        st.dataframe(filtered[existing], use_container_width=True, hide_index=True)
+        display_df = filtered[existing].copy()
 
-        st.caption(f"Showing {len(filtered)} of {len(all_df)} total trades")
+        # Rename columns for readability
+        col_rename = {
+            "scan_date": "Date", "session": "Session", "symbol": "Stock",
+            "option_type": "Type", "option_symbol": "Option Symbol",
+            "strike_price": "Strike", "contracts": "Contracts",
+            "entry_price": "Entry", "exit_price": "Exit",
+            "pnl": "P&L ($)", "pnl_pct": "P&L (%)",
+            "exit_reason": "Exit Reason", "status": "Status",
+            "source_engine": "Engine", "meta_score": "Score",
+        }
+        display_df = display_df.rename(columns=col_rename)
+
+        # Format columns
+        if "Strike" in display_df.columns:
+            display_df["Strike"] = display_df["Strike"].apply(
+                lambda v: f"${v:.0f}" if pd.notna(v) and v > 0 else ""
+            )
+        if "Entry" in display_df.columns:
+            display_df["Entry"] = display_df["Entry"].apply(
+                lambda v: f"${v:.2f}" if pd.notna(v) and v > 0 else ""
+            )
+        if "Exit" in display_df.columns:
+            display_df["Exit"] = display_df["Exit"].apply(
+                lambda v: f"${v:.2f}" if pd.notna(v) and v > 0 else ""
+            )
+        if "P&L ($)" in display_df.columns:
+            display_df["P&L ($)"] = display_df["P&L ($)"].apply(
+                lambda v: f"${v:+,.2f}" if pd.notna(v) and v != 0 else ""
+            )
+        if "P&L (%)" in display_df.columns:
+            display_df["P&L (%)"] = display_df["P&L (%)"].apply(
+                lambda v: f"{v:+.1f}%" if pd.notna(v) and v != 0 else ""
+            )
+        if "Score" in display_df.columns:
+            display_df["Score"] = display_df["Score"].apply(
+                lambda v: f"{v:.2f}" if pd.notna(v) and v > 0 else ""
+            )
+        if "Type" in display_df.columns:
+            display_df["Type"] = display_df["Type"].apply(
+                lambda v: v.upper() if isinstance(v, str) else v
+            )
+
+        st.dataframe(display_df, hide_index=True, width="stretch")
+        st.caption(f"Showing {len(display_df)} of {len(all_df)} total trades — {time_range}")
 
 
 # ─────────────────────────────────────────────────────
@@ -712,7 +952,7 @@ with tabs[3]:
                 xaxis=dict(gridcolor="rgba(255,255,255,0.04)"),
                 yaxis=dict(gridcolor="rgba(255,255,255,0.04)", tickprefix="$"),
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, key="cumulative_pnl_chart")
 
         # Win/Loss donut
         c_left, c_right = st.columns(2)
@@ -735,7 +975,7 @@ with tabs[3]:
                 margin=dict(l=10, r=10, t=10, b=10),
                 showlegend=False,
             )
-            st.plotly_chart(fig_wl, use_container_width=True)
+            st.plotly_chart(fig_wl, key="win_loss_donut")
 
         with c_right:
             st.markdown("### Puts vs Calls Performance")
@@ -767,7 +1007,7 @@ with tabs[3]:
                     showlegend=False,
                     yaxis=dict(tickprefix="$"),
                 )
-                st.plotly_chart(fig_type, use_container_width=True)
+                st.plotly_chart(fig_type, key="puts_vs_calls_bar")
             else:
                 st.info("Option type data not available.")
 
