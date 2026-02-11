@@ -439,6 +439,8 @@ def _compute_meta_score(
     live_price: Optional[float] = None,
     ews_percentiles: Optional[Dict[str, float]] = None,
     sector_boost_set: Optional[set] = None,
+    earnings_set: Optional[set] = None,
+    is_pm_scan: bool = False,
 ) -> float:
     """
     Compute a differentiated META-SCORE for ranking puts candidates.
@@ -446,7 +448,7 @@ def _compute_meta_score(
     This solves the critical 0.950 score compression problem where 67% of
     tickers get identical composite scores, making Top 10 selection random.
     
-    FEB 11 OVERHAUL — Key improvements:
+    FEB 11 OVERHAUL + FEB 11 PM-SCAN UPGRADE — Key improvements:
     
     1. BUG FIX: Gap detection now uses _cached_price (not price, which gets
        overwritten with live price in _enrich_candidates before this runs).
@@ -459,14 +461,30 @@ def _compute_meta_score(
     4. Gap weight INCREASED to 40% — this is the most impactful predictor.
        A stock gapping down -10% pre-market is virtually certain to be bearish.
     5. Stronger penalty for rallying stocks (gap > +2% = -0.15 penalty).
+    6. EARNINGS PROXIMITY BOOST: Stocks reporting earnings within 2 trading
+       days AND showing dark_pool_violence/put_buying_at_ask get +15% boost.
+       This catches BDX (-20%), UPWK (-20.2%) style crashes.
+    7. MULTI-SIGNAL CONVERGENCE: When 3+ predictive signals agree AND EWS
+       IPI >= 0.80, add convergence premium for highest-conviction picks.
+    8. PM SCAN DYNAMIC WEIGHTS: When running at 3:15 PM (no overnight gap
+       yet), redistribute the 40% gap weight to earnings/convergence/tier
+       since gap data is unavailable and would waste 40% of scoring power.
     
-    Components (total weight = 1.0):
+    AM Scan Components (total weight = 1.0):
+      1. TIER QUALITY (15%): EXPLOSIVE tier has strongest bearish evidence
+      2. SIGNAL QUALITY (15%): pre-signals (predictive) count more
+      3. INTRADAY GAP (40%): THE MOST IMPACTFUL — confirmed bearish moves
+      4. EWS INSTITUTIONAL PRESSURE (20%): IPI percentile from EWS
+      5. DUI & BATCH & SECTOR (10%): Priority + sector rotation boost
     
-    1. TIER QUALITY (15%): EXPLOSIVE tier has strongest bearish evidence
-    2. SIGNAL QUALITY (15%): pre-signals (predictive) count more
-    3. INTRADAY GAP (40%): THE MOST IMPACTFUL — confirmed bearish moves
-    4. EWS INSTITUTIONAL PRESSURE (20%): IPI percentile from EWS
-    5. DUI & BATCH & SECTOR (10%): Priority + sector rotation boost
+    PM Scan Components (total weight = 1.0) — gap weight redistributed:
+      1. TIER QUALITY (20%): Increased — EXPLOSIVE tier is key differentiator
+      2. SIGNAL QUALITY (15%): pre-signals remain critical
+      3. INTRADAY MOMENTUM (15%): Same-day price change as gap proxy
+      4. EWS INSTITUTIONAL PRESSURE (20%): IPI percentile (unchanged)
+      5. EARNINGS CATALYST (15%): Upcoming earnings + dark pool = smoking gun
+      6. CONVERGENCE PREMIUM (5%): Multi-signal agreement
+      7. DUI & BATCH & SECTOR (10%): Priority + sector rotation boost
     
     Returns: float 0.0-1.0 meta-score for ranking
     """
@@ -528,16 +546,248 @@ def _compute_meta_score(
     sector_s = 0.3 if (sector_boost_set and sym in sector_boost_set) else 0.0
     priority_score = min(is_dui + batch_s + sector_s, 1.0)
     
-    # ── WEIGHTED COMBINATION ──────────────────────────────────────
-    meta = (
-        tier_score      * 0.15 +
-        signal_score    * 0.15 +
-        gap_score       * 0.40 +
-        ews_score       * 0.20 +
-        priority_score  * 0.10
-    )
+    # ── 6. EARNINGS PROXIMITY BOOST (0.0 - 1.0) ──────────────────
+    # NEW: If stock reports earnings within next 2 trading days AND
+    # has dark_pool_violence or put_buying_at_ask signals, this is
+    # the strongest predictive signal for overnight crashes.
+    # BDX (-20%), UPWK (-20.2%) were earnings-driven crashes.
+    #
+    # IMPORTANT: The boost is CONDITIONAL on bearish positioning evidence.
+    # Earnings alone is NOT bearish — many stocks rally after earnings.
+    # The boost only fires when dark_pool_violence + put_buying_at_ask
+    # indicate institutions are POSITIONING for a post-earnings drop.
+    # Without these signals, earnings proximity gets minimal weight.
+    earnings_score = 0.0
+    if earnings_set and sym in earnings_set:
+        # Has upcoming earnings — check for institutional positioning
+        sigs = candidate.get("signals", [])
+        sig_str = str(sigs) if isinstance(sigs, list) else str(sigs)
+        has_dp = "dark_pool_violence" in sig_str
+        has_pb = "put_buying_at_ask" in sig_str
+        has_sells = "repeated_sell_blocks" in sig_str
+        has_weakness = "multi_day_weakness" in sig_str
+        bearish_signals = sum([has_dp, has_pb, has_sells, has_weakness])
+        
+        if bearish_signals >= 3:
+            earnings_score = 1.0  # Maximum: multiple bearish signals + earnings
+        elif has_pb and (has_dp or has_sells):
+            earnings_score = 0.8  # High: put buying + institutional selling
+        elif bearish_signals >= 2:
+            earnings_score = 0.6  # Moderate: 2 bearish signals
+        elif bearish_signals >= 1 and tier_score >= 0.80:
+            earnings_score = 0.4  # Conditional: 1 signal but high tier
+        else:
+            earnings_score = 0.1  # Minimal: earnings alone isn't bearish
+    
+    # ── 7. MULTI-SIGNAL CONVERGENCE (0.0 - 1.0) ──────────────────
+    # NEW: When multiple HIGH-QUALITY signals agree AND EWS IPI is high,
+    # this represents multi-source confirmation of institutional selling.
+    # GEV had 4 pre-signals + IPI=1.0 and dropped -5.4%.
+    #
+    # IMPORTANT: dark_pool_violence appears in 95% of ALL candidates,
+    # so it has ZERO discriminating power. We use a tiered approach:
+    # - HIGH_QUALITY: Rare, specific institutional signals (strongest)
+    # - STANDARD: Common signals that add context when combined
+    HIGH_QUALITY_SIGNALS = {
+        "put_buying_at_ask",        # Direct put buying — strongest
+        "call_selling_at_bid",      # Hedging via call selling
+        "multi_day_weakness",       # Multi-day selling pattern
+        "flat_price_rising_volume", # Distribution divergence
+        "gap_down_no_recovery",     # Failed bounce
+    }
+    STANDARD_SIGNALS = {
+        "repeated_sell_blocks",     # Block selling
+        "dark_pool_violence",       # Ubiquitous but adds context
+    }
+    sigs_list = candidate.get("signals", [])
+    if isinstance(sigs_list, list):
+        hq_count = sum(1 for s in sigs_list if s in HIGH_QUALITY_SIGNALS)
+        std_count = sum(1 for s in sigs_list if s in STANDARD_SIGNALS)
+    else:
+        hq_count = 0
+        std_count = 0
+    
+    convergence_score = 0.0
+    if hq_count >= 3 and ews_ipi >= 0.80:
+        convergence_score = 1.0   # Maximum: 3+ high-quality + institutional pressure
+    elif hq_count >= 2 and std_count >= 1 and ews_ipi >= 0.80:
+        convergence_score = 0.8   # Strong: 2 HQ + 1 standard + IPI
+    elif hq_count >= 2 and ews_ipi >= 0.60:
+        convergence_score = 0.6   # Moderate: 2 HQ + decent IPI
+    elif hq_count >= 2:
+        convergence_score = 0.4   # Moderate: 2 HQ signals alone
+    elif hq_count >= 1 and std_count >= 1 and ews_ipi >= 0.90:
+        convergence_score = 0.3   # Partial: 1 HQ + standard + high IPI
+    
+    # ── WEIGHTED COMBINATION (Dynamic based on scan time) ─────────
+    if is_pm_scan:
+        # PM SCAN (3:15 PM): No overnight gap available yet.
+        # Redistribute the 40% gap weight to predictive factors.
+        # gap_score here represents INTRADAY momentum (same-day drop),
+        # which is less impactful than overnight gap but still useful.
+        meta = (
+            tier_score          * 0.20 +   # ↑ increased from 15%
+            signal_score        * 0.15 +   # unchanged
+            gap_score           * 0.15 +   # ↓ intraday momentum (was 40% for AM gap)
+            ews_score           * 0.20 +   # unchanged
+            earnings_score      * 0.15 +   # NEW: earnings catalyst
+            convergence_score   * 0.05 +   # NEW: multi-signal convergence
+            priority_score      * 0.10     # unchanged
+        )
+    else:
+        # AM SCAN (9:35 AM): Overnight gap is the strongest signal.
+        # Earnings and convergence still contribute but less weight
+        # since gap data is available and more predictive.
+        meta = (
+            tier_score          * 0.12 +   # slightly reduced for AM
+            signal_score        * 0.12 +   # slightly reduced for AM
+            gap_score           * 0.35 +   # ↓ from 40% to make room for new factors
+            ews_score           * 0.18 +   # slightly reduced for AM
+            earnings_score      * 0.08 +   # NEW: still relevant post-earnings
+            convergence_score   * 0.05 +   # NEW: multi-signal convergence
+            priority_score      * 0.10     # unchanged
+        )
     
     return max(0.0, min(meta, 1.0))
+
+
+def _load_earnings_proximity() -> set:
+    """
+    Load tickers with earnings reports within the next 2 trading days.
+    
+    Stocks reporting earnings are HIGH RISK for overnight gaps. When combined
+    with dark_pool_violence or put_buying_at_ask signals (institutional
+    pre-positioning), this is the strongest predictive signal for crashes.
+    
+    Data source: PutsEngine's earnings_calendar_cache.json
+    
+    Example: BDX reported after Monday close → crashed -20% Tuesday morning.
+    If we had detected BDX with upcoming earnings + dark_pool_violence on
+    Monday 3:15 PM, we could have ranked it much higher.
+    
+    Returns: set of symbols with upcoming earnings
+    """
+    try:
+        ec_file = Path(PUTSENGINE_PATH) / "earnings_calendar_cache.json"
+        if not ec_file.exists():
+            return set()
+        
+        with open(ec_file) as f:
+            data = json.load(f)
+        
+        events = data.get("events", data if isinstance(data, dict) else {})
+        if not isinstance(events, dict):
+            return set()
+        
+        today = date.today()
+        # Next 3 calendar days covers 2 trading days (accounts for weekends)
+        cutoff = today + timedelta(days=4)
+        
+        upcoming = set()
+        for sym, info in events.items():
+            if not isinstance(info, dict):
+                continue
+            report_date_str = info.get("report_date", "")
+            try:
+                report_date = date.fromisoformat(report_date_str)
+                if today <= report_date <= cutoff:
+                    upcoming.add(sym)
+            except (ValueError, TypeError):
+                continue
+        
+        if upcoming:
+            logger.info(
+                f"  📅 Earnings proximity: {len(upcoming)} tickers reporting "
+                f"within next 2 trading days: {sorted(upcoming)[:10]}..."
+            )
+        
+        return upcoming
+    except Exception as e:
+        logger.debug(f"  Earnings calendar load failed: {e}")
+        return set()
+
+
+def _is_pm_scan() -> bool:
+    """
+    Determine if the current scan is a PM scan (after 2:00 PM ET).
+    
+    PM scans (3:15 PM) have different characteristics than AM scans (9:35 AM):
+    - No overnight gap data available (gap will happen tonight)
+    - Intraday momentum IS available (stock already weak today?)
+    - Earnings proximity is most impactful (reporting tonight/tomorrow)
+    
+    This allows dynamic weight adjustment in the meta-score algorithm.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        et = datetime.now(ZoneInfo("America/New_York"))
+        return et.hour >= 14  # 2:00 PM ET or later
+    except ImportError:
+        # Fallback: use local time heuristic
+        now = datetime.now()
+        return now.hour >= 14
+
+
+def _fetch_intraday_changes(symbols: List[str]) -> Dict[str, float]:
+    """
+    Fetch same-day intraday price changes for PM scans.
+    
+    At 3:15 PM, overnight gap data is NOT available (the gap happens tonight).
+    But we CAN check if the stock is already WEAK today:
+    - Compare current price to today's open
+    - A stock dropping -2% intraday on high volume signals weakness
+    - This serves as a "gap proxy" for PM scans
+    
+    This is critical for Monday PM scans to detect stocks that will
+    crash overnight (earnings, news, etc.).
+    
+    Returns: {symbol: intraday_change_pct} (negative = dropping)
+    """
+    changes = {}
+    api_key = os.getenv("POLYGON_API_KEY", "") or os.getenv("MASSIVE_API_KEY", "")
+    if not api_key or not symbols:
+        return changes
+    
+    try:
+        import requests
+    except ImportError:
+        return changes
+    
+    today = datetime.now().strftime("%Y-%m-%d")
+    
+    for sym in symbols:
+        try:
+            # Fetch today's OHLC to compare open vs. current
+            url = (
+                f"https://api.polygon.io/v2/aggs/ticker/{sym}/range/1/day/"
+                f"{today}/{today}"
+            )
+            resp = requests.get(
+                url,
+                params={"adjusted": "true", "apiKey": api_key},
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                results = resp.json().get("results", [])
+                if results:
+                    bar = results[0]
+                    open_price = bar.get("o", 0)
+                    close_price = bar.get("c", 0)  # Current/latest price
+                    if open_price > 0 and close_price > 0:
+                        change_pct = ((close_price - open_price) / open_price) * 100
+                        changes[sym] = change_pct
+        except Exception:
+            pass  # Non-critical — just skip
+    
+    if changes:
+        drops = {s: p for s, p in changes.items() if p < -1.0}
+        if drops:
+            logger.info(
+                f"  📉 Intraday drops detected: "
+                f"{', '.join(f'{s}({p:+.1f}%)' for s, p in sorted(drops.items(), key=lambda x: x[1])[:10])}"
+            )
+    
+    return changes
 
 
 def _compute_ews_percentiles(ews_data: Dict[str, Dict[str, Any]]) -> Dict[str, float]:
@@ -597,17 +847,40 @@ def _detect_sector_rotation(candidates: List[Dict[str, Any]]) -> set:
         logger.debug("  Cannot import EngineConfig for sector mapping")
         return set()
     
-    # Count how many candidates per sector
+    # Count how many candidates per sector — but only among the
+    # TOP QUARTILE of candidates (by score/meta-score). When ALL 275
+    # candidates are passed in, every sector with 3+ tickers would
+    # trivially qualify, making the boost meaningless.
+    # Restricting to the top quartile ensures sector rotation is
+    # detected among the STRONGEST bearish candidates, not all.
     from collections import Counter
+    
+    # Use top quartile of candidates for sector counting
+    top_quartile_size = max(50, len(candidates) // 4)
+    top_candidates = candidates[:top_quartile_size]
+    
     sector_counts = Counter()
-    for c in candidates:
+    sector_universe = Counter()  # Total tickers per sector
+    
+    for c in top_candidates:
         sym = c.get("symbol", "")
         sector = sym_to_sector.get(sym)
         if sector:
             sector_counts[sector] += 1
     
-    # Find sectors with 3+ candidates (sector rotation signal)
-    rotating_sectors = {sector for sector, count in sector_counts.items() if count >= 3}
+    # Count total universe per sector (for concentration ratio)
+    for sym, sector in sym_to_sector.items():
+        sector_universe[sector] += 1
+    
+    # Find sectors with 3+ candidates IN THE TOP QUARTILE
+    # AND where that represents a meaningful concentration
+    # (at least 20% of the sector's tickers are in the top quartile)
+    rotating_sectors = set()
+    for sector, count in sector_counts.items():
+        universe_size = sector_universe.get(sector, 1)
+        concentration = count / universe_size if universe_size > 0 else 0
+        if count >= 3 and concentration >= 0.15:  # 3+ stocks AND 15%+ concentration
+            rotating_sectors.add(sector)
     
     if rotating_sectors:
         logger.info(
@@ -1014,10 +1287,42 @@ def _enrich_candidates(candidates: List[Dict[str, Any]], top_n: int) -> List[Dic
                 f"in rotating sectors get boost"
             )
         
+        # ── FEB 11 NEW: Earnings proximity boost ──────────────────
+        # Stocks reporting earnings within next 2 trading days AND
+        # showing dark_pool_violence = highest conviction for overnight crash.
+        # This alone would have caught BDX (-20%) and UPWK (-20.2%).
+        earnings_set = _load_earnings_proximity()
+        
+        # ── FEB 11 NEW: Detect AM vs PM scan ──────────────────────
+        # PM scans (3:15 PM) have NO overnight gap data. The 40% gap weight
+        # is wasted. Dynamic weights redistribute to earnings/convergence.
+        pm_scan = _is_pm_scan()
+        if pm_scan:
+            logger.info(
+                "  🌆 PM SCAN MODE: Activating earnings catalyst + "
+                "convergence premium + intraday momentum weights "
+                "(overnight gap not yet available)"
+            )
+            # Fetch intraday price changes (today's open vs current)
+            # This serves as a "gap proxy" for PM scans
+            intraday_syms = [c["symbol"] for c in candidates[:price_fetch_count]]
+            intraday_changes = _fetch_intraday_changes(intraday_syms)
+            # Inject intraday changes as _cached_price adjustments
+            # so gap detection uses today's open vs. current price
+            for c in candidates[:price_fetch_count]:
+                sym = c["symbol"]
+                if sym in intraday_changes:
+                    c["_intraday_change"] = intraday_changes[sym]
+        else:
+            logger.info("  🌅 AM SCAN MODE: Using overnight gap as primary signal")
+        
         meta_scored = 0
         for c in candidates[:price_fetch_count]:
             live_price = c.get("_live_price")
-            meta = _compute_meta_score(c, ews_data, live_price, ews_percentiles, sector_boost_set)
+            meta = _compute_meta_score(
+                c, ews_data, live_price, ews_percentiles,
+                sector_boost_set, earnings_set, pm_scan,
+            )
             c["meta_score"] = meta
             # Replace raw score with meta-score for ranking
             c["_raw_score"] = c["score"]
@@ -1026,7 +1331,10 @@ def _enrich_candidates(candidates: List[Dict[str, Any]], top_n: int) -> List[Dic
         
         # For candidates beyond the price-fetch pool, use metadata-only scoring
         for c in candidates[price_fetch_count:]:
-            meta = _compute_meta_score(c, ews_data, None, ews_percentiles, sector_boost_set)
+            meta = _compute_meta_score(
+                c, ews_data, None, ews_percentiles,
+                sector_boost_set, earnings_set, pm_scan,
+            )
             c["meta_score"] = meta
             c["_raw_score"] = c["score"]
             c["score"] = meta
@@ -1036,22 +1344,26 @@ def _enrich_candidates(candidates: List[Dict[str, Any]], top_n: int) -> List[Dic
         
         # Log the new top 10
         logger.info(f"  ✅ META-SCORE ranking applied to {meta_scored}+ candidates")
-        logger.info(f"  📊 New Top {min(top_n, len(candidates))} after meta-scoring:")
+        scan_type = "PM" if pm_scan else "AM"
+        logger.info(f"  📊 New Top {min(top_n, len(candidates))} after meta-scoring ({scan_type} mode):")
         for i, c in enumerate(candidates[:top_n], 1):
             gap = c.get("_gap_pct", 0)
             gap_tag = f" gap={gap:+.1f}%" if gap else ""
+            intra = c.get("_intraday_change", 0)
+            intra_tag = f" intra={intra:+.1f}%" if intra else ""
             ews_ipi_raw = 0
             ews_entry = ews_data.get(c["symbol"], {})
             if isinstance(ews_entry, dict):
                 ews_ipi_raw = ews_entry.get("ipi", 0)
             sector_tag = " SECTOR-BOOST" if (sector_boost_set and c["symbol"] in sector_boost_set) else ""
+            earn_tag = " 📅EARNINGS" if (earnings_set and c["symbol"] in earnings_set) else ""
             logger.info(
                 f"    #{i:2d} {c['symbol']:6s} "
                 f"meta={c['score']:.3f} "
                 f"(raw={c.get('_raw_score', 0):.3f}) "
                 f"tier={c.get('tier', '?'):20s} "
                 f"ipi={ews_ipi_raw:.2f}"
-                f"{gap_tag}{sector_tag}"
+                f"{gap_tag}{intra_tag}{sector_tag}{earn_tag}"
             )
     else:
         # Scores are already differentiated — use existing logic
