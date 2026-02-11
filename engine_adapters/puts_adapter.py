@@ -231,6 +231,14 @@ def _fallback_from_cached_results(top_n: int = 10) -> List[Dict[str, Any]]:
                         "tier": c.get("tier", ""),
                         "data_source": data_source_label,
                         "data_age_days": data_age_days,
+                        # FEB 11: Preserve rich metadata for meta-score ranking
+                        "pre_signals": c.get("pre_signals", []),
+                        "post_signals": c.get("post_signals", []),
+                        "is_predictive": c.get("is_predictive", False),
+                        "signal_count": c.get("signal_count", 0),
+                        "is_dui": c.get("is_dui", False),
+                        "batch": c.get("batch", 5),
+                        "timing_recommendation": c.get("timing_recommendation", ""),
                     })
             
             if all_candidates:
@@ -389,6 +397,233 @@ def _fallback_from_cached_results(top_n: int = 10) -> List[Dict[str, Any]]:
         logger.info(f"  #{i} {p['symbol']} — Score: {p['score']:.3f} — ${p.get('price', 0):.2f}")
     
     return deduped[:top_n]
+
+
+def _load_ews_scores() -> Dict[str, Dict[str, Any]]:
+    """
+    Load EWS (Early Warning System) IPI scores for all scanned tickers.
+    
+    Returns dict: {symbol: {"ipi": float, "level": str, "unique_footprints": int}}
+    Used to boost ranking of tickers with institutional pressure signals.
+    """
+    ews_file = Path(PUTSENGINE_PATH) / "logs" / "ews_last_results.json"
+    try:
+        if ews_file.exists():
+            with open(ews_file) as f:
+                data = json.load(f)
+            if isinstance(data, dict) and len(data) > 10:
+                logger.info(f"  📊 Loaded EWS scores for {len(data)} tickers")
+                return data
+    except Exception as e:
+        logger.debug(f"  EWS load failed: {e}")
+    return {}
+
+
+# ─── Tier quality weights for meta-scoring ────────────────────────
+# Based on PutsEngine's tier classification of bearish signal strength.
+# EXPLOSIVE = strongest institutional distribution evidence
+TIER_WEIGHTS = {
+    "\U0001f525 EXPLOSIVE":       1.00,
+    "\U0001f3db\ufe0f CLASS A":   0.90,
+    "\U0001f4aa STRONG":          0.80,
+    "\U0001f440 MONITORING":      0.65,
+    "\U0001f4ca WATCHING":        0.55,
+    "\U0001f7e1 CLASS B":         0.50,
+    "\u274c BELOW THRESHOLD":     0.40,
+}
+
+
+def _compute_meta_score(
+    candidate: Dict[str, Any],
+    ews_data: Dict[str, Dict[str, Any]],
+    live_price: Optional[float] = None,
+    ews_percentiles: Optional[Dict[str, float]] = None,
+    sector_boost_set: Optional[set] = None,
+) -> float:
+    """
+    Compute a differentiated META-SCORE for ranking puts candidates.
+    
+    This solves the critical 0.950 score compression problem where 67% of
+    tickers get identical composite scores, making Top 10 selection random.
+    
+    FEB 11 OVERHAUL — Key improvements:
+    
+    1. BUG FIX: Gap detection now uses _cached_price (not price, which gets
+       overwritten with live price in _enrich_candidates before this runs).
+    2. EWS IPI now uses PERCENTILE ranking instead of raw IPI value.
+       When 66% of tickers have IPI >= 0.7, raw IPI can't differentiate.
+       Percentile ranking ensures the top 10% of IPI scores actually stand out.
+    3. Sector rotation boost: when 3+ tickers in the same sector have
+       distribution signals, all tickers in that sector get a boost.
+       This catches sector-wide selloffs (e.g., 9 semiconductors crashed together).
+    4. Gap weight INCREASED to 40% — this is the most impactful predictor.
+       A stock gapping down -10% pre-market is virtually certain to be bearish.
+    5. Stronger penalty for rallying stocks (gap > +2% = -0.15 penalty).
+    
+    Components (total weight = 1.0):
+    
+    1. TIER QUALITY (15%): EXPLOSIVE tier has strongest bearish evidence
+    2. SIGNAL QUALITY (15%): pre-signals (predictive) count more
+    3. INTRADAY GAP (40%): THE MOST IMPACTFUL — confirmed bearish moves
+    4. EWS INSTITUTIONAL PRESSURE (20%): IPI percentile from EWS
+    5. DUI & BATCH & SECTOR (10%): Priority + sector rotation boost
+    
+    Returns: float 0.0-1.0 meta-score for ranking
+    """
+    sym = candidate.get("symbol", "")
+    
+    # ── 1. TIER QUALITY (0.0 - 1.0) ──────────────────────────────
+    tier = candidate.get("tier", "")
+    tier_score = TIER_WEIGHTS.get(tier, 0.50)
+    
+    # ── 2. SIGNAL QUALITY (0.0 - 1.0) ────────────────────────────
+    pre_sigs = len(candidate.get("pre_signals", []))  if isinstance(candidate.get("pre_signals"), list) else 0
+    post_sigs = len(candidate.get("post_signals", [])) if isinstance(candidate.get("post_signals"), list) else 0
+    is_predictive = 1.0 if candidate.get("is_predictive", False) else 0.0
+    sig_count = candidate.get("signal_count", 0)
+    
+    signal_raw = (pre_sigs * 3.0 + post_sigs * 1.0 + is_predictive * 2.0 + min(sig_count, 5)) / 12.0
+    signal_score = min(signal_raw, 1.0)
+    
+    # ── 3. INTRADAY/PRE-MARKET GAP (0.0 - 1.0) ──────────────────
+    # CRITICAL BUG FIX: Use _cached_price (the ORIGINAL scan price) not
+    # "price" which gets overwritten with the live Polygon price in
+    # _enrich_candidates BEFORE this function is called.
+    # Without this fix, gap_pct = (live - live) / live = 0 ALWAYS.
+    cached_price = candidate.get("_cached_price", candidate.get("price", 0))
+    gap_score = 0.0
+    if live_price and cached_price and cached_price > 0:
+        gap_pct = ((live_price - cached_price) / cached_price) * 100
+        if gap_pct < 0:
+            # Stronger scaling: -3% = 0.375, -8% = 1.0, -10%+ = 1.0
+            gap_score = min(abs(gap_pct) / 8.0, 1.0)
+        elif gap_pct > 2:
+            gap_score = -0.15  # stronger penalty for rallying stocks
+    
+    # ── 4. EWS INSTITUTIONAL PRESSURE (0.0 - 1.0) ────────────────
+    ews_entry = ews_data.get(sym, {})
+    if not isinstance(ews_entry, dict):
+        ews_entry = {}
+    ews_ipi = ews_entry.get("ipi", 0)
+    ews_footprints = ews_entry.get("unique_footprints", 0)
+    
+    # FEB 11 FIX: Use PERCENTILE-BASED IPI instead of raw IPI.
+    # When 66% of tickers have IPI >= 0.7 (act level), raw IPI
+    # gives nearly identical scores to most tickers — useless for ranking.
+    # Percentile ranking ensures the top IPI scores actually differentiate.
+    if ews_percentiles and sym in ews_percentiles:
+        ipi_pct = ews_percentiles[sym]
+    else:
+        ipi_pct = ews_ipi  # fallback to raw IPI
+    
+    ews_score = ipi_pct * 0.6 + (ews_footprints / 8.0) * 0.4
+    ews_score = min(ews_score, 1.0)
+    
+    # ── 5. DUI & BATCH & SECTOR ROTATION (0.0 - 1.0) ─────────────
+    is_dui = 0.5 if candidate.get("is_dui", False) else 0.0
+    batch = candidate.get("batch", 5)
+    batch_s = max(0, (5 - batch) / 4.0) * 0.3
+    # Sector rotation boost: if 3+ tickers in same sector have signals,
+    # this ticker gets a sector boost (catches sector-wide selloffs)
+    sector_s = 0.3 if (sector_boost_set and sym in sector_boost_set) else 0.0
+    priority_score = min(is_dui + batch_s + sector_s, 1.0)
+    
+    # ── WEIGHTED COMBINATION ──────────────────────────────────────
+    meta = (
+        tier_score      * 0.15 +
+        signal_score    * 0.15 +
+        gap_score       * 0.40 +
+        ews_score       * 0.20 +
+        priority_score  * 0.10
+    )
+    
+    return max(0.0, min(meta, 1.0))
+
+
+def _compute_ews_percentiles(ews_data: Dict[str, Dict[str, Any]]) -> Dict[str, float]:
+    """
+    Compute PERCENTILE-BASED IPI rankings from EWS data.
+    
+    When 66% of tickers have IPI >= 0.7 (act level), raw IPI values
+    cluster at the top and can't differentiate bearish from bullish stocks.
+    Percentile ranking distributes scores 0.0-1.0 evenly, ensuring the
+    top 10% of IPI scores actually stand out in the meta-score ranking.
+    
+    Returns: {symbol: percentile_rank (0.0-1.0)} where 1.0 = highest IPI
+    """
+    if not ews_data:
+        return {}
+    
+    # Collect all (symbol, ipi) pairs
+    ipi_pairs = []
+    for sym, entry in ews_data.items():
+        if isinstance(entry, dict) and "ipi" in entry:
+            ipi_pairs.append((sym, entry["ipi"]))
+    
+    if not ipi_pairs:
+        return {}
+    
+    # Sort by IPI ascending → percentile = position / total
+    ipi_pairs.sort(key=lambda x: x[1])
+    total = len(ipi_pairs)
+    
+    return {sym: rank / total for rank, (sym, _) in enumerate(ipi_pairs)}
+
+
+def _detect_sector_rotation(candidates: List[Dict[str, Any]]) -> set:
+    """
+    Detect sector rotation: when 3+ tickers in the same sector have
+    distribution signals, ALL tickers in that sector should be boosted.
+    
+    This catches sector-wide selloffs. For example, on Feb 10-11:
+    - 9 semiconductors crashed together (ALAB -10%, WDC -8%, STX -7%...)
+    - 5 nuclear energy stocks dropped (LEU -9%, OKLO -7%, NNE -7%...)
+    - 4 space/aero stocks sold off (RDW -7%, ASTS -6%, PL -5%...)
+    
+    Without sector detection, individual stocks may not rank high enough
+    (their tier/signal scores are average), but the SECTOR pattern is
+    a very strong bearish signal that should boost all stocks in it.
+    
+    Returns: set of symbols that should get a sector rotation boost
+    """
+    try:
+        # Build reverse mapping: symbol -> sector
+        from putsengine.config import EngineConfig
+        sym_to_sector = {}
+        for sector_name, tickers in EngineConfig.UNIVERSE_SECTORS.items():
+            for t in tickers:
+                sym_to_sector[t] = sector_name
+    except ImportError:
+        logger.debug("  Cannot import EngineConfig for sector mapping")
+        return set()
+    
+    # Count how many candidates per sector
+    from collections import Counter
+    sector_counts = Counter()
+    for c in candidates:
+        sym = c.get("symbol", "")
+        sector = sym_to_sector.get(sym)
+        if sector:
+            sector_counts[sector] += 1
+    
+    # Find sectors with 3+ candidates (sector rotation signal)
+    rotating_sectors = {sector for sector, count in sector_counts.items() if count >= 3}
+    
+    if rotating_sectors:
+        logger.info(
+            f"  🔄 Sector rotation detected in: "
+            f"{', '.join(f'{s}({sector_counts[s]})' for s in rotating_sectors)}"
+        )
+    
+    # Build boost set: all tickers in rotating sectors
+    boost_set = set()
+    for c in candidates:
+        sym = c.get("symbol", "")
+        sector = sym_to_sector.get(sym)
+        if sector in rotating_sectors:
+            boost_set.add(sym)
+    
+    return boost_set
 
 
 def _validate_picks(picks: List[Dict[str, Any]], source: str) -> None:
@@ -616,57 +851,90 @@ def _fetch_polygon_prices(symbols: List[str]) -> Dict[str, float]:
 
 def _enrich_candidates(candidates: List[Dict[str, Any]], top_n: int) -> List[Dict[str, Any]]:
     """
-    Enrich candidates with real-time prices and differentiated scores.
+    Enrich candidates with real-time prices and META-SCORE based ranking.
 
-    Three critical fixes applied here:
+    FEB 11 OVERHAUL — Three critical improvements:
 
-    1. **PRICES — Always fetch real-time from Polygon API**
-       Cached prices from scheduled_scan_results.json can be hours old.
-       For trading decisions we need current market prices, not stale ones.
-       Even non-zero cached prices may be wildly wrong (e.g. RBLX $66 vs $73).
+    1. **PRICES — Fetch real-time from Polygon for WIDER candidate pool**
+       Instead of just top 10, fetch for top 50 candidates so we can
+       detect price gaps BEFORE ranking (catching UPWK -20%, BDX -20%).
 
-    2. **SCORES — Apply pattern_boost if not yet integrated**
-       PutsEngine runs pattern integration asynchronously. If the Meta Engine
-       reads the file before integration, all scores are uniform base values
-       (e.g. 0.65). The pattern_boost field tells us what each pick's
-       boost should be, so we apply it ourselves.
+    2. **META-SCORE — Multi-factor ranking replaces raw composite score**
+       The raw PutsEngine composite score is compressed to 0.950 for 67%
+       of tickers (183/275), making Top 10 selection essentially random.
+       The meta-score uses tier quality, signal quality, intraday gap,
+       EWS institutional pressure, and DUI priority for differentiation.
 
-    3. **TIE-BREAKING — Use signal count + vol_ratio + sub-scores**
-       When scores remain tied after boosting, differentiate by number
-       of signals (more = stronger conviction), vol_ratio (higher = more
-       distribution activity), and sub-scores.
+    3. **GAP DETECTION — The most impactful new factor**
+       Detects negative price gaps (pre-market or intraday) by comparing
+       the Polygon live price to the cached scan price. Tickers with large
+       gaps (-5%+) get massive score boosts, catching earnings reactions
+       and overnight news that the distribution layer can't predict.
 
     Called after dedup and sort, before returning results from fallback.
     """
     if not candidates:
         return candidates
 
-    top_slice = candidates[:top_n]
-    top_scores = [c["score"] for c in top_slice]
-    uniform_scores = len(set(top_scores)) == 1 and len(top_scores) > 1
     supp_lookup = None  # lazy-loaded if needed
 
     # ==================================================================
-    # FIX 1: ALWAYS fetch real-time prices from Polygon
+    # STEP 1: DETECT SCORE COMPRESSION
     # ==================================================================
-    # Cached prices can be hours old; for volatile names like RBLX, WULF
-    # the difference between cached ($66) and live ($73) is >10%.
+    from collections import Counter
+    all_scores = [round(c["score"], 3) for c in candidates]
+    score_counts = Counter(all_scores)
+    most_common_score, most_common_count = score_counts.most_common(1)[0]
+    compression_ratio = most_common_count / len(candidates)
+    
+    score_compressed = compression_ratio > 0.40  # 40%+ at same score = compressed
+    if score_compressed:
+        logger.warning(
+            f"  ⚠️ SCORE COMPRESSION DETECTED: {most_common_count}/{len(candidates)} "
+            f"({compression_ratio:.0%}) candidates at score={most_common_score:.3f} — "
+            f"activating multi-factor META-SCORE ranking"
+        )
+
+    # ==================================================================
+    # STEP 2: FETCH REAL-TIME PRICES FROM POLYGON (wider pool)
+    # ==================================================================
+    # When scores are compressed, fetch prices for a WIDER pool (top 50)
+    # so we can use gap detection as a ranking factor.
+    # When scores are differentiated, just fetch for top_n.
+    price_fetch_count = min(50, len(candidates)) if score_compressed else min(top_n, len(candidates))
     logger.info(
         f"  📡 Fetching real-time prices from Polygon for "
-        f"top {min(top_n, len(candidates))} picks..."
+        f"top {price_fetch_count} candidates..."
     )
-    all_symbols = [c["symbol"] for c in candidates[:top_n]]
-    polygon_prices = _fetch_polygon_prices(all_symbols)
+    fetch_symbols = [c["symbol"] for c in candidates[:price_fetch_count]]
+    polygon_prices = _fetch_polygon_prices(fetch_symbols)
+
+    # CRITICAL: Store the ORIGINAL cached price for ALL candidates BEFORE
+    # any Polygon price updates. _compute_meta_score uses _cached_price
+    # to compute the gap vs live price. Without this, the gap detection
+    # produces gap_pct = 0 because both prices are the same (live).
+    for c in candidates[:price_fetch_count]:
+        c["_cached_price"] = c.get("price", 0)
 
     updated_prices = 0
-    for c in candidates[:top_n]:
+    gap_detected = 0
+    for c in candidates[:price_fetch_count]:
         sym = c["symbol"]
         if sym in polygon_prices and polygon_prices[sym] > 0:
             new_price = polygon_prices[sym]
-            old_price = c.get("price", 0)
+            old_price = c["_cached_price"]  # Use the preserved cached price
+            # Store live price for gap detection
+            c["_live_price"] = new_price
             if old_price > 0 and old_price != new_price:
                 pct_diff = ((new_price - old_price) / old_price) * 100
-                if abs(pct_diff) > 1:
+                c["_gap_pct"] = pct_diff
+                if pct_diff < -3.0:
+                    gap_detected += 1
+                    logger.info(
+                        f"    🔻 {sym}: ${old_price:.2f} → ${new_price:.2f} "
+                        f"({pct_diff:+.1f}% GAP DOWN)"
+                    )
+                elif abs(pct_diff) > 1:
                     logger.info(
                         f"    {sym}: ${old_price:.2f} → ${new_price:.2f} "
                         f"({pct_diff:+.1f}% stale)"
@@ -675,19 +943,21 @@ def _enrich_candidates(candidates: List[Dict[str, Any]], top_n: int) -> List[Dic
             updated_prices += 1
 
     if updated_prices > 0:
-        logger.info(f"  ✅ Updated {updated_prices}/{len(all_symbols)} prices from Polygon API")
+        logger.info(f"  ✅ Updated {updated_prices}/{len(fetch_symbols)} prices from Polygon API")
+    if gap_detected > 0:
+        logger.info(f"  🔻 {gap_detected} tickers with significant gap-down (>3%) detected")
 
     # For any remaining $0 prices, try supplementary data files
-    still_zero = [c["symbol"] for c in candidates[:top_n] if c.get("price", 0) == 0]
+    still_zero = [c["symbol"] for c in candidates[:price_fetch_count] if c.get("price", 0) == 0]
     if still_zero:
         supp_lookup = _build_supplementary_lookup()
-        for c in candidates[:top_n]:
+        for c in candidates[:price_fetch_count]:
             if c.get("price", 0) == 0:
                 sym = c["symbol"]
                 if sym in supp_lookup and supp_lookup[sym].get("price", 0) > 0:
                     c["price"] = supp_lookup[sym]["price"]
                     logger.debug(f"    {sym}: price from supplementary data ${supp_lookup[sym]['price']:.2f}")
-        final_zero = sum(1 for c in candidates[:top_n] if c.get("price", 0) == 0)
+        final_zero = sum(1 for c in candidates[:price_fetch_count] if c.get("price", 0) == 0)
         if final_zero > 0:
             logger.warning(f"  ⚠️ {final_zero} picks still at $0.00 after all enrichment")
 
@@ -709,70 +979,83 @@ def _enrich_candidates(candidates: List[Dict[str, Any]], top_n: int) -> List[Dic
                         c[key] = supp[key]
 
     # ==================================================================
-    # FIX 2: Score differentiation — apply pattern_boost if needed
+    # STEP 3: MULTI-FACTOR META-SCORE RANKING
     # ==================================================================
-    if uniform_scores:
-        logger.warning(
-            f"  ⚠️ All top {len(top_scores)} picks have identical "
-            f"score={top_scores[0]:.3f} — attempting score differentiation..."
-        )
-
-        # STEP A: Apply pattern_boost to base scores
-        # PutsEngine's pattern integration adds pattern_boost to the base score.
-        # If integration hasn't run yet, we do it ourselves.
-        boosted = 0
-        for c in candidates:
-            boost = c.get("pattern_boost", 0)
-            if boost > 0 and c.get("pattern_enhanced", False):
-                c["score"] = min(c["score"] + boost, 1.0)
-                boosted += 1
-
-        if boosted > 0:
+    # Always apply when score compression is detected.
+    # This replaces the old pattern_boost / tie-breaker approach which
+    # only fired when ALL top 10 had identical scores (often masked by
+    # 1-2 tickers with slightly different scores like AAPL=0.965).
+    if score_compressed:
+        logger.info("  🧠 Computing multi-factor META-SCORES...")
+        ews_data = _load_ews_scores()
+        
+        # ── FEB 11 FIX: Compute EWS IPI percentile ranks ─────────
+        # When 66% of tickers have IPI >= 0.7, raw IPI can't differentiate.
+        # Percentile ranking ensures the top 10% of IPI scores stand out.
+        ews_percentiles = _compute_ews_percentiles(ews_data)
+        if ews_percentiles:
+            # Count how many are at each level
+            act_count = sum(1 for s, e in ews_data.items() if isinstance(e, dict) and e.get("level") == "act")
+            total_ews = sum(1 for s, e in ews_data.items() if isinstance(e, dict))
             logger.info(
-                f"  ✅ Applied pattern_boost to {boosted} picks — "
-                f"scores now differentiated"
+                f"  📊 EWS IPI percentile normalization: {total_ews} tickers, "
+                f"{act_count} at 'act' ({act_count/total_ews*100:.0f}%) — "
+                f"using percentile ranking for differentiation"
             )
-            candidates.sort(key=lambda x: x["score"], reverse=True)
-
-        # STEP B: Re-check if still uniform after pattern_boost
-        rechecked = [c["score"] for c in candidates[:top_n]]
-        if len(set(rechecked)) == 1 and len(rechecked) > 1:
-            # Try supplementary data scores (different file may have varied scores)
-            if supp_lookup is None:
-                supp_lookup = _build_supplementary_lookup()
-            enriched_count = 0
-            for c in candidates:
-                sym = c["symbol"]
-                if sym in supp_lookup and supp_lookup[sym].get("score", 0) > 0:
-                    supp_score = supp_lookup[sym]["score"]
-                    if supp_score != c["score"]:
-                        c["score"] = supp_score
-                        enriched_count += 1
-            if enriched_count > 0:
-                logger.info(
-                    f"  ✅ Scores enriched for {enriched_count} symbols "
-                    f"from supplementary data"
-                )
-                candidates.sort(key=lambda x: x["score"], reverse=True)
-
-        # STEP C: Final tie-breaker for any remaining ties
-        rechecked2 = [c["score"] for c in candidates[:top_n]]
-        if len(set(rechecked2)) == 1 and len(rechecked2) > 1:
+        
+        # ── FEB 11 FIX: Sector rotation detection ────────────────
+        # When 3+ tickers in the same sector have distribution signals,
+        # boost ALL tickers in that sector. This catches sector-wide
+        # selloffs (e.g., 9 semiconductors crashed together on Feb 10-11).
+        sector_boost_set = _detect_sector_rotation(candidates[:price_fetch_count])
+        if sector_boost_set:
             logger.info(
-                "  ℹ️ Scores still tied — applying multi-factor "
-                "tie-breaker for ranking"
+                f"  🔄 SECTOR ROTATION: {len(sector_boost_set)} tickers "
+                f"in rotating sectors get boost"
             )
-            candidates.sort(
-                key=lambda x: (
-                    x["score"],
-                    len(x.get("signals", [])),
-                    x.get("vol_ratio", 0),
-                    x.get("distribution_score", 0)
-                    + x.get("dealer_score", 0)
-                    + x.get("liquidity_score", 0),
-                ),
-                reverse=True,
+        
+        meta_scored = 0
+        for c in candidates[:price_fetch_count]:
+            live_price = c.get("_live_price")
+            meta = _compute_meta_score(c, ews_data, live_price, ews_percentiles, sector_boost_set)
+            c["meta_score"] = meta
+            # Replace raw score with meta-score for ranking
+            c["_raw_score"] = c["score"]
+            c["score"] = meta
+            meta_scored += 1
+        
+        # For candidates beyond the price-fetch pool, use metadata-only scoring
+        for c in candidates[price_fetch_count:]:
+            meta = _compute_meta_score(c, ews_data, None, ews_percentiles, sector_boost_set)
+            c["meta_score"] = meta
+            c["_raw_score"] = c["score"]
+            c["score"] = meta
+        
+        # Re-sort by meta-score
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+        
+        # Log the new top 10
+        logger.info(f"  ✅ META-SCORE ranking applied to {meta_scored}+ candidates")
+        logger.info(f"  📊 New Top {min(top_n, len(candidates))} after meta-scoring:")
+        for i, c in enumerate(candidates[:top_n], 1):
+            gap = c.get("_gap_pct", 0)
+            gap_tag = f" gap={gap:+.1f}%" if gap else ""
+            ews_ipi_raw = 0
+            ews_entry = ews_data.get(c["symbol"], {})
+            if isinstance(ews_entry, dict):
+                ews_ipi_raw = ews_entry.get("ipi", 0)
+            sector_tag = " SECTOR-BOOST" if (sector_boost_set and c["symbol"] in sector_boost_set) else ""
+            logger.info(
+                f"    #{i:2d} {c['symbol']:6s} "
+                f"meta={c['score']:.3f} "
+                f"(raw={c.get('_raw_score', 0):.3f}) "
+                f"tier={c.get('tier', '?'):20s} "
+                f"ipi={ews_ipi_raw:.2f}"
+                f"{gap_tag}{sector_tag}"
             )
+    else:
+        # Scores are already differentiated — use existing logic
+        logger.info("  ✅ Scores well-differentiated — using raw PutsEngine ranking")
 
     # ==================================================================
     # Deduplicate signals (scan_history may have repeats)
