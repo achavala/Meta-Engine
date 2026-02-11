@@ -1,9 +1,10 @@
 """
 Meta Engine Scheduler
 ======================
-Runs the Meta Engine twice daily on every trading day:
-  - 9:35 AM ET  (morning — captures pre-market + opening signals)
-  - 3:15 PM ET  (afternoon — captures intraday action + power hour setup)
+Runs the Meta Engine three times daily on every trading day:
+  - 9:21 AM ET  (pre-market brief — cached PutsEngine scan + zero-hour data)
+  - 9:50 AM ET  (morning — 20 min of real market data + gap detection)
+  - 3:15 PM ET  (afternoon — intraday action + power hour setup)
 
 Methods:
 1. APScheduler (preferred) — background daemon
@@ -11,7 +12,7 @@ Methods:
 3. Manual — run once via command line
 
 Usage:
-    # Start scheduler daemon (runs at 9:35 AM + 3:15 PM ET):
+    # Start scheduler daemon (runs at 9:21 AM + 9:50 AM + 3:15 PM ET):
     python scheduler.py
     
     # Run once immediately:
@@ -141,7 +142,7 @@ def _keep_awake_market_hours():
     """
     Prevent the Mac from idle-sleeping during market hours.
     Called at 9:20 AM ET by APScheduler; keeps awake for ~7 hours
-    (covers both 9:35 AM and 3:15 PM runs, plus market close at 4 PM).
+    (covers 9:21 AM, 9:50 AM and 3:15 PM runs, plus market close at 4 PM).
     Uses macOS `caffeinate` — no sudo needed.
     """
     global _caffeinate_proc
@@ -150,7 +151,7 @@ def _keep_awake_market_hours():
         _caffeinate_proc.terminate()
         _caffeinate_proc = None
 
-    duration = 25200  # 7 hours in seconds (9:20 AM → 4:20 PM)
+    duration = 25200  # 7 hours in seconds (9:15 AM → 4:15 PM)
     try:
         _caffeinate_proc = subprocess.Popen(
             ["caffeinate", "-dims", "-t", str(duration)],
@@ -181,8 +182,9 @@ def _midday_position_check():
 
 def start_scheduler():
     """
-    Start the APScheduler daemon that runs Meta Engine twice daily:
-      - 9:35 AM ET  (morning scan)
+    Start the APScheduler daemon that runs Meta Engine three times daily:
+      - 9:21 AM ET  (pre-market brief — before market open)
+      - 9:50 AM ET  (morning scan — 20 min of real market data)
       - 3:15 PM ET  (afternoon scan)
     Also starts the trading dashboard on port 5050.
     """
@@ -193,8 +195,8 @@ def start_scheduler():
         logger.error("APScheduler not installed. Run: pip install apscheduler")
         sys.exit(1)
     
-    # Parse both run times
-    run_times = MetaConfig.RUN_TIMES_ET  # ["09:35", "15:15"]
+    # Parse all run times (now supports 2 or 3 runs)
+    run_times = MetaConfig.RUN_TIMES_ET  # ["09:21", "09:50", "15:15"]
     
     logger.info("=" * 60)
     logger.info("🏛️  META ENGINE SCHEDULER")
@@ -216,22 +218,24 @@ def start_scheduler():
     # Create scheduler
     scheduler = BlockingScheduler(timezone=EST)
     
-    # ── Job 0: Keep Mac awake during market hours (9:20 AM) ──
+    # ── Job 0: Keep Mac awake during market hours (9:15 AM) ──
+    # Moved from 9:20 → 9:15 to cover the new 9:21 AM pre-market run
     scheduler.add_job(
         _keep_awake_market_hours,
         trigger=CronTrigger(
-            hour=9, minute=20,
+            hour=9, minute=15,
             day_of_week="mon-fri",
             timezone=EST,
         ),
         id="caffeinate_market_hours",
-        name="Keep Mac awake 9:20 AM - 4:20 PM ET",
+        name="Keep Mac awake 9:15 AM - 4:15 PM ET",
         misfire_grace_time=3600,
     )
-    logger.info("  ✅ Job scheduled: caffeinate at 9:20 AM ET, Mon-Fri")
+    logger.info("  ✅ Job scheduled: caffeinate at 9:15 AM ET, Mon-Fri")
 
-    # ── Job 1 & 2: Meta Engine runs (scan + trade) ──
-    session_labels = {0: "Morning", 1: "Afternoon"}
+    # ── Jobs 1-3: Meta Engine runs (scan + report + trade) ──
+    # Labels map index → descriptive name for logging and trade DB
+    session_labels = {0: "PreMarket", 1: "Morning", 2: "Afternoon"}
     for idx, run_time in enumerate(run_times):
         hour, minute = map(int, run_time.split(":"))
         label = session_labels.get(idx, f"Session-{idx+1}")

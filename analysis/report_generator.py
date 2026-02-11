@@ -53,7 +53,7 @@ def generate_md_report(
     lines = []
     lines.append("# 🏛️ Meta Engine Daily Report")
     lines.append(f"**Date:** {datetime.now().strftime('%B %d, %Y %I:%M %p ET')}")
-    lines.append(f"**Run Type:** Scheduled (9:35 AM / 3:15 PM ET)")
+    lines.append(f"**Run Type:** Scheduled (9:21 AM / 9:50 AM / 3:15 PM ET)")
     lines.append("")
 
     # Signal freshness summary — warn if data is stale

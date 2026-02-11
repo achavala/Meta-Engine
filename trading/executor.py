@@ -620,7 +620,7 @@ def execute_trades(
 
     Args:
         cross_results: Output from cross_analyze()
-        session_label: 'AM' (9:35) or 'PM' (3:15)
+        session_label: 'PreMarket' (9:21), 'AM' (9:50), or 'PM' (3:15)
 
     Returns:
         Dict with trade execution results

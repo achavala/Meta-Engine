@@ -73,8 +73,9 @@ def check_config():
         print(f"  {icon} {name}")
     
     print("\n⏰ Schedule:")
+    session_names = {0: "Pre-Market", 1: "Morning", 2: "Afternoon"}
     for i, rt in enumerate(MetaConfig.RUN_TIMES_ET):
-        label = "Morning" if i == 0 else "Afternoon"
+        label = session_names.get(i, f"Session-{i+1}")
         print(f"  {label}: {rt} ET (Mon-Fri)")
     print(f"  Top N picks: {MetaConfig.TOP_N_PICKS}")
     

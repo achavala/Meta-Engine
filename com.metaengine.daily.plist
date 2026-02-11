@@ -5,8 +5,9 @@
     <!--
     META ENGINE — macOS launchd Auto-Start
     =======================================
-    This plist runs the Meta Engine at two times every trading day:
-      - 9:35 AM ET  (morning — opening scan)
+    This plist runs the Meta Engine at three times every trading day:
+      - 9:21 AM ET  (pre-market brief — cached scans, zero-hour data)
+      - 9:50 AM ET  (morning — 20 min of real market data)
       - 3:15 PM ET  (afternoon — power hour scan)
     
     Installation:
@@ -23,7 +24,8 @@
        launchctl unload ~/Library/LaunchAgents/com.metaengine.daily.plist
     
     Note: The time is in LOCAL timezone. Adjust if you're not in ET.
-    9:35 AM ET = Hour 9, Minute 35
+    9:21 AM ET = Hour 9, Minute 21
+    9:50 AM ET = Hour 9, Minute 50
     3:15 PM ET = Hour 15, Minute 15
     -->
     
@@ -42,12 +44,19 @@
     
     <key>StartCalendarInterval</key>
     <array>
-        <!-- 9:35 AM ET — Morning scan -->
+        <!-- 9:21 AM ET — Pre-market brief -->
         <dict>
             <key>Hour</key>
             <integer>9</integer>
             <key>Minute</key>
-            <integer>35</integer>
+            <integer>21</integer>
+        </dict>
+        <!-- 9:50 AM ET — Morning scan (post-open) -->
+        <dict>
+            <key>Hour</key>
+            <integer>9</integer>
+            <key>Minute</key>
+            <integer>50</integer>
         </dict>
         <!-- 3:15 PM ET — Afternoon scan -->
         <dict>

@@ -320,7 +320,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("##### 📅 Schedule")
-    st.markdown("• **AM scan:** 9:35 AM ET")
+    st.markdown("• **Pre-Market:** 9:21 AM ET · **AM scan:** 9:50 AM ET")
     st.markdown("• **PM scan:** 3:15 PM ET")
     st.markdown("• **Days:** Mon – Fri")
 
@@ -566,7 +566,7 @@ with tabs[1]:
                 f'<span style="color:{freshness_color}; font-weight:700; font-size:14px;">'
                 f'{freshness_icon} {freshness_label} — Last scan: {scan_time_fmt} ({age_str})</span>'
                 f'<span style="color:#78909c; font-size:12px;">Auto-updates on every scan '
-                f'(9:35 AM &amp; 3:15 PM ET)</span>'
+                f'(9:21 AM, 9:50 AM &amp; 3:15 PM ET)</span>'
                 f'</div>',
                 unsafe_allow_html=True,
             )
