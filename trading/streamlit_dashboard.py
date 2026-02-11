@@ -616,20 +616,31 @@ with tabs[1]:
         moon_cross = cross.get("moonshot_through_puts", [])
         if moon_cross:
             rows = []
+            moon_has_orm = any(p.get("_orm_score") is not None for p in moon_cross)
             for i, p in enumerate(moon_cross, 1):
                 puts_a = p.get("puts_analysis", {})
-                rows.append(
-                    {
-                        "#": i,
-                        "Symbol": p["symbol"],
-                        "Score": f'{p.get("score", 0):.3f}',
-                        "Price": f'${p.get("price", 0):.2f}',
-                        "Signals": len(p.get("signals", [])),
-                        "Puts Risk": puts_a.get("risk_level", "N/A"),
-                        "Gap Alert": "⚠️" if p.get("overnight_gap_alert") else "",
-                    }
-                )
-            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+                row = {
+                    "#": i,
+                    "Symbol": p["symbol"],
+                    "Final": f'{p.get("score", 0):.3f}',
+                    "Price": f'${p.get("price", 0):.2f}',
+                }
+                if moon_has_orm:
+                    row["Base"] = f'{p.get("_base_score", 0):.3f}'
+                    orm_val = p.get("_orm_score", 0)
+                    row["ORM"] = f'{orm_val:.3f}'
+                    fcts = p.get("_orm_factors", {})
+                    if fcts:
+                        top_f = max(fcts.items(), key=lambda x: x[1])
+                        row["Top Factor"] = f"{top_f[0]}={top_f[1]:.2f}"
+                    else:
+                        row["Top Factor"] = "—"
+                row["Signals"] = len(p.get("signals", []))
+                row["Puts Risk"] = puts_a.get("risk_level", "N/A")
+                if p.get("overnight_gap_alert"):
+                    row["Gap"] = "⚠️"
+                rows.append(row)
+            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
         else:
             st.info("No moonshot picks available yet.")
 
