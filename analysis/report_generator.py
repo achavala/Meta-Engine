@@ -103,8 +103,14 @@ def generate_md_report(
             f"Only scores ≥ 0.20 have historically shown actionable edge."
         )
         lines.append("")
-    lines.append("| # | Ticker | Price | Score | Conviction | Signals | Engine Type |")
-    lines.append("|---|--------|-------|-------|------------|---------|-------------|")
+    # Check if any pick has ORM data (new scoring system)
+    has_orm = any(p.get("_orm_score") is not None for p in puts_picks)
+    if has_orm:
+        lines.append("| # | Ticker | Price | Final | Meta | ORM | Conviction | Top ORM Factor | Signals |")
+        lines.append("|---|--------|-------|-------|------|-----|------------|----------------|---------|")
+    else:
+        lines.append("| # | Ticker | Price | Score | Conviction | Signals | Engine Type |")
+        lines.append("|---|--------|-------|-------|------------|---------|-------------|")
     for i, p in enumerate(puts_picks, 1):
         sym = p["symbol"]
         price = _sf(p.get("price", 0))
@@ -118,7 +124,21 @@ def generate_md_report(
             conviction = "🟡 MED"
         else:
             conviction = "🔻 LOW"
-        lines.append(f"| {i} | **{sym}** | ${price:.2f} | {score:.3f} | {conviction} | {sig_count} | {etype} |")
+        if has_orm:
+            meta = _sf(p.get("meta_score", 0))
+            orm = _sf(p.get("_orm_score", 0))
+            orm_factors = p.get("_orm_factors", {})
+            if orm_factors:
+                top_factor = max(orm_factors.items(), key=lambda x: x[1])
+                top_f_str = f"{top_factor[0]}={top_factor[1]:.2f}"
+            else:
+                top_f_str = "—"
+            lines.append(
+                f"| {i} | **{sym}** | ${price:.2f} | {score:.3f} | "
+                f"{meta:.3f} | {orm:.3f} | {conviction} | {top_f_str} | {sig_count} |"
+            )
+        else:
+            lines.append(f"| {i} | **{sym}** | ${price:.2f} | {score:.3f} | {conviction} | {sig_count} | {etype} |")
     lines.append("")
 
     # Moonshot Engine Top 10

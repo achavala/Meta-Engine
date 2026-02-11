@@ -583,20 +583,31 @@ with tabs[1]:
         puts_cross = cross.get("puts_through_moonshot", [])
         if puts_cross:
             rows = []
+            has_orm = any(p.get("_orm_score") is not None for p in puts_cross)
             for i, p in enumerate(puts_cross, 1):
                 moon_a = p.get("moonshot_analysis", {})
-                rows.append(
-                    {
-                        "#": i,
-                        "Symbol": p["symbol"],
-                        "Score": f'{p.get("score", 0):.3f}',
-                        "Price": f'${p.get("price", 0):.2f}',
-                        "Signals": len(p.get("signals", [])),
-                        "Moonshot Level": moon_a.get("opportunity_level", "N/A"),
-                        "Gap Alert": "⚠️" if p.get("overnight_gap_alert") else "",
-                    }
-                )
-            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+                row = {
+                    "#": i,
+                    "Symbol": p["symbol"],
+                    "Final": f'{p.get("score", 0):.3f}',
+                    "Price": f'${p.get("price", 0):.2f}',
+                }
+                if has_orm:
+                    row["Meta"] = f'{p.get("meta_score", 0):.3f}'
+                    orm_val = p.get("_orm_score", 0)
+                    row["ORM"] = f'{orm_val:.3f}'
+                    fcts = p.get("_orm_factors", {})
+                    if fcts:
+                        top_f = max(fcts.items(), key=lambda x: x[1])
+                        row["Top Factor"] = f"{top_f[0]}={top_f[1]:.2f}"
+                    else:
+                        row["Top Factor"] = "—"
+                row["Signals"] = len(p.get("signals", []))
+                row["Moonshot"] = moon_a.get("opportunity_level", "N/A")
+                if p.get("overnight_gap_alert"):
+                    row["Gap"] = "⚠️"
+                rows.append(row)
+            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
         else:
             st.info("No puts picks available yet.")
 

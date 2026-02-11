@@ -3,6 +3,23 @@ PutsEngine Adapter
 ==================
 Interface to get Top 10 PUT candidates from the PutsEngine system.
 Imports PutsEngine modules directly without modifying the original codebase.
+
+FEB 11 ADDITION — Options Return Multiplier (ORM):
+  The meta-score ranks by "will it drop?".  The ORM ranks by
+  "will the PUT OPTION pay 3x–10x?".  Final ranking blends both:
+      final_score = meta_score * 0.55 + ORM * 0.45
+  This ensures the Top 10 list surfaces stocks with the highest
+  expected OPTIONS return, not just the highest probability of decline.
+
+  ORM sub-factors (8 total):
+    1. Gamma Leverage         (20%) — negative GEX = amplified moves
+    2. IV Expansion Potential  (15%) — low IV = cheap options, room to expand
+    3. OI Positioning          (15%) — put OI build-up, aggressive positioning
+    4. Delta Sweet Spot        (10%) — 0.20–0.40 delta = maximum leverage
+    5. Short DTE               (10%) — 0–5 DTE = maximum gamma leverage
+    6. Volatility Regime       (10%) — higher implied move = better for puts
+    7. Dealer Positioning      (10%) — gamma flip proximity, vanna regime
+    8. Liquidity & Spread      (10%) — tight spreads + high volume
 """
 
 import sys
@@ -12,7 +29,7 @@ import json
 import signal as _signal
 from pathlib import Path
 from datetime import datetime, date, timedelta
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import logging
 
 # Timeout for PutsEngine live scan (seconds).
@@ -899,6 +916,460 @@ def _detect_sector_rotation(candidates: List[Dict[str, Any]]) -> set:
     return boost_set
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# OPTIONS RETURN MULTIPLIER (ORM)  —  FEB 11
+# ═══════════════════════════════════════════════════════════════════════
+# Ranks put candidates by expected OPTIONS return (3x–10x), not just
+# by probability of stock decline.  Uses 8 institutional-grade factors
+# sourced from UW GEX, IV term structure, OI changes, flow, and dark pool.
+# ═══════════════════════════════════════════════════════════════════════
+
+# Paths to TradeNova UW cache files
+_TRADENOVA_DATA = Path.home() / "TradeNova" / "data"
+
+# Module-level UW cache (loaded once per pipeline run)
+_uw_gex_data: Optional[Dict[str, Any]] = None
+_uw_iv_data: Optional[Dict[str, Any]] = None
+_uw_oi_data: Optional[Dict[str, Any]] = None
+_uw_flow_data: Optional[Dict[str, Any]] = None
+_uw_dp_data: Optional[Dict[str, Any]] = None
+
+
+def _load_uw_options_data() -> Tuple[
+    Dict[str, Any],  # gex
+    Dict[str, Any],  # iv_term
+    Dict[str, Any],  # oi_change
+    Dict[str, Any],  # flow
+    Dict[str, Any],  # darkpool
+]:
+    """
+    Load ALL Unusual-Whales options-microstructure caches once.
+
+    Returns five dicts keyed by symbol.  Each cache is read from
+    ``~/TradeNova/data/`` and stripped of metadata keys.  The data is
+    cached at module level so repeated calls within the same pipeline
+    run are free.
+
+    Files consumed (all READ-ONLY):
+      - uw_gex_cache.json        (291 symbols — GEX / vanna / charm)
+      - uw_iv_term_cache.json    (290 symbols — IV term structure)
+      - uw_oi_change_cache.json  (290 symbols — OI build-up / new pos.)
+      - uw_flow_cache.json       (261 symbols — individual trades w/ greeks)
+      - darkpool_cache.json      (286 symbols — block / dark prints)
+    """
+    global _uw_gex_data, _uw_iv_data, _uw_oi_data, _uw_flow_data, _uw_dp_data
+
+    def _load(fname: str, inner_key: Optional[str] = None) -> Dict[str, Any]:
+        try:
+            fpath = _TRADENOVA_DATA / fname
+            if not fpath.exists():
+                return {}
+            with open(fpath) as f:
+                raw = json.load(f)
+            data = raw.get(inner_key, raw) if inner_key else raw
+            if not isinstance(data, dict):
+                return {}
+            return {k: v for k, v in data.items()
+                    if k not in ("timestamp", "generated_at")}
+        except Exception as exc:
+            logger.debug(f"  ORM: failed to load {fname}: {exc}")
+            return {}
+
+    if _uw_gex_data is None:
+        _uw_gex_data = _load("uw_gex_cache.json", "data")
+    if _uw_iv_data is None:
+        _uw_iv_data = _load("uw_iv_term_cache.json", "data")
+    if _uw_oi_data is None:
+        _uw_oi_data = _load("uw_oi_change_cache.json", "data")
+    if _uw_flow_data is None:
+        _uw_flow_data = _load("uw_flow_cache.json", "flow_data")
+    if _uw_dp_data is None:
+        _uw_dp_data = _load("darkpool_cache.json")
+
+    loaded = sum(1 for d in [_uw_gex_data, _uw_iv_data, _uw_oi_data,
+                              _uw_flow_data, _uw_dp_data] if d)
+    logger.debug(f"  ORM: Loaded {loaded}/5 UW cache files "
+                 f"(GEX={len(_uw_gex_data)}, IV={len(_uw_iv_data)}, "
+                 f"OI={len(_uw_oi_data)}, Flow={len(_uw_flow_data)}, "
+                 f"DP={len(_uw_dp_data)} symbols)")
+
+    return _uw_gex_data, _uw_iv_data, _uw_oi_data, _uw_flow_data, _uw_dp_data
+
+
+def _compute_options_return_multiplier(
+    symbol: str,
+    gex: Dict[str, Any],
+    iv: Dict[str, Any],
+    oi: Dict[str, Any],
+    flow: Dict[str, Any],
+    dp: Dict[str, Any],
+    stock_price: float = 0,
+) -> Tuple[float, Dict[str, float]]:
+    """
+    Compute the Options Return Multiplier (ORM) for a put candidate.
+
+    Institutional-grade scoring across 8 factors that predict
+    **how much a PUT OPTION will pay**, not just whether the stock drops.
+
+    Philosophy (30 yr quant / PhD microstructure lens):
+    ─────────────────────────────────────────────────────
+    A stock can drop -5% and:
+      • With HIGH gamma leverage + LOW IV  → put pays 10x
+      • With LOW gamma + HIGH IV (crush)   → put barely breaks even
+
+    The ORM captures this by scoring:
+      1. Gamma Leverage  — do dealers amplify the move?
+      2. IV Expansion    — are options still cheap?
+      3. OI Positioning  — is smart money already loaded?
+      4. Delta Sweet Spot— is the optimal delta (0.20–0.40) available?
+      5. Short DTE       — max gamma leverage window?
+      6. Vol Regime      — trending or ranging?
+      7. Dealer Position — gamma flip proximity?
+      8. Liquidity       — can we get in/out cleanly?
+
+    Returns: (orm_score, {factor_name: factor_score})
+    """
+    factors: Dict[str, float] = {}
+    sym_gex = gex.get(symbol, {})
+    sym_iv  = iv.get(symbol, {})
+    sym_oi  = oi.get(symbol, {})
+    sym_flow = flow.get(symbol, [])
+    sym_dp  = dp.get(symbol, {})
+    if not isinstance(sym_flow, list):
+        sym_flow = []
+
+    # ── NO DATA FALLBACK ────────────────────────────────────────────
+    # If a stock has ZERO UW data (not in any cache), give it a
+    # moderate default ORM (0.35) instead of 0.00.  This prevents
+    # good bearish picks from being nuked just because TradeNova
+    # didn't scan them.  The default is intentionally below-average
+    # so stocks WITH good UW data still rank higher.
+    has_any_data = bool(sym_gex or sym_iv or sym_oi or sym_flow or sym_dp)
+    if not has_any_data:
+        default = 0.35
+        for f_name in ["gamma_leverage", "iv_expansion", "oi_positioning",
+                        "delta_sweet", "short_dte", "vol_regime",
+                        "dealer_position", "liquidity"]:
+            factors[f_name] = default
+        return default, factors
+
+    # ── 1. GAMMA LEVERAGE (weight 0.20) ─────────────────────────────
+    # Negative net GEX = dealers are SHORT gamma → every stock move
+    # forces dealers to CHASE, amplifying the drop.  This is THE single
+    # biggest driver of 10x put returns.
+    #
+    # Scoring:
+    #   NEGATIVE regime       → base 0.60
+    #   |net_gex| magnitude   → scaled 0–0.40 (more negative = higher)
+    #   POSITIVE regime       → base 0.20 (dampening, bad for big moves)
+    gamma_score = 0.0
+    if sym_gex:
+        regime = sym_gex.get("regime", "UNKNOWN")
+        net_gex = sym_gex.get("net_gex", 0)
+
+        if regime == "NEGATIVE":
+            gamma_score = 0.60
+            # Scale by magnitude — bigger negative GEX = stronger amplification
+            # Normalize: -500K is moderate, -2M+ is extreme
+            magnitude = abs(net_gex)
+            if magnitude > 2_000_000:
+                gamma_score += 0.40
+            elif magnitude > 500_000:
+                gamma_score += 0.20 + 0.20 * min((magnitude - 500_000) / 1_500_000, 1.0)
+            elif magnitude > 100_000:
+                gamma_score += 0.10
+        elif regime == "POSITIVE":
+            # Positive GEX = dampened moves = worse for options returns
+            gamma_score = 0.20
+            # But if near the gamma flip, still explosive
+            days_since = sym_gex.get("days_since_flip", 999)
+            if days_since <= 3:
+                gamma_score = 0.50  # Just flipped — still volatile
+        else:
+            gamma_score = 0.30  # Unknown / neutral
+    factors["gamma_leverage"] = min(gamma_score, 1.0)
+
+    # ── 2. IV EXPANSION POTENTIAL (weight 0.15) ─────────────────────
+    # CRITICAL: Low/moderate IV = cheap options + room to expand on crash.
+    # HIGH IV = expensive options + IV CRUSH after event → kills returns.
+    #
+    # Ideal: front_iv < 50% → room to expand to 80%+ on crash
+    # Bad:   front_iv > 80% → IV already priced in, will crush
+    #
+    # Also: INVERTED term structure = market pricing near-term risk
+    #        This is GOOD for puts — means there's an imminent catalyst.
+    iv_score = 0.0
+    if sym_iv:
+        front_iv = sym_iv.get("front_iv", 0)
+        inverted = sym_iv.get("inverted", False)
+        impl_move = sym_iv.get("implied_move_pct", 0)
+        term_spread = sym_iv.get("term_spread", 0)
+
+        if front_iv > 0:
+            # Sweet spot: front_iv 25-60% → room to expand
+            if front_iv < 0.25:
+                iv_score = 0.70  # Very low IV — cheap, but may lack catalyst
+            elif front_iv < 0.40:
+                iv_score = 1.00  # OPTIMAL: cheap options + moderate expected vol
+            elif front_iv < 0.60:
+                iv_score = 0.80  # Good — still room to expand
+            elif front_iv < 0.80:
+                iv_score = 0.40  # Getting expensive — IV crush risk moderate
+            else:
+                iv_score = 0.15  # High IV — IV crush will eat returns
+        
+        # Bonus for inverted term structure (near-term event priced in)
+        if inverted:
+            iv_score = min(iv_score + 0.15, 1.0)
+        
+        # Bonus for high implied move (market expects big move)
+        if impl_move > 0.04:  # > 4% expected weekly move
+            iv_score = min(iv_score + 0.10, 1.0)
+    factors["iv_expansion"] = min(iv_score, 1.0)
+
+    # ── 3. OI POSITIONING (weight 0.15) ─────────────────────────────
+    # Put OI BUILDING = institutions loading up on puts.
+    # This is the "smart money footprint" for imminent drops.
+    #
+    # Key signals:
+    #   - put_oi_pct_change > 20%  → aggressive put building
+    #   - vol_gt_oi_count > 3      → new positions opening (not rolling)
+    #   - contracts_3plus_days_oi_increase > 10 → PERSISTENT positioning
+    oi_score = 0.0
+    if sym_oi:
+        put_oi_pct = sym_oi.get("put_oi_pct_change", 0)
+        vol_gt_oi = sym_oi.get("vol_gt_oi_count", 0)
+        persistent = sym_oi.get("contracts_3plus_days_oi_increase", 0)
+        call_oi_pct = sym_oi.get("call_oi_pct_change", 0)
+
+        # Put OI growth — stronger = more institutional conviction
+        if put_oi_pct > 40:
+            oi_score += 0.40
+        elif put_oi_pct > 20:
+            oi_score += 0.25
+        elif put_oi_pct > 10:
+            oi_score += 0.15
+
+        # New positions (volume > OI) — aggressive new entries
+        if vol_gt_oi > 5:
+            oi_score += 0.25
+        elif vol_gt_oi > 2:
+            oi_score += 0.15
+
+        # Persistent OI build (3+ days increasing) — conviction
+        if persistent > 15:
+            oi_score += 0.25
+        elif persistent > 8:
+            oi_score += 0.15
+        elif persistent > 3:
+            oi_score += 0.10
+
+        # Put/Call OI skew — more puts than calls = bearish consensus
+        if put_oi_pct > call_oi_pct * 1.5 and put_oi_pct > 15:
+            oi_score += 0.10
+
+    factors["oi_positioning"] = min(oi_score, 1.0)
+
+    # ── 4. DELTA SWEET SPOT (weight 0.10) ───────────────────────────
+    # For 3x–10x returns, OTM puts with delta 0.20–0.40 are optimal:
+    #   - Delta > 0.60: too expensive, low leverage, hard to get 3x+
+    #   - Delta 0.20–0.40: sweet spot — enough gamma, affordable premium
+    #   - Delta < 0.10: lottery ticket, probability too low
+    #
+    # We look at recent put FLOW to see where institutions are buying.
+    # If smart money buys at delta 0.25–0.35, that's the ideal strike zone.
+    delta_score = 0.0
+    put_trades = [t for t in sym_flow if t.get("put_call") == "P"]
+    if put_trades:
+        deltas = [abs(float(t.get("delta", 0) or 0)) for t in put_trades
+                  if t.get("delta")]
+        if deltas:
+            avg_delta = sum(deltas) / len(deltas)
+            # Count trades in the sweet spot
+            sweet_count = sum(1 for d in deltas if 0.15 <= d <= 0.45)
+            sweet_pct = sweet_count / len(deltas)
+
+            # Score based on average delta proximity to sweet spot
+            if 0.20 <= avg_delta <= 0.40:
+                delta_score = 1.0   # Perfect sweet spot
+            elif 0.15 <= avg_delta <= 0.45:
+                delta_score = 0.80  # Close to sweet spot
+            elif 0.10 <= avg_delta <= 0.55:
+                delta_score = 0.50  # Acceptable range
+            elif avg_delta < 0.10:
+                delta_score = 0.20  # Lottery territory
+            else:
+                delta_score = 0.30  # Too deep ITM — expensive
+
+            # Bonus: high percentage of flow in sweet spot
+            if sweet_pct > 0.5:
+                delta_score = min(delta_score + 0.10, 1.0)
+    factors["delta_sweet"] = min(delta_score, 1.0)
+
+    # ── 5. SHORT DTE (weight 0.10) ──────────────────────────────────
+    # Maximum gamma leverage at DTE 0–5 (options respond explosively
+    # to stock moves).  DTE 6–14 is good.  DTE 15+ = theta drag.
+    #
+    # For 3x–10x: the CATALYST must happen within days.
+    # That's why earnings proximity + short DTE = killer combo.
+    dte_score = 0.0
+    if sym_iv:
+        front_dte = sym_iv.get("front_dte", 30)
+        if front_dte <= 2:
+            dte_score = 1.0   # 0-DTE / next-day — extreme gamma
+        elif front_dte <= 5:
+            dte_score = 0.90  # Same week — very high gamma
+        elif front_dte <= 10:
+            dte_score = 0.70  # 1-2 weeks — good gamma
+        elif front_dte <= 14:
+            dte_score = 0.50  # 2 weeks — moderate gamma
+        elif front_dte <= 21:
+            dte_score = 0.30  # 3 weeks — theta starts eating
+        else:
+            dte_score = 0.15  # 1+ month — slow, theta-heavy
+    elif put_trades:
+        # Fallback: use DTE from flow trades
+        dtes = [int(t.get("dte", 30) or 30) for t in put_trades if t.get("dte")]
+        if dtes:
+            min_dte = min(dtes)
+            if min_dte <= 5:
+                dte_score = 0.90
+            elif min_dte <= 14:
+                dte_score = 0.60
+            else:
+                dte_score = 0.25
+    factors["short_dte"] = min(dte_score, 1.0)
+
+    # ── 6. VOLATILITY REGIME (weight 0.10) ──────────────────────────
+    # Trending stocks have better options returns than range-bound.
+    # implied_move_pct × GEX regime tells us the expected magnitude.
+    #
+    # HIGH implied_move + NEGATIVE GEX = explosive vol regime (best)
+    # LOW implied_move + POSITIVE GEX = compressed vol (worst)
+    vol_score = 0.0
+    if sym_iv:
+        impl_move = sym_iv.get("implied_move_pct", 0)
+        if impl_move > 0.05:
+            vol_score = 1.0   # 5%+ weekly implied move — very volatile
+        elif impl_move > 0.03:
+            vol_score = 0.70  # 3-5% — good volatility
+        elif impl_move > 0.02:
+            vol_score = 0.40  # 2-3% — moderate
+        else:
+            vol_score = 0.20  # <2% — low vol, slow moves
+    # Boost if negative GEX amplifies
+    if sym_gex.get("regime") == "NEGATIVE":
+        vol_score = min(vol_score + 0.20, 1.0)
+    factors["vol_regime"] = min(vol_score, 1.0)
+
+    # ── 7. DEALER POSITIONING / GAMMA FLIP (weight 0.10) ────────────
+    # Near gamma flip = the most explosive regime change.
+    # When dealers flip from long to short gamma, volatility EXPLODES.
+    #
+    # days_since_flip < 3  = just flipped, moves amplified
+    # gex_flip_today       = maximum instability
+    # vanna_regime NEGATIVE = vol expansion accelerates stock drops
+    dealer_score = 0.0
+    if sym_gex:
+        flip_today = sym_gex.get("gex_flip_today", False)
+        days_since_flip = sym_gex.get("days_since_flip", 999)
+        vanna_regime = sym_gex.get("vanna_regime", "NEUTRAL")
+
+        if flip_today:
+            dealer_score = 1.0  # Maximum: flipped TODAY
+        elif days_since_flip <= 2:
+            dealer_score = 0.85  # Very recent flip
+        elif days_since_flip <= 5:
+            dealer_score = 0.65  # Recent flip, still unstable
+        elif days_since_flip <= 10:
+            dealer_score = 0.40  # Moderately recent
+        else:
+            dealer_score = 0.20  # Stable regime — less explosive
+
+        # Vanna regime: NEGATIVE vanna = vol expansion pushes stock down
+        if vanna_regime == "NEGATIVE":
+            dealer_score = min(dealer_score + 0.15, 1.0)
+
+        # Put wall proximity: if stock is near the put wall, expect support
+        # to break → accelerating decline
+        put_wall = sym_gex.get("put_wall", 0)
+        if put_wall > 0 and stock_price > 0:
+            wall_dist_pct = abs(stock_price - put_wall) / stock_price * 100
+            if wall_dist_pct < 3:
+                dealer_score = min(dealer_score + 0.10, 1.0)  # Very near put wall
+    factors["dealer_position"] = min(dealer_score, 1.0)
+
+    # ── 8. LIQUIDITY & SPREAD QUALITY (weight 0.10) ─────────────────
+    # Tight spreads = better fills, lower cost of entry.
+    # High volume = liquid, easy to get in/out.
+    # Sweep activity = institutional URGENCY (crossing multiple exchanges).
+    # Dark pool blocks = smart money positioning quietly.
+    liq_score = 0.0
+    if put_trades:
+        # Bid-ask spread quality
+        spreads = []
+        for t in put_trades:
+            bid = float(t.get("bid_price", 0) or 0)
+            ask = float(t.get("ask_price", 0) or 0)
+            if bid > 0 and ask > 0:
+                spread_pct = (ask - bid) / ask * 100
+                spreads.append(spread_pct)
+
+        if spreads:
+            avg_spread = sum(spreads) / len(spreads)
+            if avg_spread < 3:
+                liq_score += 0.40  # Excellent: < 3% spread
+            elif avg_spread < 6:
+                liq_score += 0.30  # Good: 3-6% spread
+            elif avg_spread < 10:
+                liq_score += 0.15  # Okay: 6-10% spread
+            # else: wide spreads — costly
+
+        # Volume: more put flow = more liquid
+        total_vol = sum(int(t.get("volume", 0) or 0) for t in put_trades)
+        if total_vol > 5000:
+            liq_score += 0.20
+        elif total_vol > 1000:
+            liq_score += 0.10
+
+        # Sweep / Block activity = urgency
+        sweeps = sum(1 for t in put_trades if t.get("is_sweep"))
+        blocks = sum(1 for t in put_trades if t.get("is_block"))
+        aggressive = sum(1 for t in put_trades
+                         if t.get("aggressiveness") == "AGGRESSIVE_BUY")
+        if sweeps > 0 or blocks > 2:
+            liq_score += 0.15
+        if aggressive > len(put_trades) * 0.4:
+            liq_score += 0.10  # > 40% aggressive buys
+
+    # Dark pool liquidity
+    if sym_dp:
+        dp_blocks = sym_dp.get("dark_block_count", 0)
+        dp_pct_adv = sym_dp.get("pct_adv", 0)
+        if dp_blocks > 50:
+            liq_score += 0.15
+        elif dp_blocks > 20:
+            liq_score += 0.10
+        # High % of daily volume in dark pools = institutional interest
+        if dp_pct_adv > 10:
+            liq_score += 0.10
+
+    factors["liquidity"] = min(liq_score, 1.0)
+
+    # ── WEIGHTED COMBINATION ──────────────────────────────────────────
+    orm = (
+        factors["gamma_leverage"]  * 0.20 +
+        factors["iv_expansion"]    * 0.15 +
+        factors["oi_positioning"]  * 0.15 +
+        factors["delta_sweet"]     * 0.10 +
+        factors["short_dte"]       * 0.10 +
+        factors["vol_regime"]      * 0.10 +
+        factors["dealer_position"] * 0.10 +
+        factors["liquidity"]       * 0.10
+    )
+    return max(0.0, min(orm, 1.0)), factors
+
+
 def _validate_picks(picks: List[Dict[str, Any]], source: str) -> None:
     """
     Log detailed data quality warnings for the final set of picks.
@@ -1368,6 +1839,81 @@ def _enrich_candidates(candidates: List[Dict[str, Any]], top_n: int) -> List[Dic
     else:
         # Scores are already differentiated — use existing logic
         logger.info("  ✅ Scores well-differentiated — using raw PutsEngine ranking")
+
+    # ==================================================================
+    # STEP 4: OPTIONS RETURN MULTIPLIER (ORM)
+    # ==================================================================
+    # ORM answers: "Will the PUT OPTION pay 3x–10x?"
+    # Meta-score answers: "Will the stock drop?"
+    # Combining them gives: "What is the expected OPTIONS return?"
+    #
+    # final_score = meta_score × 0.55  +  ORM × 0.45
+    #
+    # This ensures bearish conviction still matters, but among equally
+    # bearish stocks, the one with better gamma leverage, cheaper IV,
+    # institutional OI build-up, and tighter spreads ranks higher.
+    # ==================================================================
+    try:
+        gex_data, iv_data, oi_data, flow_data, dp_data = _load_uw_options_data()
+        has_uw = any(d for d in [gex_data, iv_data, oi_data, flow_data, dp_data])
+    except Exception as e:
+        logger.warning(f"  ⚠️ ORM: Failed to load UW options data: {e}")
+        has_uw = False
+        gex_data = iv_data = oi_data = flow_data = dp_data = {}
+
+    if has_uw:
+        logger.info("  🎯 Computing OPTIONS RETURN MULTIPLIER (ORM)...")
+        orm_count = 0
+        orm_scores = []
+        for c in candidates[:max(top_n * 3, 30)]:
+            sym = c["symbol"]
+            stock_px = c.get("price", 0)
+            orm, factors = _compute_options_return_multiplier(
+                sym, gex_data, iv_data, oi_data, flow_data, dp_data,
+                stock_price=stock_px,
+            )
+            c["_orm_score"] = orm
+            c["_orm_factors"] = factors
+            orm_count += 1
+            orm_scores.append(orm)
+
+            # Blend: final_score = meta × 0.55 + ORM × 0.45
+            meta_score = c.get("meta_score", c["score"])
+            final = meta_score * 0.55 + orm * 0.45
+            c["score"] = max(0.0, min(final, 1.0))
+
+        # Re-sort by final blended score
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+
+        # Compute ORM statistics
+        if orm_scores:
+            avg_orm = sum(orm_scores) / len(orm_scores)
+            max_orm = max(orm_scores)
+            min_orm = min(orm_scores)
+            logger.info(
+                f"  ✅ ORM applied to {orm_count} candidates "
+                f"(avg={avg_orm:.3f}, range={min_orm:.3f}–{max_orm:.3f})"
+            )
+
+        # Log final top 10 with ORM breakdown
+        logger.info(f"  📊 FINAL Top {min(top_n, len(candidates))} "
+                     f"(meta × 0.55 + ORM × 0.45):")
+        for i, c in enumerate(candidates[:top_n], 1):
+            meta = c.get("meta_score", 0)
+            orm = c.get("_orm_score", 0)
+            fcts = c.get("_orm_factors", {})
+            # Build compact factor string
+            top_factors = sorted(fcts.items(), key=lambda x: x[1], reverse=True)[:3]
+            factor_str = " ".join(f"{k[:3]}={v:.2f}" for k, v in top_factors)
+            logger.info(
+                f"    #{i:2d} {c['symbol']:6s} "
+                f"final={c['score']:.3f} "
+                f"(meta={meta:.3f} orm={orm:.3f}) "
+                f"[{factor_str}]"
+            )
+    else:
+        logger.info("  ℹ️ ORM: No UW options data available — "
+                     "using meta-score only for ranking")
 
     # ==================================================================
     # Deduplicate signals (scan_history may have repeats)
