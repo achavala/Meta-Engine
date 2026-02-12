@@ -5,12 +5,16 @@ Interface to get Top 10 moonshot candidates from the TradeNova Moonshot Engine.
 Imports Moonshot modules directly without modifying the original codebase.
 
 Data Sources (priority order for fallback):
-  0. eod_interval_picks.json — Broadest pool: 10 picks per interval scan,
+  0. tomorrows_forecast.json — MWS 7-sensor forecasts (50 symbols with rich
+     macro/sector/microstructure/options intel scoring).  This is the broadest
+     and most analytically rich data source — captures MU, ON, TSM, WDC and
+     other institutional-grade momentum plays that narrow scan files miss.
+  1. eod_interval_picks.json — 10 picks per interval scan,
      captures intraday momentum names (MSFT, HIMS, BILL, etc.) that
      final_recommendations.json often misses.
-  1. final_recommendations.json — Curated ranked picks with UW sentiment.
-  2. final_recommendations_history.json — Historical picks (supplement).
-  3. moonshot CSV data — Oldest fallback.
+  2. final_recommendations.json — Curated ranked picks with UW sentiment.
+  3. final_recommendations_history.json — Historical picks (supplement).
+  4. moonshot CSV data — Oldest fallback.
 
 FEB 11 ADDITION — Call Options Return Multiplier (ORM):
   Just as the PutsEngine ORM ranks puts by "will the PUT OPTION pay 3x–10x?",
@@ -45,6 +49,26 @@ logger = logging.getLogger(__name__)
 TRADENOVA_PATH = str(Path.home() / "TradeNova")
 if TRADENOVA_PATH not in sys.path:
     sys.path.insert(0, TRADENOVA_PATH)
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTOR MAP  —  FEB 11  (Sector Momentum Boost)
+# ═══════════════════════════════════════════════════════════════════════
+# Build a ticker → sector map from PutsEngine's UNIVERSE_SECTORS
+# (400+ symbols across 25+ sectors) supplemented by TradeNova forecast.
+# Soft dependency — if PutsEngine is unavailable, uses forecast sectors.
+# ═══════════════════════════════════════════════════════════════════════
+_SECTOR_MAP: Dict[str, str] = {}
+try:
+    _pe_path = str(Path.home() / "PutsEngine")
+    if _pe_path not in sys.path:
+        sys.path.insert(0, _pe_path)
+    from putsengine.config import EngineConfig
+    for _sector_name, _tickers in EngineConfig.UNIVERSE_SECTORS.items():
+        for _t in _tickers:
+            _SECTOR_MAP[_t] = _sector_name
+    logger.debug(f"Sector map: {len(_SECTOR_MAP)} symbols from PutsEngine")
+except (ImportError, AttributeError):
+    logger.debug("PutsEngine sector map unavailable — will use forecast sectors")
 
 
 def get_top_moonshots(top_n: int = 10) -> List[Dict[str, Any]]:
@@ -106,6 +130,26 @@ def get_top_moonshots(top_n: int = 10) -> List[Dict[str, Any]]:
         if not results:
             logger.info("🟢 Live scan returned 0 candidates — falling back to cached TradeNova data...")
             return _fallback_from_cached_moonshots(top_n)
+
+        # ── Merge MWS forecast data into the live candidate pool ─────
+        # The live scan is narrow (Finviz + EDGAR).  The MWS 7-sensor
+        # forecast has 50 institutional-grade symbols that the live scan
+        # often misses (MU, ON, TSM, WDC, etc.).  Merging expands the
+        # candidate pool so ORM can surface the best options plays.
+        forecast_pool = _load_forecast_candidates()
+        if forecast_pool:
+            existing_symbols = {r["symbol"] for r in results}
+            merged_count = 0
+            for fc in forecast_pool:
+                if fc["symbol"] not in existing_symbols:
+                    results.append(fc)
+                    existing_symbols.add(fc["symbol"])
+                    merged_count += 1
+            if merged_count:
+                logger.info(
+                    f"🟢 Merged {merged_count} MWS forecast candidates "
+                    f"into live pool (total: {len(results)})"
+                )
 
         # ── Apply Call Options Return Multiplier (ORM) ──────────────
         # Enriches ALL candidates (not just top_n) so that stocks with
@@ -201,6 +245,32 @@ def _fallback_from_cached_moonshots(top_n: int = 10) -> List[Dict[str, Any]]:
                 for sym, cand in eod_candidates.items():
                     cand["interval_persistence"] = interval_counts.get(sym, 1)
 
+                # ── FEB 11 FIX: Deflate uniform scores ──────────────────
+                # When the interval scanner outputs ALL scores = 1.0 it
+                # provides ZERO differentiation and unfairly dominates
+                # over better-analyzed sources (MWS forecast, predictive
+                # signals).  In that case, compute a meaningful score
+                # from the only differentiating sub-components:
+                #   • velocity_score   (0-1, varies per pick)
+                #   • interval_persistence (how many scans flagged it)
+                #   • weighted_rvol    (only if < 1.0)
+                # Base: 0.80 (they ARE qualified picks from the scanner)
+                raw_scores = [c.get("score", 0) for c in eod_candidates.values()]
+                all_uniform = len(raw_scores) > 1 and len(set(raw_scores)) == 1
+                if all_uniform:
+                    max_persist = max((interval_counts.get(s, 1) for s in eod_candidates), default=1)
+                    for sym, cand in eod_candidates.items():
+                        vel = cand.get("velocity_score", 0) or 0
+                        persist = interval_counts.get(sym, 1)
+                        rvol = cand.get("volume_ratio", 0) or 0
+                        rvol_bonus = min(rvol * 0.05, 0.05) if rvol < 0.99 else 0
+                        persist_bonus = (persist / max_persist) * 0.10 if max_persist > 1 else 0
+                        cand["score"] = min(0.80 + vel * 0.10 + persist_bonus + rvol_bonus, 0.95)
+                    logger.info(
+                        f"  ℹ️ eod scores were all {raw_scores[0]:.2f} — "
+                        f"deflated to meaningful 0.80–0.95 range"
+                    )
+
                 results.extend(eod_candidates.values())
                 logger.info(
                     f"🟢 TradeNova eod_interval_picks: {len(eod_candidates)} unique symbols "
@@ -213,6 +283,14 @@ def _fallback_from_cached_moonshots(top_n: int = 10) -> List[Dict[str, Any]]:
                 )
     except Exception as e:
         logger.debug(f"Failed to read eod_interval_picks.json: {e}")
+
+    # --- Source 0b: tomorrows_forecast.json (MWS 7-sensor forecasts) ---
+    # 50 symbols with macro/sector/microstructure/options intel scoring.
+    # This captures MU, ON, TSM, WDC and other institutional-grade momentum
+    # plays that narrow scan files miss entirely.
+    forecast_candidates = _load_forecast_candidates()
+    if forecast_candidates:
+        results.extend(forecast_candidates)
 
     # --- Source 1: final_recommendations.json (best curated source) ---
     try:
@@ -229,7 +307,7 @@ def _fallback_from_cached_moonshots(top_n: int = 10) -> List[Dict[str, Any]]:
             for rec in recs:
                 results.append({
                     "symbol": rec.get("symbol", ""),
-                    "score": rec.get("composite_score", 0) / 100.0,  # Normalize 0-100 → 0-1
+                    "score": min(rec.get("composite_score", 0) / 100.0, 1.0),  # Normalize + cap at 1.0
                     "price": rec.get("current_price", 0),
                     "signals": rec.get("signals", []),
                     "signal_types": rec.get("engines", []),
@@ -322,12 +400,222 @@ def _fallback_from_cached_moonshots(top_n: int = 10) -> List[Dict[str, Any]]:
         except Exception as e:
             logger.debug(f"Failed to read CSV fallback: {e}")
 
-    # Deduplicate — keep the entry with the highest score per symbol
+    # --- Source 4: predictive_signals_latest.json (197 multi-factor signals) ---
+    # This is the BROADEST and most category-rich data source from TradeNova.
+    # Covers 197 symbols with categories: pre_catalyst, early_setup,
+    # mean_reversion, pre_breakout, short_squeeze, compression, options_flow.
+    # Key: many movers (MU, ON, TSM, SNDK, NKTR, WDC, AGQ) appear here
+    # even when they're missing from final_recommendations and eod_interval_picks.
+    try:
+        pred_file = Path(TRADENOVA_PATH) / "data" / "predictive_signals_latest.json"
+        if pred_file.exists():
+            with open(pred_file) as f:
+                pred_data = json.load(f)
+            pred_signals = pred_data.get("signals", [])
+
+            # Score mapping: category strength + signal quality + target size
+            _cat_base = {
+                "pre_catalyst": 0.85,   # Smart money pre-positioning → strongest
+                "early_setup": 0.75,    # Technical setup forming
+                "mean_reversion": 0.70, # Oversold bounce / squeeze
+            }
+            _sig_bonus = {
+                "options_flow": 0.10,   # Institutional flow → highest conviction
+                "pre_breakout": 0.08,
+                "short_squeeze": 0.08,
+                "compression": 0.04,
+                "oversold_bounce": 0.03,
+            }
+
+            pred_count = 0
+            for sig in pred_signals:
+                sym = sig.get("symbol", "")
+                direction = sig.get("direction", "")
+                if not sym or direction == "bearish":
+                    continue  # Only bullish/neutral for Moonshot
+
+                cat = sig.get("category", "")
+                sig_type = sig.get("signal_type", "")
+                raw_score = sig.get("score", 0) or 0
+                tgt_pct = sig.get("target_pct", 0) or 0
+                rr = sig.get("risk_reward", 0) or 0
+                entry_zone = sig.get("entry_zone", [0, 0])
+
+                # Compute meaningful score from category + signal + target
+                base = _cat_base.get(cat, 0.65)
+                sig_mod = _sig_bonus.get(sig_type, 0.02)
+                dir_mod = 0.03 if direction == "bullish" else 0.0
+                tgt_mod = min(tgt_pct * 0.005, 0.07)  # Up to +0.07 for 14%+ target
+                rr_mod = min(rr * 0.01, 0.03)           # Up to +0.03 for 3+ R:R
+                computed = min(base + sig_mod + dir_mod + tgt_mod + rr_mod, 1.0)
+
+                entry_low = entry_zone[0] if isinstance(entry_zone, list) and len(entry_zone) >= 1 else 0
+                entry_high = entry_zone[1] if isinstance(entry_zone, list) and len(entry_zone) >= 2 else 0
+
+                results.append({
+                    "symbol": sym,
+                    "score": computed,
+                    "price": (entry_low + entry_high) / 2 if entry_low and entry_high else 0,
+                    "signals": sig.get("signals", []),
+                    "signal_types": [cat, sig_type],
+                    "option_type": "call",
+                    "target_return": tgt_pct,
+                    "engine": f"Moonshot (predictive:{cat})",
+                    "sector": "",
+                    "volume_ratio": 0,
+                    "short_interest": 0,
+                    "action": f"{cat}:{sig_type}",
+                    "entry_low": entry_low,
+                    "entry_high": entry_high,
+                    "target": 0,
+                    "stop": 0,
+                    "rsi": 50,
+                    "uw_sentiment": direction,
+                    "data_source": f"predictive_signals ({pred_data.get('scan_label', '')})",
+                    "data_age_days": 0,
+                    "pred_category": cat,
+                    "pred_signal_type": sig_type,
+                    "pred_target_pct": tgt_pct,
+                    "pred_risk_reward": rr,
+                    "pred_confidence": sig.get("confidence", ""),
+                })
+                pred_count += 1
+            if pred_count:
+                logger.info(
+                    f"🟢 TradeNova predictive_signals: {pred_count} bullish signals "
+                    f"from {len(pred_signals)} total"
+                )
+    except Exception as e:
+        logger.debug(f"Failed to read predictive_signals_latest.json: {e}")
+
+    # --- Source 5: institutional_radar_promoted.json (84 inst. picks) ---
+    try:
+        ir_file = Path(TRADENOVA_PATH) / "data" / "institutional_radar_promoted.json"
+        if ir_file.exists():
+            with open(ir_file) as f:
+                ir_data = json.load(f)
+            promoted = ir_data.get("promoted_tickers", [])
+            ir_count = 0
+            for p in promoted:
+                if not isinstance(p, dict):
+                    continue
+                sym = p.get("symbol", p.get("ticker", ""))
+                if not sym:
+                    continue
+                conv = p.get("conviction", "")
+                conv_base = {"HIGH": 0.85, "MEDIUM": 0.72, "LOW": 0.60}.get(conv, 0.65)
+                sig_count = p.get("signal_count", 0) or 0
+                crossday = p.get("crossday_bonus", 0) or 0
+                score = min(conv_base + sig_count * 0.02 + min(crossday * 0.005, 0.05), 1.0)
+                ir_signals = p.get("signals", [])
+                results.append({
+                    "symbol": sym,
+                    "score": score,
+                    "price": 0,
+                    "signals": ir_signals if isinstance(ir_signals, list) else [],
+                    "signal_types": ["institutional_radar"],
+                    "option_type": "call",
+                    "target_return": 0,
+                    "engine": "Moonshot (institutional)",
+                    "sector": "",
+                    "volume_ratio": 0,
+                    "short_interest": 0,
+                    "action": f"institutional:{conv}",
+                    "uw_sentiment": conv,
+                    "data_source": "institutional_radar_promoted",
+                    "data_age_days": 0,
+                })
+                ir_count += 1
+            if ir_count:
+                logger.info(f"🟢 TradeNova institutional_radar: {ir_count} promoted tickers")
+    except Exception as e:
+        logger.debug(f"Failed to read institutional_radar_promoted.json: {e}")
+
+    # ── Deduplicate — keep highest-scoring entry per symbol ──────────
+    # CRITICAL (FEB 11): Also merge metadata from lower-scored entries
+    # so cross-source intelligence (MWS scores, pred signals, conviction)
+    # is preserved on the winning entry for post-ORM boost calculations.
     seen = {}
+    all_entries_per_sym: Dict[str, List[Dict[str, Any]]] = {}
     for r in results:
         sym = r["symbol"]
+        if sym not in all_entries_per_sym:
+            all_entries_per_sym[sym] = []
+        all_entries_per_sym[sym].append(r)
         if sym not in seen or r["score"] > seen[sym]["score"]:
             seen[sym] = r
+
+    # Merge metadata from all sources into the winning entry
+    _merge_keys = [
+        "pred_category", "pred_signal_type", "pred_target_pct",
+        "pred_risk_reward", "pred_confidence",
+        "mws_score", "mws_action", "expected_move_pct",
+        "microstructure_score", "whale_call_premium",
+        "conviction", "interval_persistence", "velocity_score",
+        "sector",  # Critical for sector momentum boost
+    ]
+    for sym, entries in all_entries_per_sym.items():
+        winner = seen[sym]
+        for entry in entries:
+            if entry is winner:
+                continue
+            for key in _merge_keys:
+                if key not in winner and key in entry and entry[key]:
+                    winner[key] = entry[key]
+            # Preserve price from the source with non-zero price
+            if not winner.get("price") and entry.get("price"):
+                winner["price"] = entry["price"]
+
+    # ── Multi-source convergence bonus ──────────────────────────────
+    # When multiple independent data sources agree on a symbol, it's a
+    # much higher-conviction signal.  Track which sources flagged each
+    # symbol and award a convergence bonus:
+    #   2 sources → +0.03
+    #   3 sources → +0.06
+    #   4+ sources → +0.10
+    source_counts: Dict[str, int] = {}
+    for r in results:
+        sym = r["symbol"]
+        ds = r.get("data_source", "")
+        src_key = ds.split(" (")[0] if " (" in ds else ds
+        key = f"{sym}|{src_key}"
+        if key not in source_counts:
+            source_counts[key] = 1
+        # else already counted
+    # Aggregate per symbol
+    sym_source_count: Dict[str, int] = {}
+    for key in source_counts:
+        sym = key.split("|")[0]
+        sym_source_count[sym] = sym_source_count.get(sym, 0) + 1
+
+    # ── Store convergence data as METADATA only ────────────────────
+    # CRITICAL (FEB 11 FIX): The convergence bonus must NOT be added
+    # to the base score here because base scores are often at 1.0
+    # (capped).  Adding +0.03 to 1.0 → capped at 1.0 → bonus wasted.
+    # Instead, store the bonus as metadata and apply it POST-ORM in
+    # _enrich_moonshots_with_orm(), where it's added to the blended
+    # final score (typically 0.80–0.90, not capped).
+    convergence_applied = 0
+    for sym, entry in seen.items():
+        sc = sym_source_count.get(sym, 1)
+        if sc >= 4:
+            bonus = 0.10
+        elif sc >= 3:
+            bonus = 0.06
+        elif sc >= 2:
+            bonus = 0.03
+        else:
+            bonus = 0.0
+        if bonus > 0:
+            # DON'T add to score — store as metadata for post-ORM application
+            entry["_convergence_sources"] = sc
+            entry["_convergence_bonus"] = bonus
+            convergence_applied += 1
+    if convergence_applied:
+        logger.info(
+            f"  📊 Multi-source convergence: {convergence_applied} symbols "
+            f"tagged for post-ORM boost (2+ sources agree)"
+        )
 
     # Sort with multi-factor tie-breaker:
     #   1. Score (primary — higher is better)
@@ -396,6 +684,149 @@ def _calc_data_age_days(timestamp_str: str) -> int:
         except (ValueError, TypeError):
             continue
     return -1
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# TOMORROWS FORECAST DATA SOURCE  —  FEB 11
+# ═══════════════════════════════════════════════════════════════════════
+# TradeNova's MWS 7-sensor forecast (50 symbols) is the broadest and
+# most analytically rich data source.  Each forecast entry contains:
+#   - 7 sensor scores (macro, sector, microstructure, options intel,
+#     technical, sentiment, catalyst)
+#   - GEX regime, call/put walls
+#   - Target price, stop price, expected move %
+#   - Action labels (BUY, LEAN BUY, HOLD / WAIT)
+#
+# Only BUY and LEAN BUY forecasts are included as Moonshot candidates.
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def _load_forecast_candidates() -> List[Dict[str, Any]]:
+    """
+    Load actionable candidates from tomorrows_forecast.json.
+
+    Returns a list of Moonshot-compatible candidate dicts, one per symbol
+    where the MWS forecast action is BUY or LEAN BUY.
+
+    Data freshness: only returns forecasts ≤ 3 calendar days old
+    (covers Monday morning reading Friday's forecast).
+
+    Returns empty list if the file is missing, stale, or unparseable.
+    """
+    try:
+        forecast_file = Path(TRADENOVA_PATH) / "data" / "tomorrows_forecast.json"
+        if not forecast_file.exists():
+            logger.debug("  tomorrows_forecast.json not found — skipping")
+            return []
+
+        with open(forecast_file) as f:
+            fc_data = json.load(f)
+
+        generated = fc_data.get("generated_at", "")
+        forecasts = fc_data.get("forecasts", [])
+        fc_age = _calc_data_age_days(generated)
+
+        # Skip stale data (> 3 days covers weekend gap)
+        if fc_age > 3 and fc_age >= 0:
+            logger.info(
+                f"🟢 tomorrows_forecast.json skipped — {fc_age} days old "
+                f"(generated: {generated})"
+            )
+            return []
+
+        # Filter to actionable forecasts only
+        actionable = [
+            fc for fc in forecasts
+            if fc.get("action", "").upper().startswith(("BUY", "LEAN BUY"))
+        ]
+
+        candidates = []
+        for fc in actionable:
+            sym = fc.get("symbol", "")
+            if not sym:
+                continue
+
+            # ── Enhanced MWS score ──────────────────────────────────
+            # Raw MWS (0-100 → 0-1) is conservatively scaled and always
+            # loses to eod_interval_picks (many at 1.000).  To compete
+            # fairly we add two evidence-based bonuses:
+            #
+            #  1. Expected Move bonus  (up to +0.15):
+            #     Larger expected moves → bigger option payoffs.
+            #     This is the most directly relevant signal for ORM.
+            #     Formula: exp_move_pct × 0.03, capped at 0.15
+            #       1% move → +0.03,  3% → +0.09,  5%+ → +0.15
+            #
+            #  2. Sensor Agreement bonus (up to +0.05):
+            #     When 6-7 of 7 sensors agree → highest conviction.
+            #     sensor_agreement ranges 0-1.
+            #
+            # This keeps the rank order within forecasts identical (all
+            # get the same kind of bonus) but makes them competitive
+            # with inflated scores from other sources.
+            mws_base = fc.get("mws_score", 0) / 100.0
+            exp_move = fc.get("expected_move_pct", 0) or 0
+            move_bonus = min(exp_move * 0.03, 0.15) if exp_move > 0 else 0
+            agreement = fc.get("sensor_agreement", 0) or 0
+            agree_bonus = agreement * 0.05
+            mws_score = min(mws_base + move_bonus + agree_bonus, 1.0)
+
+            # Extract strong bullish signals from sensors
+            signals = []
+            for sensor in fc.get("sensors", []):
+                sig_direction = sensor.get("signal", "")
+                name = sensor.get("name", "")
+                score = sensor.get("score", 0)
+                if sig_direction == "bullish" and score >= 60:
+                    signals.append(f"{name}: bullish ({score})")
+
+            exp_range = fc.get("expected_range", [0, 0])
+            entry_low = exp_range[0] if isinstance(exp_range, list) and len(exp_range) >= 1 else 0
+            entry_high = exp_range[1] if isinstance(exp_range, list) and len(exp_range) >= 2 else 0
+
+            candidates.append({
+                "symbol": sym,
+                "score": mws_score,
+                "price": fc.get("current_price", 0),
+                "signals": signals,
+                "signal_types": ["MWS-7-Sensor"],
+                "option_type": "call",
+                "target_return": fc.get("expected_move_pct", 0),
+                "engine": "Moonshot (MWS Forecast)",
+                "sector": fc.get("sector", ""),
+                "volume_ratio": 0,
+                "short_interest": 0,
+                "action": fc.get("action", ""),
+                "entry_low": entry_low,
+                "entry_high": entry_high,
+                "target": fc.get("target_price", 0),
+                "stop": fc.get("stop_price", 0),
+                "rsi": 50,
+                "uw_sentiment": fc.get("action", ""),
+                "data_source": f"tomorrows_forecast ({generated})",
+                "data_age_days": fc_age,
+                # ── Extra forecast-specific fields (used by ORM / report) ──
+                "mws_score": fc.get("mws_score", 0),  # Raw MWS 0-100
+                "mws_action": fc.get("action", ""),
+                "bullish_probability": fc.get("bullish_probability", 0),
+                "expected_move_pct": fc.get("expected_move_pct", 0),
+                "confidence": fc.get("confidence", ""),
+                "confidence_score": fc.get("confidence_score", 0),
+                "sensor_agreement": fc.get("sensor_agreement", 0),
+                "gex_regime": fc.get("gex_regime", ""),
+                "call_wall": fc.get("call_wall", 0),
+                "put_wall": fc.get("put_wall", 0),
+            })
+
+        logger.info(
+            f"🟢 TradeNova tomorrows_forecast: {len(candidates)} actionable "
+            f"from {len(forecasts)} total (generated: {generated})"
+        )
+        return candidates
+
+    except Exception as e:
+        logger.debug(f"Failed to read tomorrows_forecast.json: {e}")
+        return []
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -856,6 +1287,137 @@ def _compute_call_options_return_multiplier(
     return max(0.0, min(orm, 1.0)), factors
 
 
+def _apply_sector_momentum_boost(
+    candidates: List[Dict[str, Any]],
+) -> int:
+    """
+    Detect hot sectors and boost ALL stocks in those sectors.
+
+    A "hot sector" has 3+ candidates with strong base scores (≥ 0.80),
+    indicating a sector-wide catalyst.  Examples:
+      • Semiconductor sector with MU, TSM, ON, AVGO, AMD, LRCX, etc.
+        all showing strong signals → SNDK (weak individual signal)
+        gets lifted by sector sympathy.
+      • Healthcare sector after policy announcement → even weaker names
+        in the sector benefit from the tailwind.
+
+    The boost is DIFFERENTIAL: stocks that already accumulated large
+    individual boosts (convergence, signal quality, MWS) get a smaller
+    sector boost because they don't need sector sympathy.  Stocks with
+    fewer individual boosts get the maximum sector boost — this is the
+    key mechanism that lifts "sympathy plays" like SNDK.
+
+    Sector heat tiers:
+      3-4 strong peers  → base boost 0.025 (mild sector sympathy)
+      5-7 strong peers  → base boost 0.040 (moderate momentum)
+      8-10 strong peers → base boost 0.055 (strong momentum)
+      11+ strong peers  → base boost 0.070 (extreme sector-wide rally)
+
+    Returns the number of candidates that received a sector boost.
+    """
+    if not _SECTOR_MAP and not candidates:
+        return 0
+
+    # ── Step 1: Build sector map including forecast sectors ────────
+    # PutsEngine UNIVERSE_SECTORS is the primary source (400+ symbols).
+    # Supplement with tomorrows_forecast sector field for coverage.
+    sector_lookup = dict(_SECTOR_MAP)  # Copy
+    for c in candidates:
+        sym = c["symbol"]
+        fc_sector = c.get("sector", "")
+        if sym not in sector_lookup and fc_sector:
+            # Map forecast sector names to PutsEngine-style names
+            fc_lower = fc_sector.lower()
+            if "technol" in fc_lower:
+                sector_lookup[sym] = "mega_cap_tech"
+            elif "financ" in fc_lower:
+                sector_lookup[sym] = "financials"
+            elif "communi" in fc_lower:
+                sector_lookup[sym] = "telecom"
+            elif "industr" in fc_lower:
+                sector_lookup[sym] = "industrials"
+            elif "consumer" in fc_lower:
+                sector_lookup[sym] = "consumer"
+            elif "health" in fc_lower:
+                sector_lookup[sym] = "healthcare_insurance"
+            elif "energy" in fc_lower:
+                sector_lookup[sym] = "nuclear_energy"
+            else:
+                sector_lookup[sym] = fc_sector  # Use as-is
+
+    # ── Step 2: Group candidates by sector, count strong peers ─────
+    from collections import defaultdict
+    sector_candidates: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for c in candidates:
+        sym = c["symbol"]
+        sector = sector_lookup.get(sym, "")
+        if sector:
+            c["_sector"] = sector
+            sector_candidates[sector].append(c)
+
+    # A "strong" candidate: base score >= 0.80 (indicating quality signals)
+    hot_sectors: Dict[str, int] = {}
+    for sector, members in sector_candidates.items():
+        strong_count = sum(
+            1 for m in members
+            if m.get("_base_score", m.get("score", 0)) >= 0.80
+        )
+        if strong_count >= 3:
+            hot_sectors[sector] = strong_count
+
+    if not hot_sectors:
+        return 0
+
+    for sector, count in sorted(hot_sectors.items(), key=lambda x: -x[1]):
+        logger.debug(
+            f"  🔥 Hot sector: {sector} — {count} strong candidates "
+            f"({len(sector_candidates[sector])} total)"
+        )
+
+    # ── Step 3: Apply differential sector boost ────────────────────
+    boosted = 0
+    for c in candidates:
+        sector = c.get("_sector", "")
+        if sector not in hot_sectors:
+            continue
+
+        strong_peers = hot_sectors[sector]
+
+        # Base boost scales with sector heat
+        if strong_peers >= 11:
+            raw_boost = 0.070  # Extreme sector-wide rally
+        elif strong_peers >= 8:
+            raw_boost = 0.055  # Strong momentum
+        elif strong_peers >= 5:
+            raw_boost = 0.040  # Moderate momentum
+        else:
+            raw_boost = 0.025  # Mild sector sympathy
+
+        # Differential: stocks with fewer individual boosts get
+        # the FULL sector boost; stocks with large individual boosts
+        # get a reduced sector boost (they're already well-scored).
+        #
+        # Example: SNDK has _post_orm_boost=0.085 (mostly convergence)
+        #          → effective_factor ≈ 0.72 → sector_boost = 0.070 × 0.72 = 0.050
+        #          MU has _post_orm_boost=0.120 (convergence+signal+MWS)
+        #          → effective_factor ≈ 0.36 → sector_boost = 0.070 × 0.36 = 0.025
+        existing_boost = c.get("_post_orm_boost", 0)
+        # Factor: 1.0 when existing_boost=0, diminishes as boost grows
+        # At existing_boost=0.15, factor=0.25 (minimum)
+        effective_factor = max(0.25, 1.0 - (existing_boost / 0.20))
+        sector_boost = raw_boost * effective_factor
+
+        if sector_boost > 0.005:  # Skip negligible boosts
+            c["score"] = min(c["score"] + sector_boost, 1.0)
+            c["_sector_boost"] = sector_boost
+            c["_sector_heat"] = strong_peers
+            # Update total boost tracker
+            c["_post_orm_boost"] = c.get("_post_orm_boost", 0) + sector_boost
+            boosted += 1
+
+    return boosted
+
+
 def _enrich_moonshots_with_orm(
     candidates: List[Dict[str, Any]],
     top_n: int = 10,
@@ -891,7 +1453,10 @@ def _enrich_moonshots_with_orm(
     logger.info("  🎯 Computing CALL OPTIONS RETURN MULTIPLIER...")
     orm_count = 0
     orm_scores = []
-    enrich_count = min(max(top_n * 3, 30), len(candidates))
+    # Enrich ALL candidates so the re-sort is fair.  Without this,
+    # un-enriched candidates retain raw base scores and can leapfrog
+    # ORM-blended candidates (see FEB-11 tomorrows_forecast bug).
+    enrich_count = len(candidates)
 
     for c in candidates[:enrich_count]:
         sym = c["symbol"]
@@ -910,6 +1475,89 @@ def _enrich_moonshots_with_orm(
         c["_base_score"] = base_score
         final = base_score * 0.55 + orm * 0.45
         c["score"] = max(0.0, min(final, 1.0))
+
+    # ── Apply POST-ORM quality boosts ────────────────────────────
+    # These boosts are applied AFTER ORM blending so they're not
+    # wasted on base scores that were already at 1.0.  They capture
+    # cross-source intelligence that the raw ORM can't measure.
+    convergence_applied = 0
+    for c in candidates[:enrich_count]:
+        boost = 0.0
+
+        # 1. Multi-source convergence bonus
+        conv_bonus = c.get("_convergence_bonus", 0)
+        if conv_bonus > 0:
+            boost += conv_bonus
+            convergence_applied += 1
+
+        # 2. Signal-quality boost from predictive signals
+        # Candidates with pre_catalyst + options_flow DIRECTLY predict
+        # institutional positioning ahead of the move — this is the
+        # highest-conviction signal for options returns.
+        pred_cat = c.get("pred_category", "")
+        pred_sig = c.get("pred_signal_type", "")
+        if pred_cat == "pre_catalyst" and pred_sig == "options_flow":
+            boost += 0.040  # Strong institutional options positioning
+        elif pred_cat == "pre_catalyst":
+            boost += 0.025
+        elif pred_cat == "early_setup" and pred_sig == "pre_breakout":
+            boost += 0.015
+        elif pred_cat == "mean_reversion" and pred_sig == "short_squeeze":
+            boost += 0.020  # Squeeze potential = high options return
+
+        # 3. MWS forecast quality boost (from tomorrows_forecast)
+        # A high MWS score (7-sensor) with BUY action indicates
+        # multi-dimensional institutional conviction.
+        mws = c.get("mws_score", 0) or 0
+        if mws >= 80:
+            boost += 0.025  # Top quartile MWS conviction
+        elif mws >= 75:
+            boost += 0.012
+
+        # 4. Expected move magnitude
+        # Larger expected moves translate to higher options returns
+        exp_move = c.get("expected_move_pct", 0) or 0
+        if exp_move >= 5.0:
+            boost += 0.020  # 5%+ expected move
+        elif exp_move >= 3.0:
+            boost += 0.010
+
+        # 5. Target size from predictive signals
+        pred_tgt = c.get("pred_target_pct", 0) or 0
+        if pred_tgt >= 12.0:
+            boost += 0.015  # High upside target
+        elif pred_tgt >= 8.0:
+            boost += 0.008
+
+        if boost > 0:
+            c["score"] = min(c["score"] + boost, 1.0)
+            c["_post_orm_boost"] = boost
+
+    if convergence_applied:
+        logger.info(
+            f"  📊 Post-ORM quality boosts: {convergence_applied} symbols "
+            f"with convergence + signal/MWS/target boosts applied"
+        )
+
+    # ── 6. SECTOR MOMENTUM BOOST ─────────────────────────────────
+    # When a sector has many strong candidates (3+), it signals a
+    # sector-wide catalyst (e.g., MU earnings driving all semi stocks).
+    # Stocks with WEAK individual signals but in a HOT sector get a
+    # larger boost — "rising tide lifts all boats."
+    #
+    # Design principles:
+    #   • Only triggers when 3+ sector peers have strong signals
+    #   • Boost scales with sector heat (more peers = higher boost)
+    #   • DIFFERENTIAL: stocks with fewer individual boosts benefit
+    #     more (sector sympathy closes their gap to sector leaders)
+    #   • This captures plays like SNDK +8.84% driven by MU earnings
+    #     where SNDK had weak individual signals but sector momentum
+    sector_boost_applied = _apply_sector_momentum_boost(candidates[:enrich_count])
+    if sector_boost_applied:
+        logger.info(
+            f"  🔥 Sector momentum: {sector_boost_applied} symbols "
+            f"boosted by hot-sector detection"
+        )
 
     # Re-sort by final blended score
     candidates.sort(key=lambda x: x["score"], reverse=True)
