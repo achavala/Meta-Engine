@@ -105,12 +105,28 @@ def _format_telegram_summaries(summaries: Dict[str, Any]) -> List[str]:
     """
     messages = []
     
-    # ===== MESSAGE 1: Header + Conflict Matrix =====
+    # ===== MESSAGE 1: Header + Market Direction + Conflict Matrix =====
     msg1_lines = []
     msg1_lines.append("🏛️ <b>META ENGINE — INSTITUTIONAL SUMMARIES</b>")
     msg1_lines.append(f"<i>{datetime.now().strftime('%B %d, %Y -- %I:%M %p ET')}</i>")
     msg1_lines.append("")
-    
+
+    # Market Direction Prediction
+    try:
+        from analysis.market_direction_predictor import MarketDirectionPredictor
+        predictor = MarketDirectionPredictor()
+        hour = datetime.now().hour
+        timeframe = "today" if hour < 12 else "tomorrow"
+        prediction = predictor.predict_market_direction(timeframe=timeframe)
+        direction_text = predictor.format_for_telegram(prediction)
+        msg1_lines.append(direction_text)
+        msg1_lines.append("")
+        msg1_lines.append("━━━━━━━━━━━━━━━━━━━━")
+        msg1_lines.append("")
+    except Exception as e:
+        import logging as _log
+        _log.getLogger(__name__).debug(f"Market direction for Telegram skipped: {e}")
+
     # Conflict Matrix
     conflicts = summaries.get("conflict_summaries", [])
     if conflicts:
@@ -206,9 +222,10 @@ def _format_telegram_summaries(summaries: Dict[str, Any]) -> List[str]:
 def _clean_for_telegram(text: str) -> str:
     """Clean text for Telegram HTML format — escape special chars."""
     # Telegram HTML supports: <b>, <i>, <code>, <pre>, <a>
-    # Need to escape &, <, > that are NOT part of HTML tags
+    # Must escape &, <, > that are NOT part of allowed HTML tags
     text = text.replace("&", "&amp;")
-    # Don't escape < and > that might be in text (they shouldn't be in summaries)
+    text = text.replace("<", "&lt;")
+    text = text.replace(">", "&gt;")
     return text
 
 
@@ -217,13 +234,15 @@ def send_meta_telegram(
     chart_path: Optional[str] = None,
     bot_token: str = "",
     chat_id: str = "",
+    gap_up_data: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """
     Send the Meta Engine alert via Telegram.
     
-    Sends ONLY:
+    Sends:
       1. Conflict Matrix
       2. All 3-sentence institutional summaries (puts + moonshots)
+      3. Gap-Up Alerts section (if candidates detected)
     
     Does NOT send: chart, executive summary, tables (those are in the email).
     
@@ -232,6 +251,7 @@ def send_meta_telegram(
         chart_path: Path to chart (unused — email handles chart delivery)
         bot_token: Telegram bot token
         chat_id: Target chat ID
+        gap_up_data: Output from gap_up_detector.detect_gap_ups() (optional)
         
     Returns:
         True if all messages sent successfully
@@ -242,8 +262,27 @@ def send_meta_telegram(
     
     # Format the focused Telegram messages
     messages = _format_telegram_summaries(summaries)
+
+    # FEB 16: Append gap-up alerts as a separate message
+    if gap_up_data and gap_up_data.get("candidates"):
+        try:
+            from engine_adapters.gap_up_detector import format_gap_up_report
+            gap_text = format_gap_up_report(gap_up_data)
+            if gap_text:
+                # Wrap in HTML for Telegram
+                gap_msg = f"<pre>{_clean_for_telegram(gap_text)}</pre>"
+                if len(gap_msg) > MAX_MESSAGE_LENGTH:
+                    # Truncate if too long
+                    gap_msg = gap_msg[:MAX_MESSAGE_LENGTH - 10] + "</pre>"
+                messages.append(gap_msg)
+                logger.info(
+                    f"  🚀 Gap-up alerts appended to Telegram "
+                    f"({len(gap_up_data['candidates'])} candidates)"
+                )
+        except Exception as e:
+            logger.warning(f"  ⚠️ Gap-up Telegram formatting failed: {e}")
     
-    logger.info(f"  📱 Sending {len(messages)} Telegram messages (summaries + conflicts only)")
+    logger.info(f"  📱 Sending {len(messages)} Telegram messages (summaries + conflicts + gap-ups)")
     
     # Send all messages
     return _send_multiple_messages(messages, bot_token, chat_id)

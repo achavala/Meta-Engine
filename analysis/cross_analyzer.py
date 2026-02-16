@@ -1682,6 +1682,16 @@ def cross_analyze(
         "combined_ranking": [],
     }
     
+    # 0. Load earnings calendar for flagging (±2 days)
+    earnings_set = set()
+    try:
+        from engine_adapters.puts_adapter import _load_earnings_proximity
+        earnings_set = _load_earnings_proximity()
+        if earnings_set:
+            logger.info(f"  📅 Earnings calendar loaded: {len(earnings_set)} tickers with upcoming earnings")
+    except Exception as e:
+        logger.debug(f"Earnings calendar load failed: {e}")
+    
     # 1. Run PutsEngine Top 10 through Moonshot lens
     logger.info("\n📊 Running PutsEngine picks through Moonshot analysis...")
     for pick in puts_top10:
@@ -1708,6 +1718,15 @@ def cross_analyze(
         gap_alert = _detect_overnight_gap(symbol, pick, market_data)
         if gap_alert:
             cross_result["overnight_gap_alert"] = gap_alert
+
+        # Earnings proximity flagging
+        if symbol in earnings_set:
+            cross_result["_earnings_flag"] = True
+            cross_result["_earnings_warning"] = (
+                f"⚠️ {symbol} reports earnings within 2 days — "
+                f"high overnight gap risk for PUT position"
+            )
+            logger.info(f"  📅 {symbol}: EARNINGS within 2 days — special handling")
 
         results["puts_through_moonshot"].append(cross_result)
         logger.info(f"  {symbol}: Puts={_to_float(pick.get('score', 0)):.2f} | Moonshot={moonshot_view['opportunity_level']}")
@@ -1739,10 +1758,242 @@ def cross_analyze(
         if gap_alert:
             cross_result["overnight_gap_alert"] = gap_alert
 
+        # Earnings proximity flagging for CALL picks
+        # Earnings can cause extreme moves — both up AND down
+        # Flag as special handling (not necessarily bearish for calls)
+        if symbol in earnings_set:
+            cross_result["_earnings_flag"] = True
+            cross_result["_earnings_warning"] = (
+                f"⚠️ {symbol} reports earnings within 2 days — "
+                f"IV crush risk for CALL option after earnings"
+            )
+            logger.info(f"  📅 {symbol}: EARNINGS within 2 days — IV crush risk")
+
         results["moonshot_through_puts"].append(cross_result)
         logger.info(f"  {symbol}: Moonshot={_to_float(pick.get('score', 0)):.2f} | Puts Risk={puts_view['risk_level']}")
     
-    # 3. Build conflict matrix
+    # 2b. NEGATIVE RECURRENCE FILTER — exclude 2+ consecutive failures
+    # Backtest finding: AMZN 0/5, GOOGL 2/5 — repeated losers waste capital
+    try:
+        from analysis.recurrence_tracker import (
+            get_excluded_symbols,
+            record_outcomes_from_previous_scan,
+        )
+        # First, record outcomes from previous scan picks
+        record_outcomes_from_previous_scan(polygon_api_key)
+
+        excluded = get_excluded_symbols(min_consecutive_failures=2)
+        if excluded:
+            excluded_syms = {s for s, _ in excluded}
+            logger.info(
+                f"  🚫 Negative recurrence filter: {len(excluded)} symbols excluded "
+                f"(2+ consecutive failures): {sorted(excluded_syms)[:10]}"
+            )
+            # Remove from both lists (but keep them in the results as "filtered")
+            before_puts = len(results["puts_through_moonshot"])
+            before_moon = len(results["moonshot_through_puts"])
+
+            filtered_puts = []
+            for p in results["puts_through_moonshot"]:
+                if (p.get("symbol", ""), "put") in excluded:
+                    p["_excluded_reason"] = "negative_recurrence_2x_failure"
+                    logger.info(f"    🚫 {p['symbol']} PUT excluded (2+ consecutive failures)")
+                else:
+                    filtered_puts.append(p)
+            results["puts_through_moonshot"] = filtered_puts
+
+            filtered_moon = []
+            for p in results["moonshot_through_puts"]:
+                if (p.get("symbol", ""), "call") in excluded:
+                    p["_excluded_reason"] = "negative_recurrence_2x_failure"
+                    logger.info(f"    🚫 {p['symbol']} CALL excluded (2+ consecutive failures)")
+                else:
+                    filtered_moon.append(p)
+            results["moonshot_through_puts"] = filtered_moon
+
+            removed = (before_puts - len(filtered_puts)) + (before_moon - len(filtered_moon))
+            if removed:
+                logger.info(f"  ✅ Removed {removed} picks via negative recurrence filter")
+    except Exception as e:
+        logger.debug(f"Negative recurrence filter skipped: {e}")
+
+    # 2c. SECTOR CONCENTRATION RISK — penalize picks fighting sector trend
+    # Backtest finding: MU was picked as PUT while semiconductors rallied.
+    # When a put pick's sector is bullish (most peers going up), penalize it.
+    # Similarly, when a call pick's sector is bearish (most peers going down).
+    # FEB 15 FIX: Used UNIVERSE_SECTORS (was TICKERS — didn't exist), relaxed
+    # thresholds (was 3+peers AND 2x ratio — too strict, never triggered).
+    try:
+        # Build sector map from PutsEngine config (FIXED: use UNIVERSE_SECTORS)
+        sector_map = {}
+        try:
+            from putsengine.config import EngineConfig
+            for sector_name, tickers in EngineConfig.UNIVERSE_SECTORS.items():
+                if isinstance(tickers, (list, tuple)):
+                    for t in tickers:
+                        sector_map[t] = sector_name
+        except (ImportError, AttributeError) as e:
+            logger.debug(f"Sector map from PutsEngine unavailable: {e}")
+
+        if sector_map:
+            logger.debug(f"  📊 Sector map loaded: {len(sector_map)} symbols across sectors")
+            # Determine sector direction from market data of ALL analyzed picks
+            sector_signals = {}  # {sector: {"bullish": count, "bearish": count}}
+            all_picks = results["puts_through_moonshot"] + results["moonshot_through_puts"]
+
+            for pick in all_picks:
+                sym = pick.get("symbol", "")
+                sector = sector_map.get(sym, "")
+                if not sector:
+                    continue
+                if sector not in sector_signals:
+                    sector_signals[sector] = {"bullish": 0, "bearish": 0, "total": 0}
+
+                sector_signals[sector]["total"] += 1
+
+                # Check market data for direction (multiple sources)
+                mkt = pick.get("market_data", {})
+                change_pct = mkt.get("change_pct", 0)
+                # Also check price-based change if market_data is empty
+                if change_pct == 0:
+                    price = pick.get("price", 0)
+                    cached_price = pick.get("_cached_price", 0)
+                    if price > 0 and cached_price > 0:
+                        change_pct = ((price - cached_price) / cached_price) * 100
+
+                if change_pct > 0.5:  # Lowered from 1.0 → 0.5 (more sensitive)
+                    sector_signals[sector]["bullish"] += 1
+                elif change_pct < -0.5:  # Lowered from -1.0 → -0.5
+                    sector_signals[sector]["bearish"] += 1
+
+            # Log sector signals for debugging
+            for sector, info in sector_signals.items():
+                if info["total"] >= 2:
+                    logger.debug(
+                        f"    📊 Sector {sector}: {info['bullish']}↑ {info['bearish']}↓ "
+                        f"({info['total']} total)"
+                    )
+
+            # Apply penalties for picks fighting their sector trend
+            # RELAXED thresholds: 2+ peers (was 3) AND simple majority (was 2x ratio)
+            sector_penalized = 0
+            for pick in results["puts_through_moonshot"]:
+                sym = pick.get("symbol", "")
+                sector = sector_map.get(sym, "")
+                if not sector or sector not in sector_signals:
+                    continue
+                info = sector_signals[sector]
+                # PUT in a BULLISH sector — relaxed: 2+ bullish AND majority bullish
+                if info["bullish"] >= 2 and info["bullish"] > info["bearish"]:
+                    strength = info["bullish"] / max(info["total"], 1)
+                    penalty = min(0.05 + (strength - 0.5) * 0.05, 0.08)  # 5-8% penalty
+                    pick["score"] = max(pick.get("score", 0) - penalty, 0.10)
+                    pick["_sector_conflict"] = f"PUT in bullish {sector} ({info['bullish']}↑ vs {info['bearish']}↓)"
+                    sector_penalized += 1
+                    logger.info(
+                        f"    ⚠️ {sym}: PUT in bullish {sector} sector "
+                        f"({info['bullish']}↑/{info['bearish']}↓) — penalized {penalty:.1%}"
+                    )
+
+            for pick in results["moonshot_through_puts"]:
+                sym = pick.get("symbol", "")
+                sector = sector_map.get(sym, "")
+                if not sector or sector not in sector_signals:
+                    continue
+                info = sector_signals[sector]
+                # CALL in a BEARISH sector — relaxed: 2+ bearish AND majority bearish
+                if info["bearish"] >= 2 and info["bearish"] > info["bullish"]:
+                    strength = info["bearish"] / max(info["total"], 1)
+                    penalty = min(0.05 + (strength - 0.5) * 0.05, 0.08)  # 5-8% penalty
+                    pick["score"] = max(pick.get("score", 0) - penalty, 0.10)
+                    pick["_sector_conflict"] = f"CALL in bearish {sector} ({info['bearish']}↓ vs {info['bullish']}↑)"
+                    sector_penalized += 1
+                    logger.info(
+                        f"    ⚠️ {sym}: CALL in bearish {sector} sector "
+                        f"({info['bearish']}↓/{info['bullish']}↑) — penalized {penalty:.1%}"
+                    )
+
+            if sector_penalized > 0:
+                # Re-sort after penalties
+                results["puts_through_moonshot"].sort(
+                    key=lambda x: _to_float(x.get("score", 0)), reverse=True)
+                results["moonshot_through_puts"].sort(
+                    key=lambda x: _to_float(x.get("score", 0)), reverse=True)
+                logger.info(
+                    f"  🔄 Sector concentration: {sector_penalized} picks penalized "
+                    f"for fighting sector trend"
+                )
+            else:
+                logger.debug("  ✅ Sector conflict: no picks fighting sector trends")
+        else:
+            logger.debug("  ℹ️ Sector conflict: no sector map available — skipped")
+    except Exception as e:
+        logger.warning(f"Sector concentration filter error: {e}")
+
+    # 3. Track picks for recurrence analysis and apply boost
+    try:
+        from analysis.recurrence_tracker import track_pick, apply_recurrence_boost
+        scan_date = datetime.now().strftime("%Y-%m-%d")
+        scan_timestamp = results["timestamp"]
+        
+        # Track all picks
+        for i, pick in enumerate(results["puts_through_moonshot"], 1):
+            track_pick(
+                symbol=pick.get("symbol", ""),
+                option_type="put",
+                scan_date=scan_date,
+                scan_timestamp=scan_timestamp,
+                rank=i,
+                engine="PutsEngine",
+                score=_to_float(pick.get("score", 0)),
+            )
+        
+        for i, pick in enumerate(results["moonshot_through_puts"], 1):
+            track_pick(
+                symbol=pick.get("symbol", ""),
+                option_type="call",
+                scan_date=scan_date,
+                scan_timestamp=scan_timestamp,
+                rank=i,
+                engine="Moonshot",
+                score=_to_float(pick.get("score", 0)),
+            )
+        
+        # Apply recurrence boost (2x = 15% boost, 3x+ = 30% boost)
+        # This ensures recurring picks rank in Top 3 for X posts
+        results["puts_through_moonshot"] = apply_recurrence_boost(
+            results["puts_through_moonshot"],
+            days=7,
+            boost_2x=0.15,  # 15% boost for 2x recurrence
+            boost_3x=0.30,  # 30% boost for 3x+ recurrence
+        )
+        
+        results["moonshot_through_puts"] = apply_recurrence_boost(
+            results["moonshot_through_puts"],
+            days=7,
+            boost_2x=0.15,
+            boost_3x=0.30,
+        )
+        
+        # Log boosted picks that made it to Top 3
+        for pick in results["puts_through_moonshot"][:3]:
+            stars = pick.get("_recurrence_stars", 0)
+            if stars > 0:
+                logger.info(f"  ⭐ Recurrence boost: {pick.get('symbol')} PUT ({stars} stars, "
+                           f"base={pick.get('_base_score', 0):.3f}→boosted={pick.get('score', 0):.3f})")
+        
+        for pick in results["moonshot_through_puts"][:3]:
+            stars = pick.get("_recurrence_stars", 0)
+            if stars > 0:
+                logger.info(f"  ⭐ Recurrence boost: {pick.get('symbol')} CALL ({stars} stars, "
+                           f"base={pick.get('_base_score', 0):.3f}→boosted={pick.get('score', 0):.3f})")
+    except Exception as e:
+        logger.debug(f"Recurrence tracking/boost skipped: {e}")
+        # Fallback: sort by score if boost fails
+        results["puts_through_moonshot"].sort(key=lambda x: _to_float(x.get("score", 0)), reverse=True)
+        results["moonshot_through_puts"].sort(key=lambda x: _to_float(x.get("score", 0)), reverse=True)
+    
+    # 4. Build conflict matrix
     logger.info("\n📊 Building conflict matrix...")
     all_symbols = set()
     puts_map = {p["symbol"]: p for p in puts_top10}
@@ -1774,7 +2025,7 @@ def cross_analyze(
         
         results["conflict_matrix"].append(conflict_entry)
     
-    # 4. Build combined ranking
+    # 5. Build combined ranking
     combined = []
     
     for item in results["puts_through_moonshot"]:
@@ -1800,6 +2051,20 @@ def cross_analyze(
             entry["data_source"] = item["data_source"]
         if item.get("data_age_days") is not None:
             entry["data_age_days"] = item["data_age_days"]
+        # Propagate earnings flag
+        if item.get("_earnings_flag"):
+            entry["_earnings_flag"] = True
+            entry["_earnings_warning"] = item.get("_earnings_warning", "")
+        # Propagate sector conflict
+        if item.get("_sector_conflict"):
+            entry["_sector_conflict"] = item["_sector_conflict"]
+        # FEB 15 FIX: Propagate ORM fields to combined ranking
+        if "_orm_score" in item:
+            entry["_orm_score"] = item["_orm_score"]
+        if "_orm_status" in item:
+            entry["_orm_status"] = item["_orm_status"]
+        if "_orm_factors" in item:
+            entry["_orm_factors"] = item["_orm_factors"]
         combined.append(entry)
     
     for item in results["moonshot_through_puts"]:
@@ -1825,6 +2090,20 @@ def cross_analyze(
             entry["data_source"] = item["data_source"]
         if item.get("data_age_days") is not None:
             entry["data_age_days"] = item["data_age_days"]
+        # Propagate earnings flag
+        if item.get("_earnings_flag"):
+            entry["_earnings_flag"] = True
+            entry["_earnings_warning"] = item.get("_earnings_warning", "")
+        # Propagate sector conflict
+        if item.get("_sector_conflict"):
+            entry["_sector_conflict"] = item["_sector_conflict"]
+        # FEB 15 FIX: Propagate ORM fields to combined ranking
+        if "_orm_score" in item:
+            entry["_orm_score"] = item["_orm_score"]
+        if "_orm_status" in item:
+            entry["_orm_status"] = item["_orm_status"]
+        if "_orm_factors" in item:
+            entry["_orm_factors"] = item["_orm_factors"]
         combined.append(entry)
     
     combined.sort(key=lambda x: _to_float(x.get("source_score", 0)), reverse=True)

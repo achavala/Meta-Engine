@@ -1,0 +1,48 @@
+{
+  "timestamp": "2026-02-12T21:54:09.343398-05:00",
+  "analysis_period_days": 7,
+  "baseline_metrics": {
+    "trade_execution_rate": 0.367,
+    "win_rate": 0.083,
+    "avg_winner_return": 189.6,
+    "avg_loser_return": -12.3,
+    "total_picks": 60,
+    "winners": 5,
+    "losers": 34,
+    "no_trade_executed": 38
+  },
+  "trade_execution": {
+    "total_trades": 30,
+    "execution_rate": 0.0,
+    "filled": 0,
+    "pending": 6,
+    "cancelled": 0,
+    "retry_attempts": 0,
+    "vs_baseline": -0.367
+  },
+  "selection_gates": {
+    "total_filtered": 0,
+    "filtered_by_orm": 0,
+    "filtered_by_signals": 0,
+    "filtered_by_score": 0,
+    "scans_analyzed": 0
+  },
+  "orm_scores": {
+    "avg_orm": 0.6864000000000001,
+    "avg_orm_winners": 0.7112500000000002,
+    "avg_orm_losers": 0.7285000000000001,
+    "orm_ge_070_pct": 46.0,
+    "total_picks_with_orm": 50
+  },
+  "performance": {
+    "total_trades": 30,
+    "executed_trades": 24,
+    "win_rate": 0.2916666666666667,
+    "avg_winner_return": 98.45714285714287,
+    "avg_loser_return": -60.16874999999998,
+    "winners": 7,
+    "losers": 16,
+    "vs_baseline_win_rate": 0.20866666666666667,
+    "vs_baseline_avg_winner": -91.14285714285712
+  }
+}

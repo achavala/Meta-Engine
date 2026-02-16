@@ -50,21 +50,15 @@ class MetaConfig:
     X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN", "")
 
     # ========== SCHEDULE ==========
-    # Three daily scans:
-    #   1. 9:21 AM  — Pre-Market Brief: PutsEngine 9:00 AM scan just completed,
-    #                 zero-hour gap alerts saved, pre-market bid/ask data available.
-    #                 Market is NOT open → no live Polygon prices → no gap detection.
-    #                 Purpose: See what the engines found overnight/pre-market.
-    #                 Trading is SKIPPED (market closed).
-    #   2. 9:50 AM  — Morning Scan: 20 min of real market data from Polygon,
+    # Two daily scans:
+    #   1. 9:35 AM  — Morning Scan: Real market data from Polygon,
     #                 gap detection fully functional, opening range forming.
     #                 Trades execute here.
-    #   3. 3:15 PM  — Afternoon Scan: Full intraday data, power hour setup.
+    #   2. 3:15 PM  — Afternoon Scan: Full intraday data, power hour setup.
     #                 Trades execute here.
-    RUN_TIME_PREMARKET_ET = os.getenv("META_RUN_TIME_PREMARKET", "09:21")  # Pre-market brief
-    RUN_TIME_ET = os.getenv("META_RUN_TIME", "09:50")  # Morning (post-open)
+    RUN_TIME_ET = os.getenv("META_RUN_TIME", "09:35")  # Morning (post-open)
     RUN_TIME_PM_ET = os.getenv("META_RUN_TIME_PM", "15:15")  # Afternoon
-    RUN_TIMES_ET = [RUN_TIME_PREMARKET_ET, RUN_TIME_ET, RUN_TIME_PM_ET]
+    RUN_TIMES_ET = [RUN_TIME_ET, RUN_TIME_PM_ET]
     TIMEZONE = "US/Eastern"
 
     # ========== ENGINE SETTINGS ==========

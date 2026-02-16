@@ -73,7 +73,7 @@ def check_config():
         print(f"  {icon} {name}")
     
     print("\n⏰ Schedule:")
-    session_names = {0: "Pre-Market", 1: "Morning", 2: "Afternoon"}
+    session_names = {0: "Morning", 1: "Afternoon"}
     for i, rt in enumerate(MetaConfig.RUN_TIMES_ET):
         label = session_names.get(i, f"Session-{i+1}")
         print(f"  {label}: {rt} ET (Mon-Fri)")

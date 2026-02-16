@@ -60,6 +60,11 @@ CREATE TABLE IF NOT EXISTS trades (
     -- P&L
     pnl             REAL    DEFAULT 0,           -- Total $ P&L
     pnl_pct         REAL    DEFAULT 0,           -- % return
+    
+    -- Partial profit tracking
+    partial_profit_taken INTEGER DEFAULT 0,       -- 1 if partial profit taken at 2x
+    partial_profit_price REAL    DEFAULT 0,      -- Price at which partial profit was taken
+    partial_profit_pct   REAL    DEFAULT 0,       -- P&L % at partial profit exit
 
     -- Timestamps
     filled_at       TEXT,
@@ -105,6 +110,29 @@ class TradeDB:
     def _ensure_tables(self):
         with self._get_conn() as conn:
             conn.executescript(_CREATE_TABLES)
+            # Migration: Add partial profit columns if they don't exist
+            try:
+                conn.execute("""
+                    ALTER TABLE trades 
+                    ADD COLUMN partial_profit_taken INTEGER DEFAULT 0
+                """)
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+            try:
+                conn.execute("""
+                    ALTER TABLE trades 
+                    ADD COLUMN partial_profit_price REAL DEFAULT 0
+                """)
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+            try:
+                conn.execute("""
+                    ALTER TABLE trades 
+                    ADD COLUMN partial_profit_pct REAL DEFAULT 0
+                """)
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+            conn.commit()
         logger.debug(f"Trade DB ready at {self.db_path}")
 
     # ── Insert / Update ───────────────────────────────────

@@ -315,12 +315,12 @@ with st.sidebar:
     st.caption("Set in `trading/executor.py`")
 
     tp_mult = st.slider("Take Profit (×)", 1.5, 10.0, 3.0, 0.5, disabled=True)
-    sl_pct = st.slider("Stop Loss (%)", 10, 80, 50, 5, disabled=True)
+    sl_pct = st.slider("Stop Loss (%)", 10, 80, 40, 5, disabled=True)
     st.caption("Exit rules applied on each scan")
 
     st.markdown("---")
     st.markdown("##### 📅 Schedule")
-    st.markdown("• **Pre-Market:** 9:21 AM ET · **AM scan:** 9:50 AM ET")
+    st.markdown("• **AM scan:** 9:35 AM ET")
     st.markdown("• **PM scan:** 3:15 PM ET")
     st.markdown("• **Days:** Mon – Fri")
 
@@ -566,7 +566,7 @@ with tabs[1]:
                 f'<span style="color:{freshness_color}; font-weight:700; font-size:14px;">'
                 f'{freshness_icon} {freshness_label} — Last scan: {scan_time_fmt} ({age_str})</span>'
                 f'<span style="color:#78909c; font-size:12px;">Auto-updates on every scan '
-                f'(9:21 AM, 9:50 AM &amp; 3:15 PM ET)</span>'
+                f'(9:35 AM &amp; 3:15 PM ET)</span>'
                 f'</div>',
                 unsafe_allow_html=True,
             )

@@ -36,6 +36,7 @@ def send_meta_email(
     smtp_user: str = "",
     smtp_password: str = "",
     recipient: str = "",
+    gap_up_data: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """
     Send the Meta Engine analysis report via email.
@@ -44,6 +45,7 @@ def send_meta_email(
       1. Full .md report as beautifully styled HTML email body
       2. PDF attachment of the full report
       3. Technical analysis chart (inline + attachment)
+      4. Gap-Up Alerts section (if candidates detected)
     
     Args:
         summaries: Output from summary_generator.generate_all_summaries()
@@ -54,6 +56,7 @@ def send_meta_email(
         smtp_user: SMTP username/email
         smtp_password: SMTP password (app password for Gmail)
         recipient: Email recipient
+        gap_up_data: Output from gap_up_detector.detect_gap_ups() (optional)
         
     Returns:
         True if email sent successfully
@@ -99,6 +102,24 @@ def send_meta_email(
         # === EMAIL BODY: Full .md report as HTML ===
         html_content = _build_full_html_email(summaries, report_md_path, chart_path)
         text_content = _build_text_report(summaries)
+        
+        # === INJECT GAP-UP ALERTS (FEB 16) ===
+        if gap_up_data and gap_up_data.get("candidates"):
+            try:
+                from engine_adapters.gap_up_detector import format_gap_up_html, format_gap_up_report
+                gap_html = format_gap_up_html(gap_up_data)
+                gap_text = format_gap_up_report(gap_up_data)
+                if gap_html:
+                    # Insert before closing </body> or at end
+                    if "</body>" in html_content:
+                        html_content = html_content.replace("</body>", gap_html + "</body>")
+                    else:
+                        html_content += gap_html
+                if gap_text:
+                    text_content = gap_text + "\n\n" + text_content
+                logger.info(f"  🚀 Gap-up alerts injected into email ({len(gap_up_data['candidates'])} candidates)")
+            except Exception as e:
+                logger.warning(f"  ⚠️ Gap-up email injection failed: {e}")
         
         # Create alternative part (text + html)
         msg_alt = MIMEMultipart("alternative")
@@ -270,6 +291,60 @@ def _build_html_from_summaries(summaries: Dict[str, Any], chart_path: Optional[s
                 </div>
             </div>
     """
+
+    # Market Direction Section
+    try:
+        from analysis.market_direction_predictor import MarketDirectionPredictor
+        predictor = MarketDirectionPredictor()
+        hour = now.hour
+        timeframe = "today" if hour < 12 else "tomorrow"
+        prediction = predictor.predict_market_direction(timeframe=timeframe)
+        
+        direction_label = prediction.get("direction_label", "⚪ Flat")
+        confidence_pct = prediction.get("confidence_pct", 0)
+        rationale = prediction.get("rationale", "")
+        is_choppy = prediction.get("is_choppy", False)
+        composite = prediction.get("composite_score", 0)
+        header_text = "Market Direction Today" if timeframe == "today" else "Tomorrow Market Direction"
+        
+        # Color based on direction
+        if "Green" in direction_label or "🟢" in direction_label:
+            dir_color = "#4ecdc4"
+            dir_border = "#4ecdc4"
+        elif "Red" in direction_label or "🔴" in direction_label:
+            dir_color = "#ff6b6b"
+            dir_border = "#ff6b6b"
+        else:
+            dir_color = "#ffd93d"
+            dir_border = "#ffd93d"
+        
+        signals_html = ""
+        for s in prediction.get("signals", [])[:8]:
+            signals_html += f"<li style='color: #bbb; margin: 4px 0;'>{s}</li>"
+        
+        html += f"""
+            <div class="section" style="border-left-color: {dir_border};">
+                <h2>🌤️ {header_text}</h2>
+                <div style="background: linear-gradient(135deg, #16213e, #1a1a2e); 
+                            padding: 20px; border-radius: 10px; border: 1px solid {dir_border}44;">
+                    <div style="font-size: 24px; font-weight: bold; color: {dir_color}; margin-bottom: 10px;">
+                        {direction_label}
+                    </div>
+                    <div style="font-size: 14px; color: #bbb;">
+                        Confidence: {confidence_pct:.0f}% | Composite: {composite:+.4f}
+                        {'| ⚠️ Choppy' if is_choppy else ''}
+                    </div>
+                    <div style="font-size: 14px; color: #ddd; margin-top: 10px;">
+                        {rationale}
+                    </div>
+                    <ul style="margin-top: 10px; padding-left: 20px;">
+                        {signals_html}
+                    </ul>
+                </div>
+            </div>
+        """
+    except Exception as e:
+        logger.debug(f"Market direction for email skipped: {e}")
     
     # Chart
     if chart_path:

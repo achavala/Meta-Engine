@@ -1,9 +1,8 @@
 """
 Meta Engine Scheduler
 ======================
-Runs the Meta Engine three times daily on every trading day:
-  - 9:21 AM ET  (pre-market brief — cached PutsEngine scan + zero-hour data)
-  - 9:50 AM ET  (morning — 20 min of real market data + gap detection)
+Runs the Meta Engine twice daily on every trading day:
+  - 9:35 AM ET  (morning — real market data + gap detection)
   - 3:15 PM ET  (afternoon — intraday action + power hour setup)
 
 Methods:
@@ -12,7 +11,7 @@ Methods:
 3. Manual — run once via command line
 
 Usage:
-    # Start scheduler daemon (runs at 9:21 AM + 9:50 AM + 3:15 PM ET):
+    # Start scheduler daemon (runs at 9:35 AM + 3:15 PM ET):
     python scheduler.py
     
     # Run once immediately:
@@ -27,7 +26,7 @@ import os
 import signal
 import logging
 import subprocess
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 
 import pytz
@@ -141,8 +140,8 @@ _caffeinate_proc: subprocess.Popen = None  # type: ignore
 def _keep_awake_market_hours():
     """
     Prevent the Mac from idle-sleeping during market hours.
-    Called at 9:20 AM ET by APScheduler; keeps awake for ~7 hours
-    (covers 9:21 AM, 9:50 AM and 3:15 PM runs, plus market close at 4 PM).
+    Called at 9:15 AM ET by APScheduler; keeps awake for ~7 hours
+    (covers 9:35 AM and 3:15 PM runs, plus market close at 4 PM).
     Uses macOS `caffeinate` — no sudo needed.
     """
     global _caffeinate_proc
@@ -180,23 +179,64 @@ def _midday_position_check():
         logger.error(f"   Position check failed: {e}")
 
 
+def _auto_check_winners():
+    """
+    Automatically check for profitable picks (>50%) from recent scans and post winner updates.
+    
+    Institutional-grade logic:
+    - Checks scans from last 24 hours
+    - Only posts if picks are >50% profitable
+    - Tracks which scans have already been posted (avoids duplicates)
+    - Runs every 30-45 minutes during market hours (9:30 AM - 4:00 PM ET)
+    - Skips if market is closed or outside trading hours
+    """
+    now_et = datetime.now(EST)
+    now_str = now_et.strftime('%I:%M:%S %p ET')
+    
+    # Only run during market hours (9:30 AM - 4:00 PM ET) on trading days
+    if now_et.weekday() >= 5:  # Weekend
+        return
+    if now_et.hour < 9 or (now_et.hour == 9 and now_et.minute < 30):
+        return  # Before 9:30 AM
+    if now_et.hour >= 16:
+        return  # After 4:00 PM
+    
+    logger.info(f"🏆 Auto winner check at {now_str}")
+    
+    try:
+        from notifications.x_poster import check_and_post_milestones
+        
+        # Check all open trades for milestone crossings (50%, 100%, 150%, 200%, 300%, 400%, 500%)
+        # This is more efficient than checking per-scan - it monitors all positions continuously
+        stats = check_and_post_milestones(min_profit_pct=50.0)
+        
+        if stats["milestones_posted"] > 0:
+            logger.info(f"   ✅ Posted {stats['milestones_posted']} milestone updates "
+                       f"({stats['trades_with_milestones']} trades, {stats['checked']} checked)")
+        else:
+            logger.debug(f"   No new milestones reached ({stats['checked']} trades checked)")
+            
+    except Exception as e:
+        logger.error(f"   Auto winner check failed: {e}", exc_info=True)
+
+
 def start_scheduler():
     """
-    Start the APScheduler daemon that runs Meta Engine three times daily:
-      - 9:21 AM ET  (pre-market brief — before market open)
-      - 9:50 AM ET  (morning scan — 20 min of real market data)
-      - 3:15 PM ET  (afternoon scan)
+    Start the APScheduler daemon that runs Meta Engine twice daily:
+      - 9:35 AM ET  (morning scan — real market data + gap detection)
+      - 3:15 PM ET  (afternoon scan — full intraday data + power hour setup)
     Also starts the trading dashboard on port 5050.
     """
     try:
         from apscheduler.schedulers.blocking import BlockingScheduler
         from apscheduler.triggers.cron import CronTrigger
+        from apscheduler.triggers.interval import IntervalTrigger
     except ImportError:
         logger.error("APScheduler not installed. Run: pip install apscheduler")
         sys.exit(1)
     
-    # Parse all run times (now supports 2 or 3 runs)
-    run_times = MetaConfig.RUN_TIMES_ET  # ["09:21", "09:50", "15:15"]
+    # Parse run times (2 daily scans)
+    run_times = MetaConfig.RUN_TIMES_ET  # ["09:35", "15:15"]
     
     logger.info("=" * 60)
     logger.info("🏛️  META ENGINE SCHEDULER")
@@ -219,7 +259,6 @@ def start_scheduler():
     scheduler = BlockingScheduler(timezone=EST)
     
     # ── Job 0: Keep Mac awake during market hours (9:15 AM) ──
-    # Moved from 9:20 → 9:15 to cover the new 9:21 AM pre-market run
     scheduler.add_job(
         _keep_awake_market_hours,
         trigger=CronTrigger(
@@ -233,9 +272,9 @@ def start_scheduler():
     )
     logger.info("  ✅ Job scheduled: caffeinate at 9:15 AM ET, Mon-Fri")
 
-    # ── Jobs 1-3: Meta Engine runs (scan + report + trade) ──
+    # ── Jobs 1-2: Meta Engine runs (scan + report + trade) ──
     # Labels map index → descriptive name for logging and trade DB
-    session_labels = {0: "PreMarket", 1: "Morning", 2: "Afternoon"}
+    session_labels = {0: "Morning", 1: "Afternoon"}
     for idx, run_time in enumerate(run_times):
         hour, minute = map(int, run_time.split(":"))
         label = session_labels.get(idx, f"Session-{idx+1}")
@@ -255,7 +294,7 @@ def start_scheduler():
         )
         logger.info(f"  ✅ Job scheduled: {label} at {run_time} ET, Mon-Fri")
 
-    # ── Job 3: Mid-day position check (12:00 PM) ──
+    # ── Job 4: Mid-day position check (12:00 PM) ──
     scheduler.add_job(
         _midday_position_check,
         trigger=CronTrigger(
@@ -268,6 +307,22 @@ def start_scheduler():
         misfire_grace_time=3600,
     )
     logger.info("  ✅ Job scheduled: Position check at 12:00 PM ET, Mon-Fri")
+
+    # ── Job 5: Automatic winner check (every 30 minutes during market hours) ──
+    # Institutional-grade: Checks for profitable picks >50% and posts winner updates
+    # Runs every 30 minutes from 9:30 AM - 4:00 PM ET on trading days
+    # The function itself checks if it's market hours, so we can schedule it every 30 min
+    scheduler.add_job(
+        _auto_check_winners,
+        trigger=IntervalTrigger(
+            minutes=30,
+            timezone=EST,
+        ),
+        id="auto_winner_check",
+        name="Auto Winner Check (every 30 min, 9:30 AM - 4:00 PM ET)",
+        misfire_grace_time=1800,  # 30 min grace period
+    )
+    logger.info("  ✅ Job scheduled: Auto winner check every 30 min (9:30 AM - 4:00 PM ET), Mon-Fri")
 
     # If Mac is currently awake and it's market hours, start caffeinate now
     now_et = datetime.now(EST)

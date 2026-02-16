@@ -53,7 +53,7 @@ def generate_md_report(
     lines = []
     lines.append("# 🏛️ Meta Engine Daily Report")
     lines.append(f"**Date:** {datetime.now().strftime('%B %d, %Y %I:%M %p ET')}")
-    lines.append(f"**Run Type:** Scheduled (9:21 AM / 9:50 AM / 3:15 PM ET)")
+    lines.append(f"**Run Type:** Scheduled (9:35 AM / 3:15 PM ET)")
     lines.append("")
 
     # Signal freshness summary — warn if data is stale
@@ -82,6 +82,38 @@ def generate_md_report(
         for w in freshness_warnings:
             lines.append(f"- {w}")
         lines.append("")
+
+    # Market Direction Prediction
+    try:
+        from analysis.market_direction_predictor import MarketDirectionPredictor
+        predictor = MarketDirectionPredictor()
+        hour = datetime.now().hour
+        timeframe = "today" if hour < 12 else "tomorrow"
+        prediction = predictor.predict_market_direction(timeframe=timeframe)
+
+        header_txt = "Market Direction Today" if timeframe == "today" else "Tomorrow Market Direction"
+        direction_label = prediction.get("direction_label", "⚪ Flat")
+        conf_pct = prediction.get("confidence_pct", 0)
+        rationale = prediction.get("rationale", "")
+        composite = prediction.get("composite_score", 0)
+        is_choppy = prediction.get("is_choppy", False)
+
+        lines.append(f"### 🌤️ {header_txt}")
+        lines.append("")
+        lines.append(f"**{direction_label}**")
+        lines.append(f"- Confidence: {conf_pct:.0f}% | Composite: {composite:+.4f}"
+                      f"{'  | ⚠️ Choppy' if is_choppy else ''}")
+        lines.append(f"- {rationale}")
+        lines.append("")
+
+        key_signals = prediction.get("signals", [])[:6]
+        if key_signals:
+            lines.append("**Key Signals:**")
+            for sig in key_signals:
+                lines.append(f"- {sig}")
+            lines.append("")
+    except Exception:
+        pass
 
     lines.append("---")
     lines.append("")

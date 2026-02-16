@@ -1,0 +1,546 @@
+/Users/chavala/Meta Engine/venv/lib/python3.9/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+================================================================================
+ENHANCED INSTITUTIONAL-GRADE TOP 10 PICKS ANALYSIS
+Monday 9:35 AM EST to Thursday 3:15 PM EST
+================================================================================
+
+📅 Analysis Period: 2026-02-09 9:35 AM EST to 2026-02-12 3:15 PM EST
+
+📊 Loading Top 10 picks from cross_analysis files...
+   Found 60 total picks across all scans
+
+💰 Loading trade data from database...
+   Found trades for 29 unique symbol+type combinations
+
+📈 Fetching stock price data from Polygon API...
+   (This may take a minute due to API rate limits)
+
+   [1/29] Fetching AMD... ✅ $205.94
+   [2/29] Fetching AMAT... ✅ $328.39
+   [3/29] Fetching TEM... ✅ $50.78
+   [4/29] Fetching AFRM... ✅ $49.76
+   [5/29] Fetching COST... ✅ $998.86
+   [6/29] Fetching ADBE... ✅ $262.50
+   [7/29] Fetching OSCR... ✅ $13.71
+   [8/29] Fetching CCL... ✅ $32.60
+   [9/29] Fetching AMZN... ✅ $199.60
+   [10/29] Fetching MRVL... ✅ $78.23
+   [11/29] Fetching LMT... ✅ $637.43
+   [12/29] Fetching SHOP... ✅ $110.66
+   [13/29] Fetching UPST... ✅ $30.19
+   [14/29] Fetching TCOM... ✅ $54.46
+   [15/29] Fetching IONQ... ✅ $31.30
+   [16/29] Fetching UNH... ✅ $284.37
+   [17/29] Fetching GEV... ✅ $816.56
+   [18/29] Fetching GOOG... ✅ $309.37
+   [19/29] Fetching GDX... ✅ $98.28
+   [20/29] Fetching LRCX... ✅ $231.29
+   [21/29] Fetching NET... ✅ $185.17
+   [22/29] Fetching NVDA... ✅ $186.94
+   [23/29] Fetching AVGO... ✅ $331.17
+   [24/29] Fetching CRM... ✅ $185.43
+   [25/29] Fetching ZS... ✅ $170.90
+   [26/29] Fetching GOOGL... ✅ $309.00
+   [27/29] Fetching CHWY... ✅ $24.29
+   [28/29] Fetching TEAM... ✅ $86.48
+   [29/29] Fetching TSLA... ✅ $417.07
+
+🔍 Analyzing each pick with price data...
+
+================================================================================
+SUMMARY STATISTICS
+================================================================================
+
+📈 Total Picks Analyzed: 60
+   ✅ Winners (≥50%): 5 (8.3%)
+   ❌ Losers (<0%): 34 (56.7%)
+   ➖ Breakeven (0-50%): 21 (35.0%)
+   ⚠️  No Price Data: 0 (0.0%)
+
+📊 Return Source:
+   Actual Trades: 10
+   Theoretical (stock move): 50
+
+🏆 Winners:
+   Average Return: +189.6%
+   Best: UNH +223.8% (ACTUAL_TRADE)
+
+📉 Losers:
+   Average Return: -12.3%
+   Worst: CHWY -59.4% (ACTUAL_TRADE)
+
+================================================================================
+DETAILED PICK-BY-PICK ANALYSIS
+================================================================================
+
+1. ✅ UNH CALL — WINNER (+223.8%) [ACTUAL_TRADE]
+   Scan: 2026-02-11 15:15:33 EST (PM) | Engine: Moonshot
+   Score: 0.943 | ORM: 0.718
+   Stock: $278.74 → $284.37 (+2.0%)
+   Trade: Entry $0.57 → Current $1.36 (open)
+   ✅ Winner Factors:
+      • HIGH_ORM_SCORE (0.72)
+      • STRONG_SIGNAL_COUNT (8 signals)
+      • HIGH_BASE_SCORE (0.943)
+      • TOP_ORM_FACTOR: iv_expansion (1.00)
+
+2. ✅ UNH CALL — WINNER (+223.8%) [ACTUAL_TRADE]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: Moonshot
+   Score: 1.000 | ORM: 0.718
+   Stock: $284.30 → $284.37 (+0.0%)
+   Trade: Entry $0.57 → Current $1.36 (open)
+   ✅ Winner Factors:
+      • HIGH_ORM_SCORE (0.72)
+      • STRONG_SIGNAL_COUNT (8 signals)
+      • HIGH_BASE_SCORE (1.000)
+      • TOP_ORM_FACTOR: iv_expansion (1.00)
+
+3. ✅ UNH CALL — WINNER (+223.8%) [ACTUAL_TRADE]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: Moonshot
+   Score: 1.000 | ORM: 0.718
+   Stock: $284.30 → $284.37 (+0.0%)
+   Trade: Entry $0.57 → Current $1.36 (open)
+   ✅ Winner Factors:
+      • HIGH_ORM_SCORE (0.72)
+      • STRONG_SIGNAL_COUNT (8 signals)
+      • HIGH_BASE_SCORE (1.000)
+      • TOP_ORM_FACTOR: iv_expansion (1.00)
+
+4. ✅ AFRM PUT — WINNER (+209.5%) [ACTUAL_TRADE]
+   Scan: 2026-02-11 15:15:33 EST (PM) | Engine: PutsEngine
+   Score: 0.830 | ORM: 0.000
+   Stock: $56.30 → $49.76 (-11.6%)
+   Trade: Entry $1.68 → Current $5.20 (closed)
+   ✅ Winner Factors:
+      • STRONG_SIGNAL_COUNT (4 signals)
+      • HIGH_BASE_SCORE (0.830)
+      • STRONG_STOCK_MOVE: -11.6%
+
+5. ✅ MRVL PUT — WINNER (+67.0%) [ACTUAL_TRADE]
+   Scan: 2026-02-11 15:15:33 EST (PM) | Engine: PutsEngine
+   Score: 0.862 | ORM: 0.693
+   Stock: $81.32 → $78.23 (-3.8%)
+   Trade: Entry $0.88 → Current $1.47 (open)
+   ✅ Winner Factors:
+      • STRONG_SIGNAL_COUNT (5 signals)
+      • HIGH_BASE_SCORE (0.862)
+      • TOP_ORM_FACTOR: dealer_position (1.00)
+
+6. ➖ TCOM PUT — BREAKEVEN (+23.0%) [THEORETICAL]
+   Scan: 2026-02-11 15:15:33 EST (PM) | Engine: PutsEngine
+   Score: 0.785 | ORM: 0.000
+   Stock: $57.78 → $54.46 (-5.7%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+
+7. ➖ TEM PUT — BREAKEVEN (+16.9%) [THEORETICAL]
+   Scan: 2026-02-11 15:15:33 EST (PM) | Engine: PutsEngine
+   Score: 0.793 | ORM: 0.743
+   Stock: $53.02 → $50.78 (-4.2%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+
+8. ➖ AMAT PUT — BREAKEVEN (+15.9%) [THEORETICAL]
+   Scan: 2026-02-11 15:15:33 EST (PM) | Engine: PutsEngine
+   Score: 0.785 | ORM: 0.000
+   Stock: $341.95 → $328.39 (-4.0%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+
+9. ➖ ADBE CALL — BREAKEVEN (+6.9%) [THEORETICAL]
+   Scan: 2026-02-11 15:15:33 EST (PM) | Engine: Moonshot
+   Score: 0.932 | ORM: 0.718
+   Stock: $258.07 → $262.50 (+1.7%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+
+10. ➖ GEV PUT — BREAKEVEN (+5.4%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: PutsEngine
+   Score: 0.835 | ORM: 0.000
+   Stock: $827.65 → $816.56 (-1.3%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+
+11. ➖ GEV PUT — BREAKEVEN (+5.4%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: PutsEngine
+   Score: 0.835 | ORM: 0.000
+   Stock: $827.65 → $816.56 (-1.3%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+
+12. ➖ ADBE CALL — BREAKEVEN (+5.2%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: Moonshot
+   Score: 0.873 | ORM: 0.718
+   Stock: $259.11 → $262.50 (+1.3%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+
+13. ➖ ADBE CALL — BREAKEVEN (+5.2%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: Moonshot
+   Score: 0.873 | ORM: 0.718
+   Stock: $259.11 → $262.50 (+1.3%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+
+14. ➖ TEAM PUT — BREAKEVEN (+3.2%) [THEORETICAL]
+   Scan: 2026-02-11 15:15:33 EST (PM) | Engine: PutsEngine
+   Score: 0.784 | ORM: 0.643
+   Stock: $87.18 → $86.48 (-0.8%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+
+15. ➖ UPST PUT — BREAKEVEN (+2.9%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: PutsEngine
+   Score: 0.847 | ORM: 0.660
+   Stock: $30.41 → $30.19 (-0.7%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+
+16. ➖ UPST PUT — BREAKEVEN (+2.9%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: PutsEngine
+   Score: 0.847 | ORM: 0.660
+   Stock: $30.41 → $30.19 (-0.7%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+
+17. ➖ TSLA CALL — BREAKEVEN (+1.7%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: Moonshot
+   Score: 0.959 | ORM: 0.667
+   Stock: $415.29 → $417.07 (+0.4%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+
+18. ➖ TSLA CALL — BREAKEVEN (+1.7%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: Moonshot
+   Score: 0.959 | ORM: 0.667
+   Stock: $415.29 → $417.07 (+0.4%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+
+19. ➖ GOOGL PUT — BREAKEVEN (+1.7%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: PutsEngine
+   Score: 0.875 | ORM: 0.722
+   Stock: $310.28 → $309.00 (-0.4%)
+   Trade: Entry $0.00 → Current $0.00 (pending)
+
+20. ➖ GOOGL PUT — BREAKEVEN (+1.7%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: PutsEngine
+   Score: 0.875 | ORM: 0.722
+   Stock: $310.28 → $309.00 (-0.4%)
+   Trade: Entry $0.00 → Current $0.00 (pending)
+
+21. ➖ GOOG PUT — BREAKEVEN (+1.6%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: PutsEngine
+   Score: 0.882 | ORM: 0.738
+   Stock: $310.59 → $309.37 (-0.4%)
+   Trade: Entry $0.00 → Current $0.00 (pending)
+
+22. ➖ GOOG PUT — BREAKEVEN (+1.6%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: PutsEngine
+   Score: 0.882 | ORM: 0.738
+   Stock: $310.59 → $309.37 (-0.4%)
+   Trade: Entry $0.00 → Current $0.00 (pending)
+
+23. ➖ AMZN CALL — BREAKEVEN (+1.4%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: Moonshot
+   Score: 0.995 | ORM: 0.712
+   Stock: $198.92 → $199.60 (+0.3%)
+   Trade: Entry $1.20 → Current $0.59 (closed)
+
+24. ➖ AMZN CALL — BREAKEVEN (+1.4%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: Moonshot
+   Score: 0.995 | ORM: 0.712
+   Stock: $198.92 → $199.60 (+0.3%)
+   Trade: Entry $1.20 → Current $0.59 (closed)
+
+25. ➖ CCL PUT — BREAKEVEN (+0.3%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: PutsEngine
+   Score: 0.850 | ORM: 0.667
+   Stock: $32.62 → $32.60 (-0.1%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+
+26. ➖ CCL PUT — BREAKEVEN (+0.3%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: PutsEngine
+   Score: 0.850 | ORM: 0.667
+   Stock: $32.62 → $32.60 (-0.1%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+
+27. ❌ NET PUT — LOSER (-0.3%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: PutsEngine
+   Score: 0.846 | ORM: 0.657
+   Stock: $185.04 → $185.17 (+0.1%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+   ❌ Loser Reasons:
+      • NO_TRADE_EXECUTED
+
+28. ❌ NET PUT — LOSER (-0.3%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: PutsEngine
+   Score: 0.846 | ORM: 0.657
+   Stock: $185.04 → $185.17 (+0.1%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+   ❌ Loser Reasons:
+      • NO_TRADE_EXECUTED
+
+29. ❌ IONQ CALL — LOSER (-0.6%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: Moonshot
+   Score: 0.880 | ORM: 0.660
+   Stock: $31.35 → $31.30 (-0.2%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+   ❌ Loser Reasons:
+      • NO_TRADE_EXECUTED
+
+30. ❌ IONQ CALL — LOSER (-0.6%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: Moonshot
+   Score: 0.880 | ORM: 0.660
+   Stock: $31.35 → $31.30 (-0.2%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+   ❌ Loser Reasons:
+      • NO_TRADE_EXECUTED
+
+31. ❌ AMD CALL — LOSER (-0.9%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: Moonshot
+   Score: 1.000 | ORM: 0.698
+   Stock: $206.42 → $205.94 (-0.2%)
+   Trade: Entry $0.00 → Current $0.00 (pending)
+
+32. ❌ AMD CALL — LOSER (-0.9%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: Moonshot
+   Score: 1.000 | ORM: 0.698
+   Stock: $206.42 → $205.94 (-0.2%)
+   Trade: Entry $0.00 → Current $0.00 (pending)
+
+33. ❌ GOOGL CALL — LOSER (-1.7%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: Moonshot
+   Score: 0.991 | ORM: 0.725
+   Stock: $310.28 → $309.00 (-0.4%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+   ❌ Loser Reasons:
+      • NO_TRADE_EXECUTED
+
+34. ❌ GOOGL CALL — LOSER (-1.7%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: Moonshot
+   Score: 0.991 | ORM: 0.725
+   Stock: $310.28 → $309.00 (-0.4%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+   ❌ Loser Reasons:
+      • NO_TRADE_EXECUTED
+
+35. ❌ GOOGL CALL — LOSER (-2.4%) [THEORETICAL]
+   Scan: 2026-02-11 15:15:33 EST (PM) | Engine: Moonshot
+   Score: 0.876 | ORM: 0.725
+   Stock: $310.89 → $309.00 (-0.6%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+   ❌ Loser Reasons:
+      • NO_TRADE_EXECUTED
+
+36. ❌ OSCR PUT — LOSER (-2.5%) [THEORETICAL]
+   Scan: 2026-02-11 15:15:33 EST (PM) | Engine: PutsEngine
+   Score: 0.800 | ORM: 0.555
+   Stock: $13.62 → $13.71 (+0.6%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+   ❌ Loser Reasons:
+      • NO_TRADE_EXECUTED
+
+37. ❌ SHOP PUT — LOSER (-2.8%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: PutsEngine
+   Score: 0.872 | ORM: 0.715
+   Stock: $109.89 → $110.66 (+0.7%)
+   Trade: Entry $0.00 → Current $0.00 (pending)
+
+38. ❌ SHOP PUT — LOSER (-2.8%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: PutsEngine
+   Score: 0.872 | ORM: 0.715
+   Stock: $109.89 → $110.66 (+0.7%)
+   Trade: Entry $0.00 → Current $0.00 (pending)
+
+39. ❌ NVDA CALL — LOSER (-2.8%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: Moonshot
+   Score: 0.945 | ORM: 0.628
+   Stock: $188.27 → $186.94 (-0.7%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+   ❌ Loser Reasons:
+      • NO_TRADE_EXECUTED
+
+40. ❌ NVDA CALL — LOSER (-2.8%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: Moonshot
+   Score: 0.945 | ORM: 0.628
+   Stock: $188.27 → $186.94 (-0.7%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+   ❌ Loser Reasons:
+      • NO_TRADE_EXECUTED
+
+41. ❌ ZS PUT — LOSER (-3.4%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: PutsEngine
+   Score: 0.835 | ORM: 0.000
+   Stock: $169.48 → $170.90 (+0.8%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+   ❌ Loser Reasons:
+      • NO_TRADE_EXECUTED
+
+42. ❌ ZS PUT — LOSER (-3.4%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: PutsEngine
+   Score: 0.835 | ORM: 0.000
+   Stock: $169.48 → $170.90 (+0.8%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+   ❌ Loser Reasons:
+      • NO_TRADE_EXECUTED
+
+43. ❌ LMT PUT — LOSER (-4.0%) [THEORETICAL]
+   Scan: 2026-02-11 15:15:33 EST (PM) | Engine: PutsEngine
+   Score: 0.785 | ORM: 0.000
+   Stock: $631.12 → $637.43 (+1.0%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+   ❌ Loser Reasons:
+      • NO_TRADE_EXECUTED
+
+44. ❌ LRCX CALL — LOSER (-5.3%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: Moonshot
+   Score: 0.916 | ORM: 0.648
+   Stock: $234.41 → $231.29 (-1.3%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+   ❌ Loser Reasons:
+      • NO_TRADE_EXECUTED
+
+45. ❌ LRCX CALL — LOSER (-5.3%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: Moonshot
+   Score: 0.916 | ORM: 0.648
+   Stock: $234.41 → $231.29 (-1.3%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+   ❌ Loser Reasons:
+      • NO_TRADE_EXECUTED
+
+46. ❌ ADBE PUT — LOSER (-5.5%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: PutsEngine
+   Score: 0.843 | ORM: 0.650
+   Stock: $258.93 → $262.50 (+1.4%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+   ❌ Loser Reasons:
+      • NO_TRADE_EXECUTED
+
+47. ❌ ADBE PUT — LOSER (-5.5%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: PutsEngine
+   Score: 0.843 | ORM: 0.650
+   Stock: $258.93 → $262.50 (+1.4%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+   ❌ Loser Reasons:
+      • NO_TRADE_EXECUTED
+
+48. ❌ LRCX CALL — LOSER (-7.2%) [THEORETICAL]
+   Scan: 2026-02-11 15:15:33 EST (PM) | Engine: Moonshot
+   Score: 0.937 | ORM: 0.648
+   Stock: $235.54 → $231.29 (-1.8%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+   ❌ Loser Reasons:
+      • NO_TRADE_EXECUTED
+
+49. ❌ COST PUT — LOSER (-7.7%) [THEORETICAL]
+   Scan: 2026-02-11 15:15:33 EST (PM) | Engine: PutsEngine
+   Score: 0.785 | ORM: 0.000
+   Stock: $980.09 → $998.86 (+1.9%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+   ❌ Loser Reasons:
+      • NO_TRADE_EXECUTED
+
+50. ❌ TEAM PUT — LOSER (-8.8%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: PutsEngine
+   Score: 0.839 | ORM: 0.643
+   Stock: $84.62 → $86.48 (+2.2%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+   ❌ Loser Reasons:
+      • NO_TRADE_EXECUTED
+
+51. ❌ TEAM PUT — LOSER (-8.8%) [THEORETICAL]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: PutsEngine
+   Score: 0.839 | ORM: 0.643
+   Stock: $84.62 → $86.48 (+2.2%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+   ❌ Loser Reasons:
+      • NO_TRADE_EXECUTED
+
+52. ❌ TSLA CALL — LOSER (-9.1%) [THEORETICAL]
+   Scan: 2026-02-11 15:15:33 EST (PM) | Engine: Moonshot
+   Score: 0.887 | ORM: 0.667
+   Stock: $426.83 → $417.07 (-2.3%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+   ❌ Loser Reasons:
+      • NO_TRADE_EXECUTED
+
+53. ❌ AMZN CALL — LOSER (-10.0%) [THEORETICAL]
+   Scan: 2026-02-11 15:15:33 EST (PM) | Engine: Moonshot
+   Score: 0.941 | ORM: 0.712
+   Stock: $204.70 → $199.60 (-2.5%)
+   Trade: Entry $1.20 → Current $0.59 (closed)
+
+54. ❌ AMD CALL — LOSER (-12.8%) [THEORETICAL]
+   Scan: 2026-02-11 15:15:33 EST (PM) | Engine: Moonshot
+   Score: 0.935 | ORM: 0.698
+   Stock: $212.75 → $205.94 (-3.2%)
+   Trade: Entry $0.00 → Current $0.00 (pending)
+
+55. ❌ GDX CALL — LOSER (-26.3%) [THEORETICAL]
+   Scan: 2026-02-11 15:15:33 EST (PM) | Engine: Moonshot
+   Score: 0.868 | ORM: 0.623
+   Stock: $105.20 → $98.28 (-6.6%)
+   Trade: NOT EXECUTED (theoretical return based on stock move)
+   ❌ Loser Reasons:
+      • NO_TRADE_EXECUTED
+
+56. ❌ CRM CALL — LOSER (-53.3%) [ACTUAL_TRADE]
+   Scan: 2026-02-11 15:15:33 EST (PM) | Engine: Moonshot
+   Score: 0.944 | ORM: 0.743
+   Stock: $185.00 → $185.43 (+0.2%)
+   Trade: Entry $1.10 → Current $0.47 (closed)
+
+57. ❌ CRM CALL — LOSER (-53.3%) [ACTUAL_TRADE]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: Moonshot
+   Score: 0.884 | ORM: 0.743
+   Stock: $181.84 → $185.43 (+2.0%)
+   Trade: Entry $1.10 → Current $0.47 (closed)
+
+58. ❌ CRM CALL — LOSER (-53.3%) [ACTUAL_TRADE]
+   Scan: 2026-02-12 15:15:34 EST (PM) | Engine: Moonshot
+   Score: 0.884 | ORM: 0.743
+   Stock: $181.84 → $185.43 (+2.0%)
+   Trade: Entry $1.10 → Current $0.47 (closed)
+
+59. ❌ AVGO CALL — LOSER (-53.5%) [ACTUAL_TRADE]
+   Scan: 2026-02-11 15:15:33 EST (PM) | Engine: Moonshot
+   Score: 0.979 | ORM: 0.703
+   Stock: $343.25 → $331.17 (-3.5%)
+   Trade: Entry $4.30 → Current $2.00 (closed)
+
+60. ❌ CHWY PUT — LOSER (-59.4%) [ACTUAL_TRADE]
+   Scan: 2026-02-11 15:15:33 EST (PM) | Engine: PutsEngine
+   Score: 0.830 | ORM: 0.000
+   Stock: $26.08 → $24.29 (-6.9%)
+   Trade: Entry $0.64 → Current $0.26 (closed)
+   ❌ Loser Reasons:
+      • LOW_ORM_SCORE (0.00 - poor options setup)
+
+================================================================================
+ROOT CAUSE ANALYSIS: LOSERS
+================================================================================
+
+Top Loser Reasons:
+   • NO_TRADE_EXECUTED: 23 picks
+   • LOW_ORM_SCORE: 1 picks
+
+Losers by Engine:
+   PutsEngine: 14 losers
+   Moonshot: 20 losers
+
+================================================================================
+SUCCESS FACTOR ANALYSIS: WINNERS
+================================================================================
+
+Top Winner Factors:
+   • STRONG_SIGNAL_COUNT: 5 picks
+   • HIGH_BASE_SCORE: 5 picks
+   • HIGH_ORM_SCORE: 3 picks
+   • TOP_ORM_FACTOR: iv_expansion: 3 picks
+   • TOP_ORM_FACTOR: dealer_position: 1 picks
+   • STRONG_STOCK_MOVE: -11.6%: 1 picks
+
+Winners by Engine:
+   PutsEngine: 2 winners
+   Moonshot: 3 winners
+
+================================================================================
+INSTITUTIONAL RECOMMENDATIONS
+================================================================================
+
+   1. ORM Score Gate: 5 losers had ORM < 0.40. Consider minimum ORM threshold of 0.45 for Top 10 selection.
+   4. ORM Success Pattern: 3/5 winners had ORM ≥ 0.70. ORM is a strong predictor of success.
+   5. Trade Execution Gap: 38 picks (63.3%) had no trades executed. Review order placement logic and Alpaca connection.
+
+================================================================================
+Analysis Complete
+================================================================================

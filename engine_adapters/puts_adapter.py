@@ -6,10 +6,14 @@ Imports PutsEngine modules directly without modifying the original codebase.
 
 FEB 11 ADDITION — Options Return Multiplier (ORM):
   The meta-score ranks by "will it drop?".  The ORM ranks by
-  "will the PUT OPTION pay 3x–10x?".  Final ranking blends both:
-      final_score = meta_score * 0.55 + ORM * 0.45
-  This ensures the Top 10 list surfaces stocks with the highest
-  expected OPTIONS return, not just the highest probability of decline.
+  "will the PUT OPTION pay 3x–10x?".  Final ranking blends both.
+
+  FEB 16 UPDATE — Status-aware ORM blending:
+      computed ORM:  final = meta × 0.82 + ORM × 0.18
+      default ORM:   final = meta × 0.92 + ORM × 0.08
+      missing ORM:   final = meta × 1.00 (no ORM blend)
+  This prevents "institutional large-cap quality" from suppressing
+  volatile names that generate the convex winners.
 
   ORM sub-factors (8 total):
     1. Gamma Leverage         (20%) — negative GEX = amplified moves
@@ -37,8 +41,8 @@ import logging
 # If it exceeds this, fall back to cached data so the pipeline continues.
 # FEB 10 FIX: Reduced from 300s (5 min) to 30s.
 # Rationale: PutsEngine's scheduler already scans all 361 tickers at 9:00 AM
-# and saves fresh results to scheduled_scan_results.json by ~9:21 AM.
-# At 9:35 AM, Meta Engine should quickly fall back to that cached data (only 14 min old)
+# and saves fresh results to scheduled_scan_results.json by ~9:00 AM.
+# At 9:35 AM, Meta Engine should quickly fall back to that cached data (only 35 min old)
 # instead of doing a redundant 25-minute live scan.
 # Similarly, the 2:45 PM market_pulse scan feeds the 3:15 PM Meta Engine run.
 LIVE_SCAN_TIMEOUT_SEC = 30  # 30 seconds — then fall back to cached data
@@ -220,7 +224,7 @@ def _fallback_from_cached_results(top_n: int = 10) -> List[Dict[str, Any]]:
         if results_file.exists():
             with open(results_file) as f:
                 data = json.load(f)
-
+            
             # Calculate data age from file modification time
             file_mtime = datetime.fromtimestamp(results_file.stat().st_mtime)
             data_age_days = (datetime.now() - file_mtime).days
@@ -291,7 +295,7 @@ def _fallback_from_cached_results(top_n: int = 10) -> List[Dict[str, Any]]:
                             tier2_age = (datetime.now() - scan_dt).days if scan_dt else -1
                         except (ValueError, TypeError):
                             tier2_age = -1
-
+                        
                         for engine_key, picks in [("gamma_drain", gamma), ("distribution", dist), ("liquidity", liq)]:
                             for c in picks:
                                 all_candidates.append({
@@ -393,6 +397,53 @@ def _fallback_from_cached_results(top_n: int = 10) -> List[Dict[str, Any]]:
         except Exception as e:
             logger.debug(f"  Tier 4 failed: {e}")
     
+    # ── Universe scanner catch-all (FEB 16 v5.2) ────────────────────
+    # Catches VKTX/CVNA-type movers with pre-market gaps, volume spikes,
+    # or UW unusual activity that have ZERO presence in other data sources.
+    try:
+        from engine_adapters.universe_scanner import scan_universe_catchall
+        import os as _os
+        _poly_key = _os.getenv("POLYGON_API_KEY", "") or _os.getenv("MASSIVE_API_KEY", "")
+        _uw_key = _os.getenv("UNUSUAL_WHALES_API_KEY", "")
+        univ_candidates = scan_universe_catchall(
+            polygon_api_key=_poly_key,
+            uw_api_key=_uw_key,
+            direction="bearish",
+        )
+        if univ_candidates:
+            existing_symbols = {c.get("symbol", "") for c in all_candidates}
+            univ_merged = 0
+            for uc in univ_candidates:
+                if uc["symbol"] not in existing_symbols:
+                    all_candidates.append(uc)
+                    existing_symbols.add(uc["symbol"])
+                    univ_merged += 1
+            if univ_merged:
+                logger.info(
+                    f"🌐 Merged {univ_merged} universe-scanner (bearish) candidates "
+                    f"into puts pool (total: {len(all_candidates)})"
+                )
+    except Exception as e:
+        logger.debug(f"  Universe scanner merge (puts) failed: {e}")
+
+    # ── Universe gate — only allow tickers in the static universe ────
+    try:
+        from putsengine.config import EngineConfig as _EC
+        static_universe = set(_EC.get_all_tickers())
+    except (ImportError, AttributeError, Exception) as _e:
+        logger.debug(f"  Universe gate: EngineConfig unavailable ({_e}), skipping filter")
+        static_universe = set()
+    if static_universe:
+        before = len(all_candidates)
+        all_candidates = [c for c in all_candidates if c.get("symbol", "") in static_universe]
+        filtered_out = before - len(all_candidates)
+        if filtered_out:
+            logger.info(
+                f"  🚫 Universe filter: {filtered_out} candidates removed "
+                f"(not in {len(static_universe)}-ticker static universe), "
+                f"{len(all_candidates)} remain"
+            )
+    
     # ── Deduplicate and return ───────────────────────────────────────
     if not all_candidates:
         logger.warning("No PutsEngine data found across all tiers")
@@ -409,11 +460,19 @@ def _fallback_from_cached_results(top_n: int = 10) -> List[Dict[str, Any]]:
     # ── Enrich missing prices / uniform scores from supplementary data ──
     deduped = _enrich_candidates(deduped, top_n)
     
-    logger.info(f"🔴 PutsEngine (cached via {source_used}): {len(deduped)} candidates, returning top {top_n}")
-    for i, p in enumerate(deduped[:top_n], 1):
-        logger.info(f"  #{i} {p['symbol']} — Score: {p['score']:.3f} — ${p.get('price', 0):.2f}")
+    final_picks = deduped[:top_n]
+    n_returning = len(final_picks)
+    logger.info(
+        f"🔴 PutsEngine (cached via {source_used}): {len(deduped)} after Policy B gates, "
+        f"returning {n_returning} picks"
+        + (f" ⚠️ LOW OPPORTUNITY DAY" if n_returning < 3 else "")
+    )
+    for i, p in enumerate(final_picks, 1):
+        mps_tag = f" MPS={p.get('_move_potential_score', 0):.2f}" if p.get('_move_potential_score') else ""
+        sig_cnt = len(p.get('signals', [])) if isinstance(p.get('signals'), list) else 0
+        logger.info(f"  #{i} {p['symbol']} — Score: {p['score']:.3f} — ${p.get('price', 0):.2f}{mps_tag} Sig={sig_cnt}")
     
-    return deduped[:top_n]
+    return final_picks
 
 
 def _load_ews_scores() -> Dict[str, Dict[str, Any]]:
@@ -1044,6 +1103,9 @@ def _compute_options_return_multiplier(
     # good bearish picks from being nuked just because TradeNova
     # didn't scan them.  The default is intentionally below-average
     # so stocks WITH good UW data still rank higher.
+    #
+    # FEB 15 FIX: Now returns 3-tuple including has_real_data flag
+    # so callers can distinguish "computed from data" vs "default".
     has_any_data = bool(sym_gex or sym_iv or sym_oi or sym_flow or sym_dp)
     if not has_any_data:
         default = 0.35
@@ -1051,7 +1113,7 @@ def _compute_options_return_multiplier(
                         "delta_sweet", "short_dte", "vol_regime",
                         "dealer_position", "liquidity"]:
             factors[f_name] = default
-        return default, factors
+        return default, factors, False  # False = no real data used
 
     # ── 1. GAMMA LEVERAGE (weight 0.20) ─────────────────────────────
     # Negative net GEX = dealers are SHORT gamma → every stock move
@@ -1357,17 +1419,20 @@ def _compute_options_return_multiplier(
     factors["liquidity"] = min(liq_score, 1.0)
 
     # ── WEIGHTED COMBINATION ──────────────────────────────────────────
+    # FEB 12 UPDATE: Increased IV expansion (0.15→0.20) and dealer positioning (0.10→0.15)
+    # based on institutional analysis: UNH (IV expansion=1.00) and MRVL (dealer_position=1.00) were top winners
+    # Adjusted gamma_leverage (0.20→0.15) to maintain sum=1.0
     orm = (
-        factors["gamma_leverage"]  * 0.20 +
-        factors["iv_expansion"]    * 0.15 +
+        factors["gamma_leverage"]  * 0.15 +  # REDUCED from 0.20 to balance weights
+        factors["iv_expansion"]    * 0.20 +  # INCREASED from 0.15 (UNH success case: IV expansion = 1.00)
         factors["oi_positioning"]  * 0.15 +
         factors["delta_sweet"]     * 0.10 +
         factors["short_dte"]       * 0.10 +
         factors["vol_regime"]      * 0.10 +
-        factors["dealer_position"] * 0.10 +
-        factors["liquidity"]       * 0.10
+        factors["dealer_position"] * 0.15 +  # INCREASED from 0.10 (MRVL success case: dealer_position = 1.00)
+        factors["liquidity"]       * 0.05   # REDUCED from 0.10 to balance weights
     )
-    return max(0.0, min(orm, 1.0)), factors
+    return max(0.0, min(orm, 1.0)), factors, True  # True = real data used
 
 
 def _validate_picks(picks: List[Dict[str, Any]], source: str) -> None:
@@ -1841,6 +1906,66 @@ def _enrich_candidates(candidates: List[Dict[str, Any]], top_n: int) -> List[Dic
         logger.info("  ✅ Scores well-differentiated — using raw PutsEngine ranking")
 
     # ==================================================================
+    # STEP 3b: SCORE INVERSION FIX (FEB 15, 2026)
+    # ==================================================================
+    # Backtest finding: fresh differentiated signals with moderate scores
+    # (0.50–0.80) OUTPERFORM cached uniform high scores (0.90+).
+    #
+    # When data is stale (data_age_days > 0) and raw scores cluster at
+    # 0.90+, the scores are artificially inflated by cached/uniform data.
+    # Deflating them ensures fresh moderate-conviction picks compete
+    # fairly against stale high-score picks.
+    #
+    # Penalty: up to 15% reduction based on staleness + uniformity
+    # ==================================================================
+    staleness_deflated = 0
+    stale_skipped = 0
+    for c in candidates[:price_fetch_count]:
+        raw_score = c.get("_raw_score", c.get("score", 0))
+        data_age = 0
+        # Detect staleness from data source
+        data_src = c.get("data_source", c.get("engine", ""))
+        if isinstance(data_src, str) and ("cache" in data_src.lower() or "fallback" in data_src.lower()):
+            data_age = max(data_age, 1)
+        # Also check for data_age_days field
+        data_age = max(data_age, c.get("data_age_days", 0) or 0)
+        # Check data_age_hours if available (more precise for <12h detection)
+        data_age_hours = c.get("data_age_hours", data_age * 24 if data_age > 0 else 0)
+
+        # ── HARD STALE DATA GATE (FEB 15, 2026) ─────────────────
+        # Backtest: picks with data >12h old underperformed significantly.
+        # Mark as stale so they can be deprioritized in gate filtering.
+        if data_age_hours > 12 or data_age > 0:
+            c["_data_stale"] = True
+            c["_data_age_hours"] = data_age_hours if data_age_hours > 0 else data_age * 24
+
+        # Only deflate if BOTH conditions are true:
+        #   1. Raw score >= 0.90 (likely inflated by cached uniform data)
+        #   2. Data is stale (from cache, not live scan)
+        if data_age > 0 and raw_score >= 0.90:
+            # Additional check: are signals generic/uniform?
+            sigs = c.get("signals", [])
+            n_sigs = len(sigs) if isinstance(sigs, list) else 0
+            # Fewer unique signals = more likely uniform/generic data
+            uniqueness_factor = min(n_sigs / 5.0, 1.0)  # 5+ signals = fully differentiated
+            # Staleness penalty: ENHANCED — scales more aggressively with age
+            # 12-24h: moderate penalty; >24h: heavy penalty
+            age_factor = min(data_age * 0.05, 0.15)  # Increased from 0.03 → 0.05
+            staleness_penalty = age_factor * (1.0 - uniqueness_factor * 0.5)
+            if staleness_penalty > 0.005:
+                c["score"] = max(c["score"] - staleness_penalty, 0.30)
+                c["_staleness_penalty"] = staleness_penalty
+                staleness_deflated += 1
+
+    if staleness_deflated > 0:
+        # Re-sort after deflation
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+        logger.info(
+            f"  📉 Score inversion fix: {staleness_deflated} stale high-score "
+            f"picks deflated (cached data with score ≥ 0.90)"
+        )
+
+    # ==================================================================
     # STEP 4: OPTIONS RETURN MULTIPLIER (ORM)
     # ==================================================================
     # ORM answers: "Will the PUT OPTION pay 3x–10x?"
@@ -1861,59 +1986,398 @@ def _enrich_candidates(candidates: List[Dict[str, Any]], top_n: int) -> List[Dic
         has_uw = False
         gex_data = iv_data = oi_data = flow_data = dp_data = {}
 
+    # ── FEB 15 FIX: Compute ORM for ALL candidates, ALWAYS ──────────
+    # Previous bug: ORM was only computed when has_uw=True and only for
+    # the top 30 candidates. After re-sorting, unenriched candidates
+    # could enter the top 10 without any ORM score. Additionally, when
+    # has_uw=False, NO gates were applied at all.
+    #
+    # Fix: Always enrich ALL candidates. When UW data is unavailable,
+    # set _orm_status="missing" (not "computed"). Gates always run.
+    orm_count = 0
+    orm_scores = []
+    orm_computed_count = 0  # Tracks candidates with REAL data ORM
+
+    # ── FEB 16 FIX: Status-aware ORM blending ──────────────────
+    # Backtest finding: ORM at 0.45 weight overweights "institutional
+    # quality" (large-cap tight spreads) and suppresses convex winners
+    # (volatile small/mid-caps with 5%+ move potential).
+    #
+    # New weight schedule (based on ORM status):
+    #   computed  → w_orm = 0.18  (real UW data — trust moderately)
+    #   default   → w_orm = 0.08  (no symbol data, fallback 0.35)
+    #   missing   → w_orm = 0.00  (no UW data at all — don't blend)
+    #   stale     → w_orm = 0.00  (stale snapshot — unreliable)
+    ORM_WEIGHT_COMPUTED = 0.18
+    ORM_WEIGHT_DEFAULT  = 0.08
+    ORM_WEIGHT_MISSING  = 0.00
+
     if has_uw:
-        logger.info("  🎯 Computing OPTIONS RETURN MULTIPLIER (ORM)...")
-        orm_count = 0
-        orm_scores = []
-        for c in candidates[:max(top_n * 3, 30)]:
+        logger.info("  🎯 Computing OPTIONS RETURN MULTIPLIER (ORM) for ALL candidates...")
+        for c in candidates:
             sym = c["symbol"]
             stock_px = c.get("price", 0)
-            orm, factors = _compute_options_return_multiplier(
+            orm, factors, has_real_data = _compute_options_return_multiplier(
                 sym, gex_data, iv_data, oi_data, flow_data, dp_data,
                 stock_price=stock_px,
             )
             c["_orm_score"] = orm
             c["_orm_factors"] = factors
+            if has_real_data:
+                c["_orm_status"] = "computed"
+                orm_computed_count += 1
+            else:
+                c["_orm_status"] = "default"
             orm_count += 1
             orm_scores.append(orm)
 
-            # Blend: final_score = meta × 0.55 + ORM × 0.45
+            # FEB 16: Status-aware ORM blending
+            # Higher-quality ORM data gets more weight; missing/stale = no weight.
+            orm_status = c["_orm_status"]
+            if orm_status == "computed":
+                w_orm = ORM_WEIGHT_COMPUTED
+            elif orm_status == "default":
+                w_orm = ORM_WEIGHT_DEFAULT
+            else:
+                w_orm = ORM_WEIGHT_MISSING
+            w_base = 1.0 - w_orm
+
             meta_score = c.get("meta_score", c["score"])
-            final = meta_score * 0.55 + orm * 0.45
+            final = meta_score * w_base + orm * w_orm
             c["score"] = max(0.0, min(final, 1.0))
+            c["_orm_weight_used"] = w_orm
 
         # Re-sort by final blended score
         candidates.sort(key=lambda x: x["score"], reverse=True)
-
-        # Compute ORM statistics
-        if orm_scores:
-            avg_orm = sum(orm_scores) / len(orm_scores)
-            max_orm = max(orm_scores)
-            min_orm = min(orm_scores)
-            logger.info(
-                f"  ✅ ORM applied to {orm_count} candidates "
-                f"(avg={avg_orm:.3f}, range={min_orm:.3f}–{max_orm:.3f})"
-            )
-
-        # Log final top 10 with ORM breakdown
-        logger.info(f"  📊 FINAL Top {min(top_n, len(candidates))} "
-                     f"(meta × 0.55 + ORM × 0.45):")
-        for i, c in enumerate(candidates[:top_n], 1):
-            meta = c.get("meta_score", 0)
-            orm = c.get("_orm_score", 0)
-            fcts = c.get("_orm_factors", {})
-            # Build compact factor string
-            top_factors = sorted(fcts.items(), key=lambda x: x[1], reverse=True)[:3]
-            factor_str = " ".join(f"{k[:3]}={v:.2f}" for k, v in top_factors)
-            logger.info(
-                f"    #{i:2d} {c['symbol']:6s} "
-                f"final={c['score']:.3f} "
-                f"(meta={meta:.3f} orm={orm:.3f}) "
-                f"[{factor_str}]"
-            )
     else:
+        # FEB 15 FIX: When UW data is completely unavailable, still
+        # set ORM fields so downstream code (gates, executor, cross-
+        # analyzer) always has consistent _orm_score and _orm_status.
         logger.info("  ℹ️ ORM: No UW options data available — "
-                     "using meta-score only for ranking")
+                     "setting _orm_status='missing' for all candidates")
+        for c in candidates:
+            c["_orm_score"] = 0.0
+            c["_orm_status"] = "missing"
+            c["_orm_factors"] = {}
+            c["_orm_weight_used"] = 0.0
+
+    # ══════════════════════════════════════════════════════════
+    # STEP 5: MOVE POTENTIAL SCORE (FEB 16, 2026)
+    # ══════════════════════════════════════════════════════════
+    # Winners cluster at |underlying move| ≥ 5%.  This score identifies
+    # names most likely to deliver those large moves, using ATR%,
+    # historical big-move frequency, and catalyst proximity.
+    #
+    # Implementation note: we compute MPS for the TOP candidates only
+    # (not all 200+) to avoid excessive Polygon API calls.
+    try:
+        from trading.move_potential import batch_compute_move_potential
+        
+        mps_candidates = candidates[:min(40, len(candidates))]
+        mps_symbols = [c["symbol"] for c in mps_candidates]
+        
+        # Re-use earnings_set if we computed it earlier
+        try:
+            _earnings_for_mps = _load_earnings_proximity()
+        except Exception:
+            _earnings_for_mps = set()
+        
+        logger.info(f"  📐 Computing MOVE POTENTIAL SCORE for top {len(mps_symbols)} candidates...")
+        mps_results = batch_compute_move_potential(
+            mps_symbols,
+            earnings_set=_earnings_for_mps,
+        )
+        
+        mps_applied = 0
+        for c in mps_candidates:
+            sym = c["symbol"]
+            if sym in mps_results:
+                mps_score, mps_components = mps_results[sym]
+                c["_move_potential_score"] = mps_score
+                c["_move_potential_components"] = mps_components
+                mps_applied += 1
+        
+        if mps_applied:
+            logger.info(
+                f"  ✅ Move Potential Score: {mps_applied} candidates enriched "
+                f"(avg={sum(c.get('_move_potential_score',0) for c in mps_candidates)/max(mps_applied,1):.3f})"
+            )
+    except Exception as e:
+        logger.warning(f"  ⚠️ Move Potential Score: failed ({e}) — continuing without gate")
+
+    # ──────────────────────────────────────────────────────────
+    # QUALITY-OVER-QUANTITY SELECTION GATES — POLICY B v2 (FEB 16, 2026)
+    # Replaces forced Top 10 with strict quality gates.
+    # Backtested Feb 9-13 v2 sweep results:
+    #   - PUTS Sigs≥5 + Score≥0.65 = 64.7% WR on 17 picks (+8.7% avg return)
+    #   - PUTS Sigs≥5 alone = 60.5% WR on 38 picks
+    #   - PUTS Score≥0.85 = 80% WR on 5 picks (too few)
+    #
+    # PUTS ENGINE THRESHOLDS (calibrated from v2 gate sweep):
+    #   - Signal Count ≥ 5 (sweet spot: 60.5% WR — above 6, WR drops)
+    #   - Score ≥ 0.65 (best single-engine discriminator: +10pp over baseline)
+    #   - ORM ≥ 0.50 when computed (existing — validated)
+    #   - MPS ≥ 0.50 (v1 at 0.75 rejected RR +63%, CHWY +27.6%, TCOM +22%)
+    #   - Breakeven realism proxy (relaxed: 3.5% typical breakeven)
+    #   - Theta WARNING (not block)
+    # Accepts 3-7 picks typical — quality over quantity.
+    # ──────────────────────────────────────────────────────────
+    MIN_ORM_SCORE = 0.50          # Keep existing ORM gate for computed status
+    MIN_SIGNAL_COUNT = 5          # POLICY B: Raised 2→5 (winners avg 6.5 signals)
+    MIN_BASE_SCORE = 0.65         # Keep existing base score gate
+    MIN_SCORE_GATE = 0.55         # POLICY B v2: Score≥0.55 (catches APP=0.64, RR=0.60, UPST=0.58)
+    MIN_MOVE_POTENTIAL = 0.50     # POLICY B v2: Lowered 0.75→0.50 (v1 rejected 17+ big winners)
+    ORM_MISSING_PENALTY = 0.08    # Score penalty when ORM not computed
+    # Breakeven realism proxy (adapter-level pre-check)
+    # Definitive check with actual contract data is in executor.py
+    MIN_EXPECTED_MOVE_VS_BREAKEVEN = 1.3
+    TYPICAL_BREAKEVEN_PCT = 3.5   # v2: Lowered 5.0→3.5 (weekly ATM on volatile stocks)
+
+    # ── THETA AWARENESS (adapter-level, FEB 16 v2: WARNING not BLOCK) ──
+    # This is a SIGNAL ENGINE for manual execution — never block picks.
+    # Instead, flag theta exposure so the user can choose DTE accordingly.
+    # Same-day gap plays are unaffected by theta (open and close same day).
+    #
+    # Flags added to each pick:
+    #   _theta_warning: str — human-readable warning (empty = no concern)
+    #   _theta_gap_days: int — calendar days to next session
+    #   _theta_prefer_dte: int — minimum DTE recommendation
+    _theta_warning = ""
+    _theta_gap_days = 2  # default: regular Fri→Mon
+    try:
+        from trading.nyse_calendar import calendar_days_to_next_session, next_trading_day
+        _today = date.today()
+        _gap_today = calendar_days_to_next_session(_today)
+        _nxt = next_trading_day(_today)
+        _gap_tomorrow = calendar_days_to_next_session(_nxt)
+        _theta_gap_days = max(_gap_today, _gap_tomorrow)
+        if _gap_today >= 4 or _gap_tomorrow >= 4:
+            _theta_warning = (
+                f"⚠️ THETA: {_theta_gap_days}-day gap to next session "
+                f"(long weekend). Prefer same-day plays or DTE ≥ 7."
+            )
+            logger.warning(
+                f"  ⚠️ THETA AWARENESS: Today={_today} "
+                f"(gap_today={_gap_today}d, gap_next_session={_gap_tomorrow}d). "
+                f"Flagging all picks with theta warning — NOT blocking. "
+                f"User can trade same-day or choose longer DTE."
+            )
+        elif _today.weekday() == 4:  # Friday
+            _theta_warning = (
+                f"⚠️ THETA: Friday — weekend decay for short DTE. "
+                f"Prefer same-day plays or DTE ≥ 5."
+            )
+            logger.info(f"  ℹ️ Friday theta awareness: flagging picks (not blocking)")
+    except Exception as e:
+        logger.warning(f"  ⚠️ Theta awareness: check failed ({e})")
+
+    before_gates = len(candidates)
+    filtered_candidates = []
+    gate_reasons = []
+    
+    for c in candidates:
+        orm = c.get("_orm_score", 0)
+        orm_status = c.get("_orm_status", "missing")
+        signals = c.get("signals", [])
+        signal_count = len(signals) if isinstance(signals, list) else 0
+        base_score = c.get("meta_score", c.get("score", 0))
+        
+        # ── ORM GATE — CONDITIONAL on computed vs missing/default ────
+        if orm_status == "computed" and orm < MIN_ORM_SCORE:
+            gate_reasons.append(f"{c.get('symbol', '?')}: ORM {orm:.3f} < {MIN_ORM_SCORE} (computed)")
+            continue
+        elif orm_status in ("missing", "default"):
+            c["score"] = max(c.get("score", 0) - ORM_MISSING_PENALTY, 0.10)
+            c["_orm_missing_penalty"] = ORM_MISSING_PENALTY
+            if signal_count < 3 and base_score < 0.80:
+                gate_reasons.append(
+                    f"{c.get('symbol', '?')}: ORM {orm_status} + weak signals "
+                    f"({signal_count}) + low score ({base_score:.2f})"
+                )
+                continue
+            logger.debug(
+                f"     ℹ️ {c.get('symbol', '?')}: ORM {orm_status} — penalty applied "
+                f"({ORM_MISSING_PENALTY:.0%}), signals={signal_count}, score={base_score:.2f}"
+            )
+
+        # ── SIGNAL COUNT GATE — POLICY B v2 (FEB 16, 2026) ────────
+        # PUTS: Sigs ≥ 5 is the sweet spot (60.5% WR).
+        # Above 6, WR actually drops ("noise consensus" not quality).
+        if signal_count < MIN_SIGNAL_COUNT:
+            gate_reasons.append(
+                f"{c.get('symbol', '?')}: {signal_count} signals < {MIN_SIGNAL_COUNT} (Policy B v2 PUTS)"
+            )
+            continue
+        if base_score < MIN_BASE_SCORE:
+            gate_reasons.append(f"{c.get('symbol', '?')}: base score {base_score:.3f} < {MIN_BASE_SCORE}")
+            continue
+
+        # ── SCORE GATE — POLICY B v2 (FEB 16, 2026) ─────────────
+        # Best single-engine discriminator for PUTS: Score ≥ 0.65 → 57.7% WR
+        # Combined with Sigs ≥ 5: 64.7% WR on 17 picks (+8.7% avg return)
+        pick_score = c.get("score", 0)
+        if pick_score < MIN_SCORE_GATE:
+            gate_reasons.append(
+                f"{c.get('symbol', '?')}: score {pick_score:.3f} < {MIN_SCORE_GATE} (Policy B v2 PUTS)"
+            )
+            continue
+        
+        # ── PRICE DATA VALIDATION GATE ────────────────────────────
+        pick_price = float(c.get("price", 0) or 0)
+        if pick_price <= 0:
+            gate_reasons.append(f"{c.get('symbol', '?')}: no valid price data (price={pick_price})")
+            continue
+        if pick_price < 1.0:
+            gate_reasons.append(f"{c.get('symbol', '?')}: penny stock price ${pick_price:.2f}")
+            continue
+        if pick_price > 10000:
+            gate_reasons.append(f"{c.get('symbol', '?')}: unrealistic price ${pick_price:.0f}")
+            continue
+
+        # ── SIGNAL UNIFORMITY PENALTY ─────────────────────────────
+        if isinstance(signals, list) and signal_count >= 2:
+            unique_signals = len(set(str(s) for s in signals))
+            uniformity = 1.0 - (unique_signals / signal_count)
+            if uniformity >= 0.70:
+                penalty = 0.05 * uniformity
+                c["score"] = max(c["score"] - penalty, 0.20)
+                c["_signal_uniformity_penalty"] = penalty
+                logger.debug(
+                    f"     ⚠️ {c.get('symbol', '?')}: signal uniformity "
+                    f"{uniformity:.0%} — penalized {penalty:.3f}"
+                )
+        
+        # ── MOVE POTENTIAL GATE — POLICY B v2 (FEB 16, 2026) ────────
+        # v2: Lowered to 0.50. v1 at 0.75 rejected CHWY (MPS=0.58, +27.6%),
+        # TCOM (MPS=0.39, +22.1%), AMAT (MPS=0.65, +14.2%), MRVL (MPS=0.67, +13.5%).
+        # MPS ≥ 0.50 filters out only truly low-move-potential stocks.
+        mps = c.get("_move_potential_score")
+        if mps is not None and mps < MIN_MOVE_POTENTIAL:
+            gate_reasons.append(
+                f"{c.get('symbol', '?')}: MPS {mps:.3f} < {MIN_MOVE_POTENTIAL} "
+                f"(Policy B — no override)"
+            )
+            continue
+        
+        # ── BREAKEVEN REALISM FILTER — v2 (FEB 16, 2026) ─────────
+        # v2: TYPICAL_BREAKEVEN_PCT lowered 5.0→3.5. v1 at 5.0 gave
+        # threshold 6.5%, rejecting RR (exp=6.4%, +63.1%), HIMS (6.4%,
+        # +35.4%), OKLO (6.4%, +33.4%) by just 0.1%. New threshold = 4.55%.
+        # Definitive check with actual contract data is in executor.py.
+        if mps is not None and mps > 0:
+            expected_move_pct = mps * 10.0
+            required_for_breakeven = TYPICAL_BREAKEVEN_PCT * MIN_EXPECTED_MOVE_VS_BREAKEVEN
+            if expected_move_pct < required_for_breakeven:
+                gate_reasons.append(
+                    f"{c.get('symbol', '?')}: Breakeven proxy — "
+                    f"expected move {expected_move_pct:.1f}% < "
+                    f"{required_for_breakeven:.1f}% required (MPS={mps:.2f})"
+                )
+                continue
+        
+        # ── DIRECTIONAL FILTER — POLICY B v3 (FEB 16, 2026) ────────
+        # Ultra-selective: Block puts if stock has bullish_flow + call_buying in bull regime.
+        # Loser analysis: MU (PUTS) lost -27.4% when stock went UP +10.9% — had bullish_flow + call_buying.
+        # This filter prevents wrong-direction trades in bull markets.
+        # Note: This is a conservative filter — some winners had this combo, but they were in bear regimes.
+        try:
+            from analysis.market_direction_predictor import get_market_direction_for_scan
+            regime_info = get_market_direction_for_scan(session_label="AM")
+            regime_label = regime_info.get("regime", "UNKNOWN") if regime_info else "UNKNOWN"
+            
+            # Check for bullish flow + call buying in bull regimes
+            if regime_label in ("STRONG_BULL", "LEAN_BULL"):
+                # Try to get UW flow data (optional — don't block if unavailable)
+                try:
+                    uw_flow_path = Path("/Users/chavala/TradeNova/data/uw_flow_cache.json")
+                    if uw_flow_path.exists():
+                        with open(uw_flow_path) as f:
+                            uw_data = json.load(f)
+                        flow_data = uw_data.get("flow_data", uw_data) if isinstance(uw_data, dict) else {}
+                        sym_flow = flow_data.get(c.get("symbol", ""), [])
+                        if isinstance(sym_flow, list):
+                            call_prem = sum(t.get("premium", 0) for t in sym_flow 
+                                          if isinstance(t, dict) and t.get("put_call") == "C")
+                            put_prem = sum(t.get("premium", 0) for t in sym_flow 
+                                         if isinstance(t, dict) and t.get("put_call") == "P")
+                            total = call_prem + put_prem
+                            call_pct = call_prem / total if total > 0 else 0.50
+                            
+                            # Check for call buying in catalysts
+                            catalysts = c.get("catalysts", [])
+                            cat_str = " ".join(str(cat) for cat in catalysts).lower() if isinstance(catalysts, list) else str(catalysts).lower()
+                            has_call_buying = "call buying" in cat_str or "positive gex" in cat_str
+                            
+                            # Block if bullish flow + call buying in bull regime
+                            if call_pct > 0.60 and has_call_buying:
+                                gate_reasons.append(
+                                    f"{c.get('symbol', '?')}: Bull regime + bullish flow "
+                                    f"(call_pct={call_pct:.0%}) + call_buying — stock might go up "
+                                    f"(Policy B v3 PUTS ultra-selective)"
+                                )
+                                continue
+                except Exception:
+                    pass  # Don't block if UW data unavailable
+        except Exception:
+            pass  # Don't block if regime unavailable
+        
+        filtered_candidates.append(c)
+    
+    if gate_reasons:
+        logger.info(f"  🚫 Policy B Quality Gates: {len(gate_reasons)} candidates filtered out:")
+        for reason in gate_reasons[:15]:
+            logger.info(f"     • {reason}")
+        if len(gate_reasons) > 15:
+            logger.info(f"     ... and {len(gate_reasons) - 15} more")
+    
+    candidates = filtered_candidates
+    
+    # ── LOW OPPORTUNITY DAY CHECK (POLICY B) ─────────────────
+    # When strict gates leave fewer than 3 picks, this is expected.
+    # Preserving capital on thin days IS the edge.
+    if len(candidates) < 3:
+        logger.warning(
+            f"  ⚠️ LOW OPPORTUNITY DAY: Only {len(candidates)} puts candidates "
+            f"passed Policy B quality gates (of {before_gates} total). "
+            f"Capital preserved — quality over quantity."
+        )
+        for c in candidates:
+            c["_low_opportunity_day"] = True
+    
+    logger.info(f"  ✅ After Policy B gates: {len(candidates)}/{before_gates} candidates remain")
+
+    # Compute ORM statistics
+    if orm_scores:
+        avg_orm = sum(orm_scores) / len(orm_scores)
+        max_orm = max(orm_scores)
+        min_orm = min(orm_scores)
+        logger.info(
+            f"  ✅ ORM applied to {orm_count} candidates "
+            f"({orm_computed_count} from real data, "
+            f"{orm_count - orm_computed_count} defaults/missing) "
+            f"(avg={avg_orm:.3f}, range={min_orm:.3f}–{max_orm:.3f})"
+        )
+
+    # Log final picks with ORM breakdown (quality-over-quantity: may be < 10)
+    n_final = min(top_n, len(candidates))
+    logger.info(f"  📊 FINAL {n_final} PUTS picks (Policy B quality gates) "
+                 f"(ORM blending: computed={ORM_WEIGHT_COMPUTED}, "
+                 f"default={ORM_WEIGHT_DEFAULT}, missing={ORM_WEIGHT_MISSING}):")
+    for i, c in enumerate(candidates[:top_n], 1):
+        meta = c.get("meta_score", 0)
+        orm = c.get("_orm_score", 0)
+        status = c.get("_orm_status", "?")
+        mps_val = c.get("_move_potential_score", 0)
+        sig_cnt = len(c.get("signals", [])) if isinstance(c.get("signals"), list) else 0
+        fcts = c.get("_orm_factors", {})
+        top_factors = sorted(fcts.items(), key=lambda x: x[1], reverse=True)[:3]
+        factor_str = " ".join(f"{k[:3]}={v:.2f}" for k, v in top_factors)
+        logger.info(
+            f"    #{i:2d} {c['symbol']:6s} "
+            f"final={c['score']:.3f} "
+            f"(meta={meta:.3f} orm={orm:.3f} [{status}] mps={mps_val:.2f} sig={sig_cnt}) "
+            f"[{factor_str}]"
+        )
 
     # ==================================================================
     # Deduplicate signals (scan_history may have repeats)
@@ -1926,7 +2390,492 @@ def _enrich_candidates(candidates: List[Dict[str, Any]], top_n: int) -> List[Dic
                     seen_sigs.append(s)
             c["signals"] = seen_sigs
 
+    # ══════════════════════════════════════════════════════════════════
+    # POLICY B v4: REGIME GATE + DIRECTIONAL FILTER + CONVICTION RANKING
+    # Target: 80% WR by eliminating wrong-direction PUTS trades
+    #
+    # Evidence from Feb 9-13 forward backtest:
+    #   - PUTS with call_pct > 0.55 were 100% losers (e.g. MU -27.4%)
+    #   - PUTS in STRONG_BULL/LEAN_BULL had ~30% WR → block entirely
+    #   - PUTS in bear regimes had ~60-70% WR → allow with conviction filter
+    # ══════════════════════════════════════════════════════════════════
+    try:
+        candidates = _apply_puts_regime_gate_v5(candidates)
+    except Exception as e:
+        logger.warning(f"  ⚠️ PUTS regime gate: failed ({e}) — continuing without gate")
+
+    # ── THETA AWARENESS FLAGS (FEB 16 v2) ─────────────────────
+    # Attach theta warning to every pick so email/telegram/X can show it.
+    if _theta_warning:
+        for c in candidates:
+            c["_theta_warning"] = _theta_warning
+            c["_theta_gap_days"] = _theta_gap_days
+            c["_theta_prefer_dte"] = 7 if _theta_gap_days >= 4 else 5
+
     return candidates
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# POLICY B v4: PUTS REGIME GATE + DIRECTIONAL FILTER + CONVICTION SCORING
+# ══════════════════════════════════════════════════════════════════════════
+
+def _get_puts_regime() -> Dict[str, Any]:
+    """Get current market regime for PUTS gating."""
+    result = {
+        "regime_label": "UNKNOWN",
+        "regime_score": 0.0,
+        "regime_asof_timestamp": datetime.now().isoformat(),
+    }
+    try:
+        from analysis.market_direction_predictor import get_market_direction_for_scan
+        prediction = get_market_direction_for_scan(session_label="AM")
+        if prediction:
+            composite = prediction.get("composite_score", 0)
+            if composite >= 0.30:
+                label = "STRONG_BULL"
+            elif composite >= 0.10:
+                label = "LEAN_BULL"
+            elif composite <= -0.30:
+                label = "STRONG_BEAR"
+            elif composite <= -0.10:
+                label = "LEAN_BEAR"
+            else:
+                label = "NEUTRAL"
+            result.update({
+                "regime_label": label,
+                "regime_score": round(composite, 4),
+                "regime_asof_timestamp": prediction.get("timestamp",
+                                                        datetime.now().isoformat()),
+            })
+    except Exception as e:
+        logger.debug(f"  PUTS regime predictor failed: {e}")
+
+    # Fallback: PutsEngine's market_direction.json
+    if result["regime_label"] == "UNKNOWN":
+        try:
+            md_file = Path(PUTSENGINE_PATH) / "market_direction.json"
+            if md_file.exists():
+                with open(md_file) as f:
+                    md = json.load(f)
+                direction = md.get("direction", "unknown").lower()
+                if "bull" in direction:
+                    result["regime_label"] = "LEAN_BULL"
+                    result["regime_score"] = 0.15
+                elif "bear" in direction:
+                    result["regime_label"] = "LEAN_BEAR"
+                    result["regime_score"] = -0.15
+                else:
+                    result["regime_label"] = "NEUTRAL"
+                    result["regime_score"] = 0.0
+        except Exception:
+            pass
+
+    return result
+
+
+def _load_uw_flow_for_puts() -> Dict[str, Any]:
+    """Load UW options flow data for directional filtering."""
+    try:
+        flow_file = Path.home() / "TradeNova" / "data" / "uw_flow_cache.json"
+        if flow_file.exists():
+            with open(flow_file) as f:
+                data = json.load(f)
+            # UW flow is nested: {"timestamp": ..., "flow_data": {SYM: [trades...]}}
+            if "flow_data" in data and isinstance(data["flow_data"], dict):
+                return data["flow_data"]
+            return {k: v for k, v in data.items()
+                    if not k.startswith("_") and k != "metadata"}
+    except Exception as e:
+        logger.debug(f"  UW flow load for puts failed: {e}")
+    return {}
+
+
+def _compute_puts_call_pct(symbol: str, flow_data: Dict[str, Any]) -> float:
+    """Compute call premium % for a symbol from UW flow data."""
+    sym_flow = flow_data.get(symbol, []) if isinstance(flow_data, dict) else []
+    call_prem = 0.0
+    put_prem = 0.0
+    if isinstance(sym_flow, list):
+        for trade in sym_flow:
+            if isinstance(trade, dict):
+                prem = trade.get("premium", 0) or 0
+                if trade.get("put_call") == "C":
+                    call_prem += prem
+                elif trade.get("put_call") == "P":
+                    put_prem += prem
+    total = call_prem + put_prem
+    return call_prem / total if total > 0 else 0.50
+
+
+def _apply_puts_regime_gate_v5(
+    candidates: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Policy B v5 PUTS Regime Gate — expanded intelligence for catching movers.
+
+    v5 changes (FEB 16):
+      - Expanded from 3→5 per scan to capture more winners (U, UPST, DKNG)
+      - Added predictive recurrence, dark pool, multi-day persistence to conviction
+      - Added dual-direction awareness (call_pct check with earnings escape hatch)
+
+    Rules (based on Feb 9–13 forward backtest + 20-mover analysis):
+      - STRONG_BULL / LEAN_BULL → BLOCK ALL puts (wrong direction)
+      - call_pct > 0.55 → BLOCK (heavy call buying = stock going up)
+        UNLESS earnings + put_buying + high recurrence (institutional positioning)
+      - NEUTRAL → Allow only with high conviction (MPS ≥ 0.60, sig ≥ 5)
+      - STRONG_BEAR / LEAN_BEAR → Allow (puts aligned with regime)
+
+    After filtering, apply conviction scoring and keep top N.
+    """
+    if not candidates:
+        return candidates
+
+    regime_info = _get_puts_regime()
+    regime_label = regime_info["regime_label"]
+    regime_score = regime_info["regime_score"]
+
+    logger.info(
+        f"  🛡️ PUTS Regime Gate v5: regime={regime_label} "
+        f"(score={regime_score:+.3f})"
+    )
+
+    # Load UW flow for directional filter
+    flow_data = _load_uw_flow_for_puts()
+
+    # Load v5 intelligence sources
+    try:
+        from engine_adapters.moonshot_adapter import (
+            _load_predictive_recurrence,
+            _load_dark_pool_activity,
+            _load_multiday_persistence,
+        )
+        pred_recurrence = _load_predictive_recurrence()
+        dp_activity = _load_dark_pool_activity()
+        multiday_data = _load_multiday_persistence()
+    except ImportError:
+        pred_recurrence = {}
+        dp_activity = {}
+        multiday_data = {}
+
+    hard_blocked = []
+    passed = []
+
+    MAX_PUTS_PER_SCAN = 5   # v5: Expanded 3→5 (catches U, UPST, DKNG)
+    MIN_CONVICTION_SCORE = 0.32  # v5.1: Lowered 0.45→0.32 (catches HOOD 0.330, high-recurrence movers)
+    DEEP_BEAR_PM_PENALTY = 0.70  # PM + deep bear (score < -0.50) = 30% conviction penalty
+    # Evidence: Feb 12 PM (day 2 STRONG_BEAR) had 0% WR — stocks bounced (mean reversion)
+
+    for c in candidates:
+        sym = c.get("symbol", "")
+        score = c.get("score", 0)
+        mps_val = c.get("_move_potential_score", 0) or 0
+        sig_cnt = len(c.get("signals", [])) if isinstance(c.get("signals"), list) else 0
+
+        # Compute call_pct for directional filter
+        call_pct = _compute_puts_call_pct(sym, flow_data)
+
+        # Store for logging
+        c["_regime_label"] = regime_label
+        c["_regime_score"] = regime_score
+        c["_regime_asof_timestamp"] = regime_info["regime_asof_timestamp"]
+        c["_call_pct"] = round(call_pct, 3)
+
+        # v5: Load enrichment data
+        sym_pred = pred_recurrence.get(sym, 0)
+        sym_dp = dp_activity.get(sym, {})
+        sym_days = multiday_data.get(sym, 0)
+        c["_pred_recurrence"] = sym_pred
+        c["_dark_pool"] = sym_dp
+        c["_multiday_days"] = sym_days
+
+        gate_decision = "ALLOW"
+        gate_reasons = []
+
+        # ── RULE 1: Block PUTS in bullish regimes ──
+        if regime_label in ("STRONG_BULL", "LEAN_BULL"):
+            gate_decision = "HARD_BLOCK"
+            gate_reasons.append(
+                f"{regime_label}: ALL puts blocked (wrong direction — "
+                f"market rising, puts lose)"
+            )
+
+        # ── RULE 2: Block PUTS with heavy call buying (directional filter) ──
+        # ESCAPE HATCHES (v5.1): Multiple conditions can override contra-flow:
+        #   A) Earnings + pred recurrence ≥10 + DP selling (institutional pre-positioning)
+        #   B) Very high pred recurrence (≥20) + multi-day persistence (≥2 days)
+        #      Evidence: APP (75% call, -22%), LUNR (89% call, -21.9%), ASTS (73% call, -21.8%)
+        #      These had strong recurring bearish signals despite bullish UW flow.
+        #   C) In STRONG_BEAR: relax call_pct threshold from 55% to 65%
+        #      (in deep bear, even stocks with moderate call buying can crash)
+        elif call_pct > 0.55:
+            # Determine escape hatch conditions
+            catalysts = c.get("catalysts", [])
+            cat_str = " ".join(str(x) for x in catalysts).lower() if isinstance(catalysts, list) else str(catalysts).lower()
+            has_earnings = "earnings" in cat_str or "report" in cat_str
+            dp_net = sym_dp.get("net_institutional", 0)
+            dp_selling = dp_net < -0.1  # Net dark pool selling
+
+            # Escape A: Earnings + recurrence + DP selling
+            escape_a = has_earnings and sym_pred >= 10 and dp_selling
+            # Escape B: High recurrence + multi-day persistence (v5.1: lowered 20→15)
+            # Evidence: APP (pred=17, 3d) → -22.0% despite 75% call_pct
+            escape_b = sym_pred >= 15 and sym_days >= 2
+            # Escape C: STRONG_BEAR + moderate call_pct (55-65%)
+            escape_c = regime_label == "STRONG_BEAR" and call_pct <= 0.65
+            # Escape D: Sustained multi-source conviction (v5.1)
+            # pred >= 10 AND multiday >= 3 → strong persistent bearish signal
+            escape_d = sym_pred >= 10 and sym_days >= 3
+
+            has_escape = escape_a or escape_b or escape_c or escape_d
+
+            if has_escape:
+                escape_type = []
+                if escape_a:
+                    escape_type.append(f"earnings+pred{sym_pred}x+DP_sell")
+                if escape_b:
+                    escape_type.append(f"high_recurrence({sym_pred}x)+multiday({sym_days}d)")
+                if escape_c:
+                    escape_type.append(f"STRONG_BEAR+moderate_call({call_pct:.0%}≤65%)")
+                if escape_d:
+                    escape_type.append(f"sustained({sym_pred}x+{sym_days}d)")
+                gate_reasons.append(
+                    f"call_pct={call_pct:.0%}>55% but ESCAPE: "
+                    f"{' | '.join(escape_type)} → allow puts"
+                )
+                logger.info(
+                    f"  🔓 PUTS ESCAPE: {sym} — call_pct={call_pct:.0%} BUT "
+                    f"{' | '.join(escape_type)} → allow"
+                )
+            else:
+                gate_decision = "HARD_BLOCK"
+                gate_reasons.append(
+                    f"Heavy call buying (call_pct={call_pct:.0%} > 55%) — "
+                    f"stock has bullish flow, puts will lose "
+                    f"(pred={sym_pred}x, days={sym_days}, regime={regime_label})"
+                )
+
+        # ── RULE 3: NEUTRAL regime — require minimum conviction ──
+        elif regime_label == "NEUTRAL":
+            if mps_val < 0.60 or sig_cnt < 5:
+                gate_decision = "HARD_BLOCK"
+                gate_reasons.append(
+                    f"Neutral regime: MPS={mps_val:.2f}<0.60 or sig={sig_cnt}<5 "
+                    f"(insufficient conviction for puts in flat market)"
+                )
+            else:
+                gate_reasons.append(
+                    f"Neutral + high conviction (MPS={mps_val:.2f}, sig={sig_cnt})"
+                )
+
+        # ── RULE 4: Bear regimes — allow (puts aligned) ──
+        elif regime_label in ("STRONG_BEAR", "LEAN_BEAR"):
+            gate_reasons.append(f"{regime_label}: Puts aligned with regime — allow")
+
+        else:
+            # UNKNOWN regime — allow puts (safer default for puts)
+            gate_reasons.append(f"UNKNOWN regime — allowing puts (default safe)")
+
+        c["_regime_gate_decision"] = gate_decision
+        c["_regime_gate_reasons"] = gate_reasons
+
+        if gate_decision == "HARD_BLOCK":
+            hard_blocked.append(c)
+            logger.info(
+                f"  🔴 PUTS BLOCK: {sym} — {gate_reasons[0][:100]} → removed"
+            )
+        else:
+            passed.append(c)
+
+    if hard_blocked:
+        logger.info(
+            f"  🛡️ PUTS Regime Gate v5: {len(hard_blocked)} puts blocked, "
+            f"{len(passed)} survive (regime={regime_label})"
+        )
+
+    # ── CONVICTION SCORING + TOP-N RANKING (v5 — expanded) ──
+    # For puts: meta_score, MPS, signal count, EWS IPI, ORM,
+    #           + predictive recurrence, dark pool, multi-day persistence
+    for c in passed:
+        meta = c.get("meta_score", c.get("score", 0))
+        mps_val = c.get("_move_potential_score", 0) or 0
+        sig_cnt = len(c.get("signals", [])) if isinstance(c.get("signals"), list) else 0
+        orm = c.get("_orm_score", 0) or 0
+        ews_ipi = c.get("_ews_ipi", 0) or 0
+
+        # Signal quality bonus (high-quality bearish signals)
+        HIGH_Q = {"put_buying_at_ask", "call_selling_at_bid",
+                  "multi_day_weakness", "flat_price_rising_volume",
+                  "gap_down_no_recovery"}
+        sigs = c.get("signals", [])
+        hq_count = sum(1 for s in sigs if s in HIGH_Q) if isinstance(sigs, list) else 0
+        hq_bonus = min(hq_count * 0.08, 0.40)
+
+        sig_density = min(sig_cnt / 12.0, 1.0)
+
+        # ── v5 new factors ──────────────────────────────────────
+        sym = c.get("symbol", "")
+        sym_pred = c.get("_pred_recurrence", 0)
+        sym_dp = c.get("_dark_pool", {})
+        sym_days = c.get("_multiday_days", 0)
+
+        dp_value = sym_dp.get("total_value_m", 0) if isinstance(sym_dp, dict) else 0
+        dp_net = sym_dp.get("net_institutional", 0) if isinstance(sym_dp, dict) else 0
+
+        # Predictive recurrence score — v5.1 tuned (same tiers as moonshot)
+        #   10x-14x → 0.40, 15x-19x → 0.60, 20x-29x → 0.80, 30x+ → 1.0
+        if sym_pred >= 30:
+            pred_score = 1.0
+        elif sym_pred >= 20:
+            pred_score = 0.80
+        elif sym_pred >= 15:
+            pred_score = 0.60
+        elif sym_pred >= 10:
+            pred_score = 0.40
+        else:
+            pred_score = 0.0
+
+        # Dark pool score for PUTS: negative net = institutional selling = good for puts
+        if dp_value >= 100 and dp_net < -0.1:
+            dp_score = 1.0  # Massive institutional selling (like U)
+        elif dp_value >= 50 and dp_net < 0:
+            dp_score = 0.6
+        elif dp_value >= 10 and dp_net < 0:
+            dp_score = 0.3
+        elif dp_net > 0.2:
+            dp_score = -0.2  # Penalize: institutional buying = bad for puts
+        else:
+            dp_score = 0.0
+
+        # Multi-day persistence score
+        if sym_days >= 3:
+            multiday_score = 1.0
+        elif sym_days >= 2:
+            multiday_score = 0.5
+        else:
+            multiday_score = 0.0
+
+        # ── Conviction formula (v5.1 — reweighted) ───────────────
+        #   23% meta score (v5.1: reduced 28→23%, pred recurrence more important)
+        #   16% MPS (move potential)
+        #   10% signal density
+        #   10% HQ signal bonus
+        #    6% EWS institutional pressure (v5.1: reduced 11→6%)
+        #   15% predictive recurrence (v5.1: raised 10→15%, key discriminator)
+        #   10% dark pool institutional flow (v5.1: raised 8→10%)
+        #   10% multi-day persistence (v5.1: raised 7→10%)
+        conviction = (
+            0.23 * meta
+            + 0.16 * mps_val
+            + 0.10 * sig_density
+            + 0.10 * hq_bonus
+            + 0.06 * ews_ipi
+            + 0.15 * pred_score
+            + 0.10 * max(dp_score, 0)  # Only add positive dp_score to conviction
+            + 0.10 * multiday_score
+        )
+
+        # Penalize if institutional buying (bad for puts)
+        if dp_score < 0:
+            conviction += dp_score * 0.08  # Subtract up to 1.6% conviction
+
+        # Deep bear + PM penalty: after 2+ consecutive bear days,
+        # PM puts catch mean-reversion bounces (stocks oversold, snap back).
+        # Evidence: Feb 12 PM (regime_score=-0.60, day 2 STRONG_BEAR) had 0% WR.
+        is_pm = _is_pm_scan()
+        if is_pm and regime_score < -0.50:
+            conviction *= DEEP_BEAR_PM_PENALTY
+            logger.debug(
+                f"  🕐 {sym}: Deep bear PM penalty "
+                f"(regime={regime_score:+.2f}, conviction "
+                f"{conviction / DEEP_BEAR_PM_PENALTY:.3f} → {conviction:.3f})"
+            )
+
+        c["_conviction_score"] = round(conviction, 4)
+        c["_conviction_breakdown"] = {
+            "meta": round(0.23 * meta, 4),
+            "mps": round(0.16 * mps_val, 4),
+            "sig_density": round(0.10 * sig_density, 4),
+            "hq_bonus": round(0.10 * hq_bonus, 4),
+            "ews_ipi": round(0.06 * ews_ipi, 4),
+            "pred_recurrence": round(0.15 * pred_score, 4),
+            "dark_pool": round(0.10 * max(dp_score, 0), 4),
+            "multiday": round(0.10 * multiday_score, 4),
+            "pred_count": sym_pred,
+            "dp_value_m": round(dp_value, 1),
+            "multiday_days": sym_days,
+        }
+
+    # Drop below conviction floor
+    below_floor = [c for c in passed if c.get("_conviction_score", 0) < MIN_CONVICTION_SCORE]
+    passed = [c for c in passed if c.get("_conviction_score", 0) >= MIN_CONVICTION_SCORE]
+    if below_floor:
+        logger.info(
+            f"  🔻 Conviction floor ({MIN_CONVICTION_SCORE}): dropped {len(below_floor)} puts "
+            f"({', '.join(c.get('symbol', '?') for c in below_floor)})"
+        )
+
+    # Sort by conviction and take top N
+    passed.sort(key=lambda x: x.get("_conviction_score", 0), reverse=True)
+    if len(passed) > MAX_PUTS_PER_SCAN:
+        trimmed = passed[MAX_PUTS_PER_SCAN:]
+        passed = passed[:MAX_PUTS_PER_SCAN]
+        logger.info(
+            f"  🎯 PUTS Conviction Top-{MAX_PUTS_PER_SCAN}: kept {len(passed)}, "
+            f"trimmed {len(trimmed)} lower-conviction picks"
+        )
+        for t in trimmed:
+            logger.info(
+                f"    ✂️ Trimmed: {t['symbol']:6s} "
+                f"conviction={t['_conviction_score']:.3f} "
+                f"score={t.get('score', 0):.3f}"
+            )
+
+    # Log final conviction-ranked picks with v5 enrichment
+    for i, c in enumerate(passed, 1):
+        bd = c.get("_conviction_breakdown", {})
+        pred_cnt = bd.get("pred_count", 0)
+        dp_val = bd.get("dp_value_m", 0)
+        md_days = bd.get("multiday_days", 0)
+        v5_tag = ""
+        if pred_cnt >= 10:
+            v5_tag += f" 📡{pred_cnt}x"
+        if dp_val >= 10:
+            v5_tag += f" 🏦${dp_val:.0f}M"
+        if md_days >= 2:
+            v5_tag += f" 📅{md_days}d"
+        logger.info(
+            f"    #{i} {c['symbol']:6s} conv={c.get('_conviction_score', 0):.3f} "
+            f"score={c.get('score', 0):.3f} call_pct={c.get('_call_pct', 0.5):.0%} "
+            f"regime={regime_label}{v5_tag}"
+        )
+
+    # Save shadow artifact
+    try:
+        shadow_path = Path(os.environ.get("META_ENGINE_OUTPUT",
+                                          str(Path(__file__).parent.parent / "output")))
+        shadow_file = shadow_path / f"puts_regime_shadow_{datetime.now().strftime('%Y%m%d_%H%M')}.json"
+        shadow_data = {
+            "timestamp": datetime.now().isoformat(),
+            "regime": regime_info,
+            "candidates_before": len(candidates),
+            "hard_blocked": [{
+                "symbol": c.get("symbol"),
+                "call_pct": c.get("_call_pct"),
+                "gate_reasons": c.get("_regime_gate_reasons", []),
+            } for c in hard_blocked],
+            "passed": [{
+                "symbol": c.get("symbol"),
+                "conviction": c.get("_conviction_score"),
+                "call_pct": c.get("_call_pct"),
+            } for c in passed],
+        }
+        with open(shadow_file, "w") as f:
+            json.dump(shadow_data, f, indent=2, default=str)
+        logger.info(f"  💾 PUTS regime shadow: {shadow_file}")
+    except Exception as e:
+        logger.debug(f"  PUTS regime shadow save failed: {e}")
+
+    return passed
 
 
 def get_puts_universe() -> List[str]:

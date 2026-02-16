@@ -2,7 +2,7 @@
 🏛️ META ENGINE — Core Orchestrator
 =====================================
 The Meta Engine sits on top of PutsEngine and Moonshot Engine,
-running 3× daily on every trading day (9:21 AM, 9:50 AM, 3:15 PM ET) to:
+running 2× daily on every trading day (9:35 AM, 3:15 PM ET) to:
 
 1. Get Top 10 picks from PutsEngine (bearish/distribution signals)
 2. Get Top 10 picks from Moonshot Engine (bullish/squeeze signals)
@@ -299,15 +299,22 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # ================================================================
-    # STEP 1: Get Top 10 from PutsEngine
+    # STEP 1: Get Top Puts (Policy B: quality over quantity)
     # ================================================================
     logger.info("\n" + "=" * 50)
-    logger.info("STEP 1: Getting PutsEngine Top 10...")
+    logger.info("STEP 1: Getting PutsEngine picks (Policy B)...")
     logger.info("=" * 50)
     
     from engine_adapters.puts_adapter import get_top_puts
     puts_top10 = get_top_puts(top_n=MetaConfig.TOP_N_PICKS)
     results["puts_top10"] = puts_top10
+    
+    # Log quality-over-quantity status
+    if len(puts_top10) < 3:
+        logger.warning(
+            f"  ⚠️ LOW OPPORTUNITY: Only {len(puts_top10)} puts passed Policy B gates. "
+            f"Capital preserved — this is expected on quiet days."
+        )
     
     # Save to file
     puts_file = output_dir / f"puts_top10_{now.strftime('%Y%m%d')}.json"
@@ -316,15 +323,22 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
     logger.info(f"  💾 Saved: {puts_file}")
     
     # ================================================================
-    # STEP 2: Get Top 10 from Moonshot Engine
+    # STEP 2: Get Top Moonshots (Policy B: quality over quantity)
     # ================================================================
     logger.info("\n" + "=" * 50)
-    logger.info("STEP 2: Getting Moonshot Top 10...")
+    logger.info("STEP 2: Getting Moonshot picks (Policy B)...")
     logger.info("=" * 50)
     
     from engine_adapters.moonshot_adapter import get_top_moonshots
     moonshot_top10 = get_top_moonshots(top_n=MetaConfig.TOP_N_PICKS)
     results["moonshot_top10"] = moonshot_top10
+    
+    # Log quality-over-quantity status
+    if len(moonshot_top10) < 3:
+        logger.warning(
+            f"  ⚠️ LOW OPPORTUNITY: Only {len(moonshot_top10)} moonshots passed Policy B gates. "
+            f"Capital preserved — this is expected on quiet days."
+        )
     
     # Save to file
     moon_file = output_dir / f"moonshot_top10_{now.strftime('%Y%m%d')}.json"
@@ -332,6 +346,102 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
         json.dump({"timestamp": now.isoformat(), "picks": moonshot_top10}, f, indent=2, default=str)
     logger.info(f"  💾 Saved: {moon_file}")
     
+    # ================================================================
+    # STEP 2a: Dual-Direction Awareness (FEB 16 v5)
+    # ================================================================
+    # Cross-check for symbols appearing in BOTH moonshot AND puts picks.
+    # When a stock shows up in both directions, it means the scoring found
+    # evidence for both up and down — the system must pick ONE direction.
+    # We flag these conflicts so the user is aware and can tiebreak manually.
+    puts_syms = {p.get("symbol", "") for p in puts_top10}
+    moon_syms = {m.get("symbol", "") for m in moonshot_top10}
+    overlap = puts_syms & moon_syms - {""}
+    if overlap:
+        logger.warning(
+            f"  ⚠️ DUAL-DIRECTION CONFLICT: {overlap} appear in BOTH moonshot AND puts picks!"
+        )
+        for sym in overlap:
+            # Get conviction scores from both
+            moon_conv = next((m.get("_conviction_score", 0) for m in moonshot_top10
+                              if m.get("symbol") == sym), 0)
+            puts_conv = next((p.get("_conviction_score", 0) for p in puts_top10
+                              if p.get("symbol") == sym), 0)
+            # Flag both with the conflict
+            for picks_list in (moonshot_top10, puts_top10):
+                for p in picks_list:
+                    if p.get("symbol") == sym:
+                        p["_dual_direction_conflict"] = True
+                        p["_opposing_conviction"] = (
+                            puts_conv if picks_list is moonshot_top10 else moon_conv
+                        )
+            # Log which direction wins
+            winner = "CALLS" if moon_conv > puts_conv else "PUTS"
+            logger.warning(
+                f"    {sym}: moonshot_conv={moon_conv:.3f} vs puts_conv={puts_conv:.3f} "
+                f"→ {winner} has higher conviction"
+            )
+
+    # ================================================================
+    # STEP 2b: Gap-Up Detection (Same-Day Plays)
+    # ================================================================
+    logger.info("\n" + "=" * 50)
+    logger.info("STEP 2b: Gap-Up Detection (Same-Day Plays)...")
+    logger.info("=" * 50)
+
+    gap_up_data = {}
+    try:
+        from engine_adapters.gap_up_detector import detect_gap_ups, format_gap_up_report
+        gap_up_data = detect_gap_ups(polygon_api_key=MetaConfig.POLYGON_API_KEY)
+        gap_candidates = gap_up_data.get("candidates", [])
+        if gap_candidates:
+            logger.info(f"  🚀 {len(gap_candidates)} gap-up candidates detected")
+            # Save gap-up data
+            gap_file = output_dir / f"gap_up_alerts_{now.strftime('%Y%m%d_%H%M')}.json"
+            with open(gap_file, "w") as f:
+                json.dump(gap_up_data, f, indent=2, default=str)
+            logger.info(f"  💾 Saved: {gap_file}")
+            # Also save as latest
+            gap_latest = output_dir / "gap_up_alerts_latest.json"
+            with open(gap_latest, "w") as f:
+                json.dump(gap_up_data, f, indent=2, default=str)
+        else:
+            logger.info("  ℹ️ No gap-up candidates detected — quiet pre-market")
+    except Exception as e:
+        logger.warning(f"  ⚠️ Gap-up detection failed: {e}")
+
+    results["gap_up_alerts"] = gap_up_data
+
+    # ================================================================
+    # STEP 2c: Universe Coverage Report (FEB 16 v5.2)
+    # ================================================================
+    logger.info("\n" + "=" * 50)
+    logger.info("STEP 2c: Universe Coverage Report...")
+    logger.info("=" * 50)
+
+    try:
+        from engine_adapters.universe_scanner import get_coverage_report
+        coverage_report = get_coverage_report()
+        coverage_pct = coverage_report.get("coverage_pct", 0)
+        uncovered_count = coverage_report.get("uncovered_count", 0)
+        logger.info(
+            f"  🌐 Coverage: {coverage_pct:.1f}% of universe "
+            f"({uncovered_count} tickers uncovered)"
+        )
+        if uncovered_count > 0:
+            logger.info(
+                f"  ⚠️ Uncovered: {', '.join(coverage_report.get('uncovered_tickers', [])[:15])}"
+            )
+
+        # Save coverage report
+        cov_file = output_dir / f"coverage_report_{now.strftime('%Y%m%d')}.json"
+        with open(cov_file, "w") as f:
+            json.dump(coverage_report, f, indent=2, default=str)
+
+        results["coverage_report"] = coverage_report
+    except Exception as e:
+        logger.warning(f"  ⚠️ Coverage report failed: {e}")
+        results["coverage_report"] = {}
+
     # ================================================================
     # STEP 3: Cross-Engine Analysis
     # ================================================================
@@ -396,7 +506,28 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
     with open(latest_cross_tmp, "w") as f:
         json.dump(cross_results, f, indent=2, default=str)
     latest_cross_tmp.rename(latest_cross_path)
-    
+
+    # ── Generate weather-grade market direction prediction ──
+    # This saves to output/market_direction_{timeframe}_latest.json
+    # so email, telegram, and X poster can reliably read it
+    try:
+        from analysis.market_direction_predictor import MarketDirectionPredictor
+        md_predictor = MarketDirectionPredictor()
+        md_hour = now.hour
+        md_timeframe = "today" if md_hour < 12 else "tomorrow"
+        md_prediction = md_predictor.predict_market_direction(timeframe=md_timeframe)
+        cross_results["weather_direction"] = {
+            "label": md_prediction.get("direction_label", ""),
+            "confidence_pct": md_prediction.get("confidence_pct", 0),
+            "timeframe": md_timeframe,
+            "composite": md_prediction.get("composite_score", 0),
+        }
+        logger.info(f"  🌤️ Weather direction: {md_prediction.get('direction_label', 'N/A')} "
+                     f"({md_prediction.get('confidence_pct', 0):.0f}%)")
+    except Exception as e:
+        logger.warning(f"  ⚠️ Weather-grade market direction failed: {e}")
+        cross_results["weather_direction"] = {}
+
     # ================================================================
     # STEP 4: Generate 3-Sentence Summaries
     # ================================================================
@@ -523,6 +654,7 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
             smtp_user=MetaConfig.SMTP_USER,
             smtp_password=MetaConfig.SMTP_PASSWORD,
             recipient=MetaConfig.ALERT_EMAIL,
+            gap_up_data=gap_up_data,
         )
         results["notifications"]["email"] = email_sent
     except Exception as e:
@@ -542,11 +674,19 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
             chart_path=chart_path,
             bot_token=MetaConfig.TELEGRAM_BOT_TOKEN,
             chat_id=MetaConfig.TELEGRAM_CHAT_ID,
+            gap_up_data=gap_up_data,
         )
         results["notifications"]["telegram"] = tg_sent
     except Exception as e:
         logger.error(f"Telegram failed: {e}")
     
+    # Determine session label from current time (used by X poster and trading)
+    # 2-session schedule: Morning (9:35 AM), Afternoon (3:15 PM)
+    if now.hour < 12:
+        session_label = "AM"
+    else:
+        session_label = "PM"
+
     # ================================================================
     # STEP 8: Post to X/Twitter (Top 3 Puts + Top 3 Calls)
     # ================================================================
@@ -559,6 +699,8 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
         x_posted = post_meta_to_x(
             summaries=summaries,
             cross_results=cross_results,
+            session_label=session_label,
+            gap_up_data=gap_up_data,
         )
         results["notifications"]["x_twitter"] = x_posted
     except Exception as e:
@@ -574,14 +716,6 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
     results["trading"] = {"status": "skipped"}
     try:
         from trading.executor import execute_trades
-        # Determine session label from current time
-        # 3-session schedule: PreMarket (9:21), Morning (9:50), Afternoon (3:15)
-        if now.hour < 9 or (now.hour == 9 and now.minute < 30):
-            session_label = "PreMarket"
-        elif now.hour < 12:
-            session_label = "AM"
-        else:
-            session_label = "PM"
         trade_result = execute_trades(
             cross_results=cross_results,
             session_label=session_label,
@@ -616,6 +750,17 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
     logger.info(f"   Trading: {'✅' if trades_placed > 0 else '⏸️'} ({trades_placed} orders)")
     logger.info(f"   Output: {output_dir}")
     logger.info("=" * 70)
+    
+    # ──────────────────────────────────────────────────────────
+    # Run validation monitor (non-blocking, logs errors only)
+    # ──────────────────────────────────────────────────────────
+    try:
+        from monitoring.validation_monitor import ValidationMonitor
+        monitor = ValidationMonitor()
+        # Quick validation (last 1 day only for speed)
+        monitor.generate_validation_report(days=1)
+    except Exception as e:
+        logger.debug(f"Validation monitor skipped: {e}")
     
     return results
 

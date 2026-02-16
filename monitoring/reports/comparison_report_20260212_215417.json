@@ -1,0 +1,60 @@
+{
+  "timestamp": "2026-02-12T21:54:17.023731",
+  "analysis_period_days": 7,
+  "baseline": {
+    "trade_execution_rate": 0.367,
+    "win_rate": 0.083,
+    "avg_winner_return": 189.6,
+    "avg_loser_return": -12.3,
+    "total_picks": 60,
+    "winners": 5,
+    "losers": 34,
+    "no_trade_executed": 38
+  },
+  "current": {
+    "trade_execution_rate": 0.0,
+    "win_rate": 0.2916666666666667,
+    "avg_winner_return": 98.45714285714287,
+    "avg_loser_return": -60.16874999999998,
+    "selection_gates_filtered": 0,
+    "orm_ge_070_pct": 46.0
+  },
+  "improvements": {
+    "execution_rate": -0.367,
+    "win_rate": 0.20866666666666667,
+    "avg_winner_return": -91.14285714285712,
+    "avg_loser_return": -47.86874999999998
+  },
+  "recommendations": [
+    {
+      "category": "Trade Execution",
+      "priority": "HIGH",
+      "issue": "Execution rate only improved by -36.7% (target: +20-30%)",
+      "action": "Investigate Alpaca API connection, check retry logic logs, verify account status"
+    },
+    {
+      "category": "Win Rate",
+      "priority": "INFO",
+      "issue": "Win rate improved by 20.9% - Excellent!",
+      "action": "Selection gates are working well, continue monitoring"
+    },
+    {
+      "category": "Selection Gates",
+      "priority": "HIGH",
+      "issue": "No selection gate filtering detected",
+      "action": "Verify selection gates are active in logs, check adapter code"
+    },
+    {
+      "category": "ORM Scores",
+      "priority": "LOW",
+      "issue": "Only 46.0% of picks have ORM \u2265 0.70",
+      "action": "Monitor if ORM enhancements are improving scores over time"
+    },
+    {
+      "category": "Average Returns",
+      "priority": "MEDIUM",
+      "issue": "Average winner return decreased by 91.1%",
+      "action": "Review ORM weight adjustments, may need to revert some changes"
+    }
+  ]
+}
