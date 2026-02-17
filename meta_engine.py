@@ -347,41 +347,6 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
     logger.info(f"  💾 Saved: {moon_file}")
     
     # ================================================================
-    # STEP 2a: Dual-Direction Awareness (FEB 16 v5)
-    # ================================================================
-    # Cross-check for symbols appearing in BOTH moonshot AND puts picks.
-    # When a stock shows up in both directions, it means the scoring found
-    # evidence for both up and down — the system must pick ONE direction.
-    # We flag these conflicts so the user is aware and can tiebreak manually.
-    puts_syms = {p.get("symbol", "") for p in puts_top10}
-    moon_syms = {m.get("symbol", "") for m in moonshot_top10}
-    overlap = puts_syms & moon_syms - {""}
-    if overlap:
-        logger.warning(
-            f"  ⚠️ DUAL-DIRECTION CONFLICT: {overlap} appear in BOTH moonshot AND puts picks!"
-        )
-        for sym in overlap:
-            # Get conviction scores from both
-            moon_conv = next((m.get("_conviction_score", 0) for m in moonshot_top10
-                              if m.get("symbol") == sym), 0)
-            puts_conv = next((p.get("_conviction_score", 0) for p in puts_top10
-                              if p.get("symbol") == sym), 0)
-            # Flag both with the conflict
-            for picks_list in (moonshot_top10, puts_top10):
-                for p in picks_list:
-                    if p.get("symbol") == sym:
-                        p["_dual_direction_conflict"] = True
-                        p["_opposing_conviction"] = (
-                            puts_conv if picks_list is moonshot_top10 else moon_conv
-                        )
-            # Log which direction wins
-            winner = "CALLS" if moon_conv > puts_conv else "PUTS"
-            logger.warning(
-                f"    {sym}: moonshot_conv={moon_conv:.3f} vs puts_conv={puts_conv:.3f} "
-                f"→ {winner} has higher conviction"
-            )
-
-    # ================================================================
     # STEP 2b: Gap-Up Detection (Same-Day Plays)
     # ================================================================
     logger.info("\n" + "=" * 50)
@@ -412,35 +377,44 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
     results["gap_up_alerts"] = gap_up_data
 
     # ================================================================
-    # STEP 2c: Universe Coverage Report (FEB 16 v5.2)
+    # STEP 2c: 5x OPTIONS POTENTIAL (Separate Track)
     # ================================================================
+    # Surfaces high-volatility, sector-wave, persistent-signal stocks
+    # that the score-ceiling + regime-gate pipeline filters out.
+    # This does NOT modify existing Top 10 — it's an additive section.
     logger.info("\n" + "=" * 50)
-    logger.info("STEP 2c: Universe Coverage Report...")
+    logger.info("STEP 2c: 5x Options Potential Detection...")
     logger.info("=" * 50)
 
+    five_x_data = {}
     try:
-        from engine_adapters.universe_scanner import get_coverage_report
-        coverage_report = get_coverage_report()
-        coverage_pct = coverage_report.get("coverage_pct", 0)
-        uncovered_count = coverage_report.get("uncovered_count", 0)
-        logger.info(
-            f"  🌐 Coverage: {coverage_pct:.1f}% of universe "
-            f"({uncovered_count} tickers uncovered)"
+        from engine_adapters.five_x_potential import compute_5x_potential, format_5x_potential_report
+        five_x_data = compute_5x_potential(
+            moonshot_candidates=moonshot_top10,
+            puts_candidates=puts_top10,
+            top_n=25,  # Validated: 56/65 (86%) 5x mover coverage with top_n=25
         )
-        if uncovered_count > 0:
-            logger.info(
-                f"  ⚠️ Uncovered: {', '.join(coverage_report.get('uncovered_tickers', [])[:15])}"
-            )
+        results["five_x_potential"] = five_x_data
 
-        # Save coverage report
-        cov_file = output_dir / f"coverage_report_{now.strftime('%Y%m%d')}.json"
-        with open(cov_file, "w") as f:
-            json.dump(coverage_report, f, indent=2, default=str)
-
-        results["coverage_report"] = coverage_report
+        call_5x = five_x_data.get("call_potential", [])
+        put_5x = five_x_data.get("put_potential", [])
+        if call_5x or put_5x:
+            logger.info(f"  🔥 5x Potential: {len(call_5x)} calls, {len(put_5x)} puts")
+            # Save 5x potential data
+            five_x_file = output_dir / f"five_x_potential_{now.strftime('%Y%m%d_%H%M')}.json"
+            with open(five_x_file, "w") as f:
+                json.dump(five_x_data, f, indent=2, default=str)
+            logger.info(f"  💾 Saved: {five_x_file}")
+            # Save latest
+            five_x_latest = output_dir / "five_x_potential_latest.json"
+            with open(five_x_latest, "w") as f:
+                json.dump(five_x_data, f, indent=2, default=str)
+        else:
+            logger.info("  ℹ️ No 5x potential candidates above threshold")
     except Exception as e:
-        logger.warning(f"  ⚠️ Coverage report failed: {e}")
-        results["coverage_report"] = {}
+        logger.warning(f"  ⚠️ 5x Potential detection failed: {e}")
+        import traceback
+        logger.debug(traceback.format_exc())
 
     # ================================================================
     # STEP 3: Cross-Engine Analysis
@@ -527,6 +501,35 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
     except Exception as e:
         logger.warning(f"  ⚠️ Weather-grade market direction failed: {e}")
         cross_results["weather_direction"] = {}
+
+    # ── Inject 5x Potential into cross_results for downstream consumers ──
+    if five_x_data:
+        cross_results["five_x_potential"] = five_x_data
+        # Also enrich combined_ranking items with 5x potential scores
+        _five_x_sym_map = {}
+        for c in five_x_data.get("call_potential", []):
+            _five_x_sym_map[c.get("symbol", "")] = {
+                "five_x_score": c.get("five_x_score", 0),
+                "five_x_type": "CALL",
+            }
+        for c in five_x_data.get("put_potential", []):
+            sym = c.get("symbol", "")
+            if sym not in _five_x_sym_map:
+                _five_x_sym_map[sym] = {
+                    "five_x_score": c.get("five_x_score", 0),
+                    "five_x_type": "PUT",
+                }
+        for item in cross_results.get("combined_ranking", []):
+            sym = item.get("symbol", "")
+            if sym in _five_x_sym_map:
+                item["five_x_score"] = _five_x_sym_map[sym]["five_x_score"]
+                item["five_x_type"] = _five_x_sym_map[sym]["five_x_type"]
+        # Re-save cross_analysis with 5x data
+        with open(cross_file, "w") as f:
+            json.dump(cross_results, f, indent=2, default=str)
+        with open(latest_cross_tmp, "w") as f:
+            json.dump(cross_results, f, indent=2, default=str)
+        latest_cross_tmp.rename(latest_cross_path)
 
     # ================================================================
     # STEP 4: Generate 3-Sentence Summaries
@@ -655,6 +658,7 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
             smtp_password=MetaConfig.SMTP_PASSWORD,
             recipient=MetaConfig.ALERT_EMAIL,
             gap_up_data=gap_up_data,
+            five_x_data=five_x_data,
         )
         results["notifications"]["email"] = email_sent
     except Exception as e:
@@ -675,6 +679,7 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
             bot_token=MetaConfig.TELEGRAM_BOT_TOKEN,
             chat_id=MetaConfig.TELEGRAM_CHAT_ID,
             gap_up_data=gap_up_data,
+            five_x_data=five_x_data,
         )
         results["notifications"]["telegram"] = tg_sent
     except Exception as e:

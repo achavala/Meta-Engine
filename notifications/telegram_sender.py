@@ -235,6 +235,7 @@ def send_meta_telegram(
     bot_token: str = "",
     chat_id: str = "",
     gap_up_data: Optional[Dict[str, Any]] = None,
+    five_x_data: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """
     Send the Meta Engine alert via Telegram.
@@ -243,6 +244,7 @@ def send_meta_telegram(
       1. Conflict Matrix
       2. All 3-sentence institutional summaries (puts + moonshots)
       3. Gap-Up Alerts section (if candidates detected)
+      4. 5x Potential Alerts section (if candidates detected)
     
     Does NOT send: chart, executive summary, tables (those are in the email).
     
@@ -252,6 +254,7 @@ def send_meta_telegram(
         bot_token: Telegram bot token
         chat_id: Target chat ID
         gap_up_data: Output from gap_up_detector.detect_gap_ups() (optional)
+        five_x_data: Output from five_x_potential.compute_5x_potential() (optional)
         
     Returns:
         True if all messages sent successfully
@@ -281,8 +284,27 @@ def send_meta_telegram(
                 )
         except Exception as e:
             logger.warning(f"  ⚠️ Gap-up Telegram formatting failed: {e}")
+
+    # FEB 16: Append 5x potential alerts as a separate message
+    if five_x_data and (five_x_data.get("call_potential") or five_x_data.get("put_potential")):
+        try:
+            from engine_adapters.five_x_potential import format_5x_potential_report
+            five_x_text = format_5x_potential_report(five_x_data)
+            if five_x_text:
+                five_x_msg = f"<pre>{_clean_for_telegram(five_x_text)}</pre>"
+                if len(five_x_msg) > MAX_MESSAGE_LENGTH:
+                    five_x_msg = five_x_msg[:MAX_MESSAGE_LENGTH - 10] + "</pre>"
+                messages.append(five_x_msg)
+                n_calls = len(five_x_data.get("call_potential", []))
+                n_puts = len(five_x_data.get("put_potential", []))
+                logger.info(
+                    f"  🔥 5x Potential alerts appended to Telegram "
+                    f"({n_calls} calls, {n_puts} puts)"
+                )
+        except Exception as e:
+            logger.warning(f"  ⚠️ 5x Potential Telegram formatting failed: {e}")
     
-    logger.info(f"  📱 Sending {len(messages)} Telegram messages (summaries + conflicts + gap-ups)")
+    logger.info(f"  📱 Sending {len(messages)} Telegram messages (summaries + conflicts + gap-ups + 5x)")
     
     # Send all messages
     return _send_multiple_messages(messages, bot_token, chat_id)

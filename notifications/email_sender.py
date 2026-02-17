@@ -37,6 +37,7 @@ def send_meta_email(
     smtp_password: str = "",
     recipient: str = "",
     gap_up_data: Optional[Dict[str, Any]] = None,
+    five_x_data: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """
     Send the Meta Engine analysis report via email.
@@ -121,6 +122,132 @@ def send_meta_email(
             except Exception as e:
                 logger.warning(f"  ⚠️ Gap-up email injection failed: {e}")
         
+        # === INJECT 5x POTENTIAL (FEB 16) ===
+        if five_x_data and (five_x_data.get("call_potential") or five_x_data.get("put_potential")):
+            try:
+                from engine_adapters.five_x_potential import format_5x_potential_report
+                five_x_text = format_5x_potential_report(five_x_data)
+                n_calls = len(five_x_data.get("call_potential", []))
+                n_puts = len(five_x_data.get("put_potential", []))
+
+                # Build styled HTML section for 5x Potential
+                five_x_html = (
+                    '<div style="background:#0d1117;border:1px solid rgba(255,165,0,0.3);'
+                    'border-radius:12px;padding:24px;margin:24px 0;">'
+                    '<h2 style="color:#ffa726;margin:0 0 6px 0;font-size:20px;">'
+                    '🔥 System 2 — 5x Potential Watchlist</h2>'
+                    '<p style="color:#90a4ae;font-size:13px;margin:0 0 16px 0;">'
+                    'Broad awareness of stocks with ≥5x options return potential. '
+                    'These complement the Top Picks above by surfacing volatile, '
+                    'sector-wave, high-beta names. For awareness, NOT trade execution.</p>'
+                )
+
+                # Call potential table
+                if five_x_data.get("call_potential"):
+                    five_x_html += (
+                        '<h3 style="color:#00e676;font-size:15px;margin:16px 0 8px 0;">'
+                        f'📈 Top CALL Potential ({n_calls})</h3>'
+                        '<table style="width:100%;border-collapse:collapse;font-size:13px;">'
+                        '<tr style="border-bottom:1px solid rgba(255,255,255,0.1);">'
+                        '<th style="color:#78909c;padding:6px 10px;text-align:left;">#</th>'
+                        '<th style="color:#78909c;padding:6px 10px;text-align:left;">Symbol</th>'
+                        '<th style="color:#78909c;padding:6px 10px;text-align:right;">5x Score</th>'
+                        '<th style="color:#78909c;padding:6px 10px;text-align:left;">Sector</th>'
+                        '<th style="color:#78909c;padding:6px 10px;text-align:left;">Source</th>'
+                        '</tr>'
+                    )
+                    for i, c in enumerate(five_x_data["call_potential"][:15], 1):
+                        sym = c.get("symbol", "?")
+                        score = c.get("_5x_score", c.get("five_x_score", 0))
+                        sector = c.get("_sector", c.get("sector", "—")) or "—"
+                        src = c.get("_source", "—")
+                        score_str = f"{score:.3f}" if isinstance(score, (int, float)) else str(score)
+                        five_x_html += (
+                            f'<tr style="border-bottom:1px solid rgba(255,255,255,0.05);">'
+                            f'<td style="color:#e0e0e0;padding:5px 10px;">{i}</td>'
+                            f'<td style="color:#00e676;padding:5px 10px;font-weight:700;">{sym}</td>'
+                            f'<td style="color:#e0e0e0;padding:5px 10px;text-align:right;">{score_str}</td>'
+                            f'<td style="color:#90a4ae;padding:5px 10px;">{sector}</td>'
+                            f'<td style="color:#78909c;padding:5px 10px;">{src}</td>'
+                            f'</tr>'
+                        )
+                    five_x_html += '</table>'
+
+                # Put potential table
+                if five_x_data.get("put_potential"):
+                    five_x_html += (
+                        '<h3 style="color:#ff1744;font-size:15px;margin:16px 0 8px 0;">'
+                        f'📉 Top PUT Potential ({n_puts})</h3>'
+                        '<table style="width:100%;border-collapse:collapse;font-size:13px;">'
+                        '<tr style="border-bottom:1px solid rgba(255,255,255,0.1);">'
+                        '<th style="color:#78909c;padding:6px 10px;text-align:left;">#</th>'
+                        '<th style="color:#78909c;padding:6px 10px;text-align:left;">Symbol</th>'
+                        '<th style="color:#78909c;padding:6px 10px;text-align:right;">5x Score</th>'
+                        '<th style="color:#78909c;padding:6px 10px;text-align:left;">Sector</th>'
+                        '<th style="color:#78909c;padding:6px 10px;text-align:left;">Source</th>'
+                        '</tr>'
+                    )
+                    for i, c in enumerate(five_x_data["put_potential"][:15], 1):
+                        sym = c.get("symbol", "?")
+                        score = c.get("_5x_score", c.get("five_x_score", 0))
+                        sector = c.get("_sector", c.get("sector", "—")) or "—"
+                        src = c.get("_source", "—")
+                        score_str = f"{score:.3f}" if isinstance(score, (int, float)) else str(score)
+                        five_x_html += (
+                            f'<tr style="border-bottom:1px solid rgba(255,255,255,0.05);">'
+                            f'<td style="color:#e0e0e0;padding:5px 10px;">{i}</td>'
+                            f'<td style="color:#ff1744;padding:5px 10px;font-weight:700;">{sym}</td>'
+                            f'<td style="color:#e0e0e0;padding:5px 10px;text-align:right;">{score_str}</td>'
+                            f'<td style="color:#90a4ae;padding:5px 10px;">{sector}</td>'
+                            f'<td style="color:#78909c;padding:5px 10px;">{src}</td>'
+                            f'</tr>'
+                        )
+                    five_x_html += '</table>'
+
+                # Sector wave watchlist
+                wave_wl = five_x_data.get("sector_wave_watchlist", [])
+                if wave_wl:
+                    wave_names = []
+                    for w in wave_wl:
+                        if isinstance(w, dict):
+                            wave_names.append(w.get("symbol", "?"))
+                        elif isinstance(w, str):
+                            wave_names.append(w)
+                    if wave_names:
+                        five_x_html += (
+                            '<h3 style="color:#ffd740;font-size:15px;margin:16px 0 8px 0;">'
+                            '🌊 Sector Wave Watchlist</h3>'
+                            '<p style="color:#b0bec5;font-size:13px;">'
+                            + " · ".join(f"<b>{n}</b>" for n in wave_names[:30])
+                            + '</p>'
+                        )
+
+                # Two-system explainer
+                five_x_html += (
+                    '<div style="background:rgba(68,138,255,0.08);border:1px solid rgba(68,138,255,0.2);'
+                    'border-radius:8px;padding:12px 16px;margin-top:16px;">'
+                    '<p style="color:#90caf9;font-size:12px;margin:0;line-height:1.5;">'
+                    '<b>🏛️ Two-System Architecture:</b> '
+                    '<span style="color:#00e676;">System 1 (Top Picks)</span> = '
+                    'ultra-selective Policy B v4 trades (80% WR target). '
+                    '<span style="color:#ffa726;">System 2 (5x Watchlist)</span> = '
+                    'broad awareness of ≥5x potential movers (86% coverage). '
+                    'Both run at every 9:35 AM &amp; 3:15 PM scan.</p>'
+                    '</div>'
+                )
+
+                five_x_html += '</div>'
+
+                if "</body>" in html_content:
+                    html_content = html_content.replace("</body>", five_x_html + "</body>")
+                else:
+                    html_content += five_x_html
+                if five_x_text:
+                    text_content = five_x_text + "\n\n" + text_content
+                logger.info(f"  🔥 5x Potential injected into email ({n_calls} calls, {n_puts} puts)")
+            except Exception as e:
+                logger.warning(f"  ⚠️ 5x Potential email injection failed: {e}")
+
         # Create alternative part (text + html)
         msg_alt = MIMEMultipart("alternative")
         msg_alt.attach(MIMEText(text_content, "plain", "utf-8"))

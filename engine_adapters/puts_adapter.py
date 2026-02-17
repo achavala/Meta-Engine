@@ -397,35 +397,6 @@ def _fallback_from_cached_results(top_n: int = 10) -> List[Dict[str, Any]]:
         except Exception as e:
             logger.debug(f"  Tier 4 failed: {e}")
     
-    # ── Universe scanner catch-all (FEB 16 v5.2) ────────────────────
-    # Catches VKTX/CVNA-type movers with pre-market gaps, volume spikes,
-    # or UW unusual activity that have ZERO presence in other data sources.
-    try:
-        from engine_adapters.universe_scanner import scan_universe_catchall
-        import os as _os
-        _poly_key = _os.getenv("POLYGON_API_KEY", "") or _os.getenv("MASSIVE_API_KEY", "")
-        _uw_key = _os.getenv("UNUSUAL_WHALES_API_KEY", "")
-        univ_candidates = scan_universe_catchall(
-            polygon_api_key=_poly_key,
-            uw_api_key=_uw_key,
-            direction="bearish",
-        )
-        if univ_candidates:
-            existing_symbols = {c.get("symbol", "") for c in all_candidates}
-            univ_merged = 0
-            for uc in univ_candidates:
-                if uc["symbol"] not in existing_symbols:
-                    all_candidates.append(uc)
-                    existing_symbols.add(uc["symbol"])
-                    univ_merged += 1
-            if univ_merged:
-                logger.info(
-                    f"🌐 Merged {univ_merged} universe-scanner (bearish) candidates "
-                    f"into puts pool (total: {len(all_candidates)})"
-                )
-    except Exception as e:
-        logger.debug(f"  Universe scanner merge (puts) failed: {e}")
-
     # ── Universe gate — only allow tickers in the static universe ────
     try:
         from putsengine.config import EngineConfig as _EC
@@ -2400,7 +2371,7 @@ def _enrich_candidates(candidates: List[Dict[str, Any]], top_n: int) -> List[Dic
     #   - PUTS in bear regimes had ~60-70% WR → allow with conviction filter
     # ══════════════════════════════════════════════════════════════════
     try:
-        candidates = _apply_puts_regime_gate_v5(candidates)
+        candidates = _apply_puts_regime_gate_v4(candidates)
     except Exception as e:
         logger.warning(f"  ⚠️ PUTS regime gate: failed ({e}) — continuing without gate")
 
@@ -2507,21 +2478,15 @@ def _compute_puts_call_pct(symbol: str, flow_data: Dict[str, Any]) -> float:
     return call_prem / total if total > 0 else 0.50
 
 
-def _apply_puts_regime_gate_v5(
+def _apply_puts_regime_gate_v4(
     candidates: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     """
-    Policy B v5 PUTS Regime Gate — expanded intelligence for catching movers.
+    Policy B v4 PUTS Regime Gate — hard block for 80% WR target.
 
-    v5 changes (FEB 16):
-      - Expanded from 3→5 per scan to capture more winners (U, UPST, DKNG)
-      - Added predictive recurrence, dark pool, multi-day persistence to conviction
-      - Added dual-direction awareness (call_pct check with earnings escape hatch)
-
-    Rules (based on Feb 9–13 forward backtest + 20-mover analysis):
+    Rules (based on Feb 9–13 forward backtest):
       - STRONG_BULL / LEAN_BULL → BLOCK ALL puts (wrong direction)
       - call_pct > 0.55 → BLOCK (heavy call buying = stock going up)
-        UNLESS earnings + put_buying + high recurrence (institutional positioning)
       - NEUTRAL → Allow only with high conviction (MPS ≥ 0.60, sig ≥ 5)
       - STRONG_BEAR / LEAN_BEAR → Allow (puts aligned with regime)
 
@@ -2535,33 +2500,18 @@ def _apply_puts_regime_gate_v5(
     regime_score = regime_info["regime_score"]
 
     logger.info(
-        f"  🛡️ PUTS Regime Gate v5: regime={regime_label} "
+        f"  🛡️ PUTS Regime Gate v4: regime={regime_label} "
         f"(score={regime_score:+.3f})"
     )
 
     # Load UW flow for directional filter
     flow_data = _load_uw_flow_for_puts()
 
-    # Load v5 intelligence sources
-    try:
-        from engine_adapters.moonshot_adapter import (
-            _load_predictive_recurrence,
-            _load_dark_pool_activity,
-            _load_multiday_persistence,
-        )
-        pred_recurrence = _load_predictive_recurrence()
-        dp_activity = _load_dark_pool_activity()
-        multiday_data = _load_multiday_persistence()
-    except ImportError:
-        pred_recurrence = {}
-        dp_activity = {}
-        multiday_data = {}
-
     hard_blocked = []
     passed = []
 
-    MAX_PUTS_PER_SCAN = 5   # v5: Expanded 3→5 (catches U, UPST, DKNG)
-    MIN_CONVICTION_SCORE = 0.32  # v5.1: Lowered 0.45→0.32 (catches HOOD 0.330, high-recurrence movers)
+    MAX_PUTS_PER_SCAN = 3   # Ultra-selective: max 3 per scan for 80% WR target
+    MIN_CONVICTION_SCORE = 0.45  # Minimum conviction to pass
     DEEP_BEAR_PM_PENALTY = 0.70  # PM + deep bear (score < -0.50) = 30% conviction penalty
     # Evidence: Feb 12 PM (day 2 STRONG_BEAR) had 0% WR — stocks bounced (mean reversion)
 
@@ -2580,14 +2530,6 @@ def _apply_puts_regime_gate_v5(
         c["_regime_asof_timestamp"] = regime_info["regime_asof_timestamp"]
         c["_call_pct"] = round(call_pct, 3)
 
-        # v5: Load enrichment data
-        sym_pred = pred_recurrence.get(sym, 0)
-        sym_dp = dp_activity.get(sym, {})
-        sym_days = multiday_data.get(sym, 0)
-        c["_pred_recurrence"] = sym_pred
-        c["_dark_pool"] = sym_dp
-        c["_multiday_days"] = sym_days
-
         gate_decision = "ALLOW"
         gate_reasons = []
 
@@ -2600,59 +2542,12 @@ def _apply_puts_regime_gate_v5(
             )
 
         # ── RULE 2: Block PUTS with heavy call buying (directional filter) ──
-        # ESCAPE HATCHES (v5.1): Multiple conditions can override contra-flow:
-        #   A) Earnings + pred recurrence ≥10 + DP selling (institutional pre-positioning)
-        #   B) Very high pred recurrence (≥20) + multi-day persistence (≥2 days)
-        #      Evidence: APP (75% call, -22%), LUNR (89% call, -21.9%), ASTS (73% call, -21.8%)
-        #      These had strong recurring bearish signals despite bullish UW flow.
-        #   C) In STRONG_BEAR: relax call_pct threshold from 55% to 65%
-        #      (in deep bear, even stocks with moderate call buying can crash)
         elif call_pct > 0.55:
-            # Determine escape hatch conditions
-            catalysts = c.get("catalysts", [])
-            cat_str = " ".join(str(x) for x in catalysts).lower() if isinstance(catalysts, list) else str(catalysts).lower()
-            has_earnings = "earnings" in cat_str or "report" in cat_str
-            dp_net = sym_dp.get("net_institutional", 0)
-            dp_selling = dp_net < -0.1  # Net dark pool selling
-
-            # Escape A: Earnings + recurrence + DP selling
-            escape_a = has_earnings and sym_pred >= 10 and dp_selling
-            # Escape B: High recurrence + multi-day persistence (v5.1: lowered 20→15)
-            # Evidence: APP (pred=17, 3d) → -22.0% despite 75% call_pct
-            escape_b = sym_pred >= 15 and sym_days >= 2
-            # Escape C: STRONG_BEAR + moderate call_pct (55-65%)
-            escape_c = regime_label == "STRONG_BEAR" and call_pct <= 0.65
-            # Escape D: Sustained multi-source conviction (v5.1)
-            # pred >= 10 AND multiday >= 3 → strong persistent bearish signal
-            escape_d = sym_pred >= 10 and sym_days >= 3
-
-            has_escape = escape_a or escape_b or escape_c or escape_d
-
-            if has_escape:
-                escape_type = []
-                if escape_a:
-                    escape_type.append(f"earnings+pred{sym_pred}x+DP_sell")
-                if escape_b:
-                    escape_type.append(f"high_recurrence({sym_pred}x)+multiday({sym_days}d)")
-                if escape_c:
-                    escape_type.append(f"STRONG_BEAR+moderate_call({call_pct:.0%}≤65%)")
-                if escape_d:
-                    escape_type.append(f"sustained({sym_pred}x+{sym_days}d)")
-                gate_reasons.append(
-                    f"call_pct={call_pct:.0%}>55% but ESCAPE: "
-                    f"{' | '.join(escape_type)} → allow puts"
-                )
-                logger.info(
-                    f"  🔓 PUTS ESCAPE: {sym} — call_pct={call_pct:.0%} BUT "
-                    f"{' | '.join(escape_type)} → allow"
-                )
-            else:
-                gate_decision = "HARD_BLOCK"
-                gate_reasons.append(
-                    f"Heavy call buying (call_pct={call_pct:.0%} > 55%) — "
-                    f"stock has bullish flow, puts will lose "
-                    f"(pred={sym_pred}x, days={sym_days}, regime={regime_label})"
-                )
+            gate_decision = "HARD_BLOCK"
+            gate_reasons.append(
+                f"Heavy call buying (call_pct={call_pct:.0%} > 55%) — "
+                f"stock has bullish flow, puts will lose"
+            )
 
         # ── RULE 3: NEUTRAL regime — require minimum conviction ──
         elif regime_label == "NEUTRAL":
@@ -2688,13 +2583,12 @@ def _apply_puts_regime_gate_v5(
 
     if hard_blocked:
         logger.info(
-            f"  🛡️ PUTS Regime Gate v5: {len(hard_blocked)} puts blocked, "
+            f"  🛡️ PUTS Regime Gate v4: {len(hard_blocked)} puts blocked, "
             f"{len(passed)} survive (regime={regime_label})"
         )
 
-    # ── CONVICTION SCORING + TOP-N RANKING (v5 — expanded) ──
-    # For puts: meta_score, MPS, signal count, EWS IPI, ORM,
-    #           + predictive recurrence, dark pool, multi-day persistence
+    # ── CONVICTION SCORING + TOP-N RANKING ──
+    # For puts: meta_score, MPS, signal count, EWS IPI, ORM
     for c in passed:
         meta = c.get("meta_score", c.get("score", 0))
         mps_val = c.get("_move_potential_score", 0) or 0
@@ -2712,71 +2606,19 @@ def _apply_puts_regime_gate_v5(
 
         sig_density = min(sig_cnt / 12.0, 1.0)
 
-        # ── v5 new factors ──────────────────────────────────────
-        sym = c.get("symbol", "")
-        sym_pred = c.get("_pred_recurrence", 0)
-        sym_dp = c.get("_dark_pool", {})
-        sym_days = c.get("_multiday_days", 0)
-
-        dp_value = sym_dp.get("total_value_m", 0) if isinstance(sym_dp, dict) else 0
-        dp_net = sym_dp.get("net_institutional", 0) if isinstance(sym_dp, dict) else 0
-
-        # Predictive recurrence score — v5.1 tuned (same tiers as moonshot)
-        #   10x-14x → 0.40, 15x-19x → 0.60, 20x-29x → 0.80, 30x+ → 1.0
-        if sym_pred >= 30:
-            pred_score = 1.0
-        elif sym_pred >= 20:
-            pred_score = 0.80
-        elif sym_pred >= 15:
-            pred_score = 0.60
-        elif sym_pred >= 10:
-            pred_score = 0.40
-        else:
-            pred_score = 0.0
-
-        # Dark pool score for PUTS: negative net = institutional selling = good for puts
-        if dp_value >= 100 and dp_net < -0.1:
-            dp_score = 1.0  # Massive institutional selling (like U)
-        elif dp_value >= 50 and dp_net < 0:
-            dp_score = 0.6
-        elif dp_value >= 10 and dp_net < 0:
-            dp_score = 0.3
-        elif dp_net > 0.2:
-            dp_score = -0.2  # Penalize: institutional buying = bad for puts
-        else:
-            dp_score = 0.0
-
-        # Multi-day persistence score
-        if sym_days >= 3:
-            multiday_score = 1.0
-        elif sym_days >= 2:
-            multiday_score = 0.5
-        else:
-            multiday_score = 0.0
-
-        # ── Conviction formula (v5.1 — reweighted) ───────────────
-        #   23% meta score (v5.1: reduced 28→23%, pred recurrence more important)
-        #   16% MPS (move potential)
-        #   10% signal density
-        #   10% HQ signal bonus
-        #    6% EWS institutional pressure (v5.1: reduced 11→6%)
-        #   15% predictive recurrence (v5.1: raised 10→15%, key discriminator)
-        #   10% dark pool institutional flow (v5.1: raised 8→10%)
-        #   10% multi-day persistence (v5.1: raised 7→10%)
+        # Conviction formula:
+        #   35% meta score (already blended with ORM)
+        #   20% MPS (move potential)
+        #   15% signal density
+        #   15% HQ signal bonus
+        #   15% EWS institutional pressure
         conviction = (
-            0.23 * meta
-            + 0.16 * mps_val
-            + 0.10 * sig_density
-            + 0.10 * hq_bonus
-            + 0.06 * ews_ipi
-            + 0.15 * pred_score
-            + 0.10 * max(dp_score, 0)  # Only add positive dp_score to conviction
-            + 0.10 * multiday_score
+            0.35 * meta
+            + 0.20 * mps_val
+            + 0.15 * sig_density
+            + 0.15 * hq_bonus
+            + 0.15 * ews_ipi
         )
-
-        # Penalize if institutional buying (bad for puts)
-        if dp_score < 0:
-            conviction += dp_score * 0.08  # Subtract up to 1.6% conviction
 
         # Deep bear + PM penalty: after 2+ consecutive bear days,
         # PM puts catch mean-reversion bounces (stocks oversold, snap back).
@@ -2785,25 +2627,12 @@ def _apply_puts_regime_gate_v5(
         if is_pm and regime_score < -0.50:
             conviction *= DEEP_BEAR_PM_PENALTY
             logger.debug(
-                f"  🕐 {sym}: Deep bear PM penalty "
+                f"  🕐 {c.get('symbol', '?')}: Deep bear PM penalty "
                 f"(regime={regime_score:+.2f}, conviction "
                 f"{conviction / DEEP_BEAR_PM_PENALTY:.3f} → {conviction:.3f})"
             )
 
         c["_conviction_score"] = round(conviction, 4)
-        c["_conviction_breakdown"] = {
-            "meta": round(0.23 * meta, 4),
-            "mps": round(0.16 * mps_val, 4),
-            "sig_density": round(0.10 * sig_density, 4),
-            "hq_bonus": round(0.10 * hq_bonus, 4),
-            "ews_ipi": round(0.06 * ews_ipi, 4),
-            "pred_recurrence": round(0.15 * pred_score, 4),
-            "dark_pool": round(0.10 * max(dp_score, 0), 4),
-            "multiday": round(0.10 * multiday_score, 4),
-            "pred_count": sym_pred,
-            "dp_value_m": round(dp_value, 1),
-            "multiday_days": sym_days,
-        }
 
     # Drop below conviction floor
     below_floor = [c for c in passed if c.get("_conviction_score", 0) < MIN_CONVICTION_SCORE]
@@ -2830,23 +2659,12 @@ def _apply_puts_regime_gate_v5(
                 f"score={t.get('score', 0):.3f}"
             )
 
-    # Log final conviction-ranked picks with v5 enrichment
+    # Log final conviction-ranked picks
     for i, c in enumerate(passed, 1):
-        bd = c.get("_conviction_breakdown", {})
-        pred_cnt = bd.get("pred_count", 0)
-        dp_val = bd.get("dp_value_m", 0)
-        md_days = bd.get("multiday_days", 0)
-        v5_tag = ""
-        if pred_cnt >= 10:
-            v5_tag += f" 📡{pred_cnt}x"
-        if dp_val >= 10:
-            v5_tag += f" 🏦${dp_val:.0f}M"
-        if md_days >= 2:
-            v5_tag += f" 📅{md_days}d"
         logger.info(
             f"    #{i} {c['symbol']:6s} conv={c.get('_conviction_score', 0):.3f} "
             f"score={c.get('score', 0):.3f} call_pct={c.get('_call_pct', 0.5):.0%} "
-            f"regime={regime_label}{v5_tag}"
+            f"regime={regime_label}"
         )
 
     # Save shadow artifact

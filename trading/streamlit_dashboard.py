@@ -667,6 +667,136 @@ with tabs[1]:
         for a in alerts:
             st.warning(a)
 
+    # ── 5x Potential Module (System 2) ─────────────────
+    st.markdown("---")
+    five_x = cross.get("five_x_potential", {})
+    # Also try loading from dedicated file if not in cross
+    if not five_x:
+        five_x_path = OUTPUT_DIR / "five_x_potential_latest.json"
+        if five_x_path.exists():
+            try:
+                with open(five_x_path) as f:
+                    five_x = json.load(f)
+            except Exception:
+                five_x = {}
+
+    call_5x = five_x.get("call_potential", [])
+    put_5x = five_x.get("put_potential", [])
+    wave_wl = five_x.get("sector_wave_watchlist", [])
+
+    if call_5x or put_5x:
+        st.markdown("### 🔥 5x Potential Watchlist (High-Leverage Movers)")
+        st.caption(
+            "System 2 — Broad awareness of stocks with ≥5x options return potential. "
+            "These are NOT trade recommendations; they complement the Top 10 picks above "
+            "by ensuring you never miss a major mover."
+        )
+
+        col_5c, col_5p = st.columns(2)
+
+        with col_5c:
+            st.markdown("#### 📈 Top CALL Potential")
+            if call_5x:
+                rows_5c = []
+                for i, c in enumerate(call_5x[:15], 1):
+                    sym = c.get("symbol", "?")
+                    score = c.get("_5x_score", c.get("five_x_score", 0))
+                    sector = c.get("_sector", c.get("sector", "—"))
+                    persist = c.get("_persistence_days", 0)
+                    src = c.get("_source", "—")
+                    price_raw = c.get("price", 0)
+                    try:
+                        price_val = float(str(price_raw).replace("$", "").split("-")[0].strip()) if price_raw else 0
+                    except (ValueError, TypeError):
+                        price_val = 0
+                    rows_5c.append({
+                        "#": i,
+                        "Symbol": sym,
+                        "5x Score": f"{score:.3f}" if isinstance(score, (int, float)) else str(score),
+                        "Price": f"${price_val:.2f}" if price_val > 0 else "—",
+                        "Sector": sector if sector else "—",
+                        "Persist": f"{persist}d" if persist else "—",
+                        "Source": src,
+                    })
+                st.dataframe(pd.DataFrame(rows_5c), hide_index=True, use_container_width=True)
+            else:
+                st.info("No call 5x candidates detected.")
+
+        with col_5p:
+            st.markdown("#### 📉 Top PUT Potential")
+            if put_5x:
+                rows_5p = []
+                for i, c in enumerate(put_5x[:15], 1):
+                    sym = c.get("symbol", "?")
+                    score = c.get("_5x_score", c.get("five_x_score", 0))
+                    sector = c.get("_sector", c.get("sector", "—"))
+                    persist = c.get("_persistence_days", 0)
+                    src = c.get("_source", "—")
+                    price_raw = c.get("price", 0)
+                    try:
+                        price_val = float(str(price_raw).replace("$", "").split("-")[0].strip()) if price_raw else 0
+                    except (ValueError, TypeError):
+                        price_val = 0
+                    rows_5p.append({
+                        "#": i,
+                        "Symbol": sym,
+                        "5x Score": f"{score:.3f}" if isinstance(score, (int, float)) else str(score),
+                        "Price": f"${price_val:.2f}" if price_val > 0 else "—",
+                        "Sector": sector if sector else "—",
+                        "Persist": f"{persist}d" if persist else "—",
+                        "Source": src,
+                    })
+                st.dataframe(pd.DataFrame(rows_5p), hide_index=True, use_container_width=True)
+            else:
+                st.info("No put 5x candidates detected.")
+
+        # Sector Wave Watchlist
+        if wave_wl:
+            st.markdown("#### 🌊 Sector Wave Watchlist")
+            st.caption("Sectors with 3+ stocks showing correlated signals — broad sector momentum detected")
+            wave_items = []
+            for w in wave_wl:
+                if isinstance(w, dict):
+                    wave_items.append(f"**{w.get('symbol', '?')}** ({w.get('sector', '—')})")
+                elif isinstance(w, str):
+                    wave_items.append(f"**{w}**")
+            if wave_items:
+                # Show as flowing tags
+                st.markdown(" · ".join(wave_items))
+
+        # Regime warnings from 5x module
+        regime_warnings = five_x.get("regime_warnings", [])
+        if regime_warnings:
+            for rw in regime_warnings:
+                st.warning(rw)
+    else:
+        st.markdown("### 🔥 5x Potential Watchlist")
+        st.info("No 5x potential candidates detected yet — will populate on next scan.")
+
+    # ── Two-System Explainer Banner ────────────────────
+    st.markdown("---")
+    st.markdown(
+        '<div style="background:rgba(26,31,46,0.85); border:1px solid rgba(68,138,255,0.3); '
+        'border-radius:10px; padding:16px 24px; margin:12px 0;">'
+        '<div style="font-size:15px; font-weight:700; color:#448aff; margin-bottom:8px;">'
+        '🏛️ Two-System Architecture</div>'
+        '<div style="font-size:13px; color:#b0bec5; line-height:1.6;">'
+        '<b style="color:#00e676;">System 1 — Policy B v4 (Top Picks above)</b>: '
+        'Ultra-selective high-conviction trades. Max 3 per engine per scan. '
+        'Regime-gated, conviction-scored. <b>Target: 80% win rate.</b><br/>'
+        '<b style="color:#ffa726;">System 2 — 5x Potential (Watchlist below)</b>: '
+        'Broad awareness of stocks with ≥5x options return potential. '
+        'Covers volatile, sector-wave, high-beta names the Top 10 filters out. '
+        '<b>86% coverage of major movers.</b><br/><br/>'
+        'Both systems run at <b>every 9:35 AM and 3:15 PM scan</b> via '
+        '<code style="color:#e0e0e0;">meta_engine.py</code>. '
+        'Policy B v4 is for <b>trading</b>. '
+        '5x Potential is for <b>awareness</b> '
+        '(ensuring you never miss a major mover even if it didn\'t pass ultra-selective gates).'
+        '</div></div>',
+        unsafe_allow_html=True,
+    )
+
 
 # ─────────────────────────────────────────────────────
 #  TAB 3: Trade History  (Persistent P&L Dashboard)

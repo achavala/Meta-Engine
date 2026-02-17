@@ -73,226 +73,6 @@ except (ImportError, AttributeError):
     logger.debug("PutsEngine sector map unavailable — will use forecast sectors")
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# SIGNAL INTELLIGENCE LOADERS — FEB 16 v5 (Catch All 20 Movers)
-# ═══════════════════════════════════════════════════════════════════════
-# These functions load and cache cross-source intelligence that the base
-# scoring pipeline misses:
-#   1. Predictive signal recurrence (10-40x appearances → strong conviction)
-#   2. Dark pool institutional flow ($175M AMAT, $370M MU)
-#   3. Multi-day setup persistence (signals persisting 2-3 days)
-# ═══════════════════════════════════════════════════════════════════════
-
-_PRED_RECURRENCE_CACHE: Optional[Dict[str, int]] = None
-_DARKPOOL_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
-_MULTIDAY_PERSISTENCE_CACHE: Optional[Dict[str, int]] = None
-
-
-def _load_predictive_recurrence() -> Dict[str, int]:
-    """
-    Load predictive signal recurrence counts from predictive_signals.json.
-
-    Counts how many times each symbol appeared across ALL scans in the file.
-    All 20 top movers from Feb 9-13 had 10-40x recurring signals — this is
-    one of the strongest conviction indicators available.
-
-    Returns:
-        {symbol: appearance_count}  e.g. {"ROKU": 42, "RIVN": 28}
-    """
-    global _PRED_RECURRENCE_CACHE
-    if _PRED_RECURRENCE_CACHE is not None:
-        return _PRED_RECURRENCE_CACHE
-
-    _PRED_RECURRENCE_CACHE = {}
-    tn_data = Path.home() / "TradeNova" / "data"
-
-    # Try predictive_signals.json first (multi-day history)
-    for fname in ("predictive_signals.json", "predictive_signals_latest.json"):
-        try:
-            fpath = tn_data / fname
-            if not fpath.exists():
-                continue
-            with open(fpath) as f:
-                data = json.load(f)
-
-            if isinstance(data, dict):
-                for date_key, day_data in data.items():
-                    if not isinstance(day_data, dict):
-                        continue
-                    for scan in day_data.get("scans", []):
-                        if not isinstance(scan, dict):
-                            continue
-                        for sig in scan.get("signals", []):
-                            if isinstance(sig, dict):
-                                sym = sig.get("symbol", "")
-                                if sym:
-                                    _PRED_RECURRENCE_CACHE[sym] = (
-                                        _PRED_RECURRENCE_CACHE.get(sym, 0) + 1
-                                    )
-
-            if _PRED_RECURRENCE_CACHE:
-                logger.info(
-                    f"  📡 Predictive recurrence: {len(_PRED_RECURRENCE_CACHE)} symbols loaded "
-                    f"from {fname} (top: {sorted(_PRED_RECURRENCE_CACHE.items(), key=lambda x: x[1], reverse=True)[:3]})"
-                )
-                return _PRED_RECURRENCE_CACHE
-        except Exception as e:
-            logger.debug(f"  Predictive recurrence: {fname} failed ({e})")
-
-    return _PRED_RECURRENCE_CACHE
-
-
-def _load_dark_pool_activity() -> Dict[str, Dict[str, Any]]:
-    """
-    Load dark pool institutional activity from darkpool_cache.json.
-
-    Computes aggregate metrics per symbol:
-      - total_value_m: total dark pool value in millions
-      - num_prints: number of dark pool prints
-      - buyside_pct: % of prints at premium (institutional buying)
-      - sellside_pct: % of prints at discount (institutional selling)
-      - net_institutional: buyside_pct - sellside_pct (>0 = accumulation)
-
-    Evidence: AMAT had $175M dark pool + 73% buyside → +13.8%.
-              MU had $370M dark pool + 67% buyside → +14.4%.
-              U had $28M dark pool + 30% buyside → -32.7% (selling).
-
-    Returns:
-        {symbol: {total_value_m, num_prints, buyside_pct, ...}}
-    """
-    global _DARKPOOL_CACHE
-    if _DARKPOOL_CACHE is not None:
-        return _DARKPOOL_CACHE
-
-    _DARKPOOL_CACHE = {}
-    try:
-        dp_path = Path.home() / "TradeNova" / "data" / "darkpool_cache.json"
-        if not dp_path.exists():
-            return _DARKPOOL_CACHE
-        with open(dp_path) as f:
-            dp_raw = json.load(f)
-
-        for sym, sym_data in dp_raw.items():
-            if not sym or not isinstance(sym, str):
-                continue
-            prints = []
-            if isinstance(sym_data, dict):
-                prints = sym_data.get("prints", [])
-            elif isinstance(sym_data, list):
-                prints = sym_data
-            if not prints:
-                continue
-
-            total_val = sum(p.get("value", 0) for p in prints if isinstance(p, dict))
-            buyside = sum(
-                1 for p in prints
-                if isinstance(p, dict) and (p.get("premium_discount_pct", 0) or 0) > 0
-            )
-            sellside = sum(
-                1 for p in prints
-                if isinstance(p, dict) and (p.get("premium_discount_pct", 0) or 0) < -0.3
-            )
-            n_prints = len(prints)
-            bs_pct = buyside / n_prints if n_prints > 0 else 0.5
-            ss_pct = sellside / n_prints if n_prints > 0 else 0.5
-
-            _DARKPOOL_CACHE[sym] = {
-                "total_value_m": total_val / 1e6,
-                "num_prints": n_prints,
-                "buyside_pct": round(bs_pct, 3),
-                "sellside_pct": round(ss_pct, 3),
-                "net_institutional": round(bs_pct - ss_pct, 3),
-            }
-
-        if _DARKPOOL_CACHE:
-            top3 = sorted(
-                _DARKPOOL_CACHE.items(),
-                key=lambda x: x[1]["total_value_m"],
-                reverse=True,
-            )[:3]
-            logger.info(
-                f"  🏦 Dark pool: {len(_DARKPOOL_CACHE)} symbols loaded "
-                f"(top: {[(s, f'${d['total_value_m']:.0f}M') for s, d in top3]})"
-            )
-    except Exception as e:
-        logger.debug(f"  Dark pool load failed: {e}")
-
-    return _DARKPOOL_CACHE
-
-
-def _load_multiday_persistence() -> Dict[str, int]:
-    """
-    Load multi-day setup persistence from forecast history.
-
-    Checks how many DISTINCT days a symbol appeared in forecasts.
-    Stocks appearing 2-3+ consecutive days have sustained institutional
-    interest — these are NOT one-day wonders.
-
-    Evidence: RIVN appeared in Mon+Tue+Wed forecasts → Thu +27.7%
-              VST appeared in Tue+Wed → Thu +12.2%
-              AMAT appeared Mon-Fri → Thu +13.8%
-
-    Returns:
-        {symbol: num_days_appeared}
-    """
-    global _MULTIDAY_PERSISTENCE_CACHE
-    if _MULTIDAY_PERSISTENCE_CACHE is not None:
-        return _MULTIDAY_PERSISTENCE_CACHE
-
-    _MULTIDAY_PERSISTENCE_CACHE = {}
-    tn_data = Path.home() / "TradeNova" / "data"
-
-    # Method 1: Check predictive_signals.json date keys
-    try:
-        pred_path = tn_data / "predictive_signals.json"
-        if pred_path.exists():
-            with open(pred_path) as f:
-                pred_data = json.load(f)
-            if isinstance(pred_data, dict):
-                sym_days: Dict[str, set] = {}
-                for date_key, day_data in pred_data.items():
-                    if not isinstance(day_data, dict):
-                        continue
-                    for scan in day_data.get("scans", []):
-                        if not isinstance(scan, dict):
-                            continue
-                        for sig in scan.get("signals", []):
-                            if isinstance(sig, dict):
-                                sym = sig.get("symbol", "")
-                                if sym:
-                                    sym_days.setdefault(sym, set()).add(date_key)
-                for sym, days in sym_days.items():
-                    _MULTIDAY_PERSISTENCE_CACHE[sym] = len(days)
-    except Exception as e:
-        logger.debug(f"  Multi-day persistence (predictive): {e}")
-
-    # Method 2: Also check tomorrows_forecast.json for "appeared before" markers
-    try:
-        fc_path = tn_data / "tomorrows_forecast.json"
-        if fc_path.exists():
-            with open(fc_path) as f:
-                fc_data = json.load(f)
-            for fc in fc_data.get("forecasts", []):
-                sym = fc.get("symbol", "")
-                if not sym:
-                    continue
-                # If symbol already has multi-day count from predictive, keep max
-                existing = _MULTIDAY_PERSISTENCE_CACHE.get(sym, 0)
-                if existing < 1:
-                    _MULTIDAY_PERSISTENCE_CACHE[sym] = 1
-    except Exception as e:
-        logger.debug(f"  Multi-day persistence (forecast): {e}")
-
-    if _MULTIDAY_PERSISTENCE_CACHE:
-        multi = {s: d for s, d in _MULTIDAY_PERSISTENCE_CACHE.items() if d >= 2}
-        logger.info(
-            f"  📅 Multi-day persistence: {len(multi)} symbols with 2+ days "
-            f"(top: {sorted(multi.items(), key=lambda x: x[1], reverse=True)[:5]})"
-        )
-
-    return _MULTIDAY_PERSISTENCE_CACHE
-
-
 def get_top_moonshots(top_n: int = 10) -> List[Dict[str, Any]]:
     """
     Get the Top N moonshot candidates from the TradeNova Moonshot Engine.
@@ -372,53 +152,6 @@ def get_top_moonshots(top_n: int = 10) -> List[Dict[str, Any]]:
                     f"🟢 Merged {merged_count} MWS forecast candidates "
                     f"into live pool (total: {len(results)})"
                 )
-
-        # ── Merge predictive signal candidates (FEB 16 v5) ──────────
-        # Symbols with ≥15x predictive recurrence but not in forecast
-        # (catches RIVN, NET, DDOG, VST, U, DKNG that forecast misses)
-        pred_pool = _load_predictive_signal_candidates()
-        if pred_pool:
-            existing_symbols = {r["symbol"] for r in results}
-            pred_merged = 0
-            for pc in pred_pool:
-                if pc["symbol"] not in existing_symbols:
-                    results.append(pc)
-                    existing_symbols.add(pc["symbol"])
-                    pred_merged += 1
-            if pred_merged:
-                logger.info(
-                    f"📡 Merged {pred_merged} predictive-signal candidates "
-                    f"into live pool (total: {len(results)})"
-                )
-
-        # ── Merge universe scanner candidates (FEB 16 v5.2) ────────
-        # Catches VKTX/CVNA-type movers with pre-market gaps, volume spikes,
-        # or UW unusual activity that have ZERO presence in other data sources.
-        try:
-            from engine_adapters.universe_scanner import scan_universe_catchall
-            import os as _os
-            _poly_key = _os.getenv("POLYGON_API_KEY", "") or _os.getenv("MASSIVE_API_KEY", "")
-            _uw_key = _os.getenv("UNUSUAL_WHALES_API_KEY", "")
-            univ_pool = scan_universe_catchall(
-                polygon_api_key=_poly_key,
-                uw_api_key=_uw_key,
-                direction="bullish",
-            )
-            if univ_pool:
-                existing_symbols = {r["symbol"] for r in results}
-                univ_merged = 0
-                for uc in univ_pool:
-                    if uc["symbol"] not in existing_symbols:
-                        results.append(uc)
-                        existing_symbols.add(uc["symbol"])
-                        univ_merged += 1
-                if univ_merged:
-                    logger.info(
-                        f"🌐 Merged {univ_merged} universe-scanner candidates "
-                        f"into live pool (total: {len(results)})"
-                    )
-        except Exception as e:
-            logger.debug(f"  Universe scanner merge failed: {e}")
 
         # ── Universe gate — only allow tickers in the 104-ticker static list ──
         if _STATIC_UNIVERSE:
@@ -577,53 +310,6 @@ def _fallback_from_cached_moonshots(top_n: int = 10) -> List[Dict[str, Any]]:
     forecast_candidates = _load_forecast_candidates()
     if forecast_candidates:
         results.extend(forecast_candidates)
-
-    # --- Source 0c: Predictive signal candidates (FEB 16 v5) ---
-    # Symbols with ≥15x predictive recurrence but not in forecast/interval data.
-    # Catches RIVN, NET, DDOG, VST, U, DKNG that other sources miss.
-    pred_candidates = _load_predictive_signal_candidates()
-    if pred_candidates:
-        existing_symbols = {r["symbol"] for r in results}
-        pred_merged = 0
-        for pc in pred_candidates:
-            if pc["symbol"] not in existing_symbols:
-                results.append(pc)
-                existing_symbols.add(pc["symbol"])
-                pred_merged += 1
-        if pred_merged:
-            logger.info(
-                f"📡 Merged {pred_merged} predictive-signal candidates "
-                f"into cached pool (total: {len(results)})"
-            )
-
-    # --- Source 0d: Universe scanner catch-all (FEB 16 v5.2) ---
-    # Catches VKTX/CVNA-type movers with pre-market gaps, volume spikes,
-    # or UW unusual activity that have ZERO presence in other data sources.
-    try:
-        from engine_adapters.universe_scanner import scan_universe_catchall
-        import os as _os
-        _poly_key = _os.getenv("POLYGON_API_KEY", "") or _os.getenv("MASSIVE_API_KEY", "")
-        _uw_key = _os.getenv("UNUSUAL_WHALES_API_KEY", "")
-        univ_candidates = scan_universe_catchall(
-            polygon_api_key=_poly_key,
-            uw_api_key=_uw_key,
-            direction="bullish",
-        )
-        if univ_candidates:
-            existing_symbols = {r["symbol"] for r in results}
-            univ_merged = 0
-            for uc in univ_candidates:
-                if uc["symbol"] not in existing_symbols:
-                    results.append(uc)
-                    existing_symbols.add(uc["symbol"])
-                    univ_merged += 1
-            if univ_merged:
-                logger.info(
-                    f"🌐 Merged {univ_merged} universe-scanner candidates "
-                    f"into cached pool (total: {len(results)})"
-                )
-    except Exception as e:
-        logger.debug(f"  Universe scanner merge (cached) failed: {e}")
 
     # --- Source 1: final_recommendations.json (best curated source) ---
     try:
@@ -1179,140 +865,6 @@ def _load_forecast_candidates() -> List[Dict[str, Any]]:
 
     except Exception as e:
         logger.debug(f"Failed to read tomorrows_forecast.json: {e}")
-        return []
-
-
-def _load_predictive_signal_candidates() -> List[Dict[str, Any]]:
-    """
-    Generate supplementary candidates from predictive_signals.json (FEB 16 v5).
-
-    When a symbol has HIGH predictive signal recurrence (≥15x appearances)
-    AND is in the static universe, it has proven institutional interest that
-    the MWS forecast may not capture.
-
-    Evidence (Feb 9-13):
-      - RIVN: 37x recurrence, NOT in forecast → +27.7% (biggest call winner)
-      - U:    40x recurrence, NOT in forecast → -32.7% (biggest put winner)
-      - DKNG: 25x recurrence, NOT in forecast → -22.8%
-      - VST:  21x recurrence, NOT in forecast → +12.2%
-
-    These are the movers the existing pipeline misses entirely. By creating
-    synthetic candidates from predictive signals + dark pool data, we give
-    the ORM/conviction pipeline a chance to score and rank them.
-
-    Returns candidates for symbols with ≥15x predictive recurrence that
-    are in the static universe. Score is scaled from recurrence count.
-    """
-    MIN_RECURRENCE = 10  # v5: Lowered 15→10 (captures SHOP 14x, RDDT 13x, HOOD 11x, COIN 10x)
-
-    try:
-        pred = _load_predictive_recurrence()
-        if not pred:
-            return []
-
-        # Only create candidates for universe symbols
-        universe = _STATIC_UNIVERSE if _STATIC_UNIVERSE else set()
-        if not universe:
-            logger.debug("  Predictive candidates: no static universe loaded")
-            return []
-
-        dp = _load_dark_pool_activity()
-        multiday = _load_multiday_persistence()
-
-        candidates = []
-        for sym, count in pred.items():
-            if count < MIN_RECURRENCE:
-                continue
-            if sym not in universe:
-                continue
-
-            # Get dark pool info for price estimation
-            dp_info = dp.get(sym, {})
-            days = multiday.get(sym, 0)
-
-            # Score: scale recurrence to 0.55-0.90 range (v5.1: raised floor)
-            # 10x → 0.55, 20x → 0.70, 30x → 0.85, 37x+ → 0.90
-            # Evidence: ALL 20 top movers had 10-40x; higher base captures them
-            score = min(0.55 + (count - MIN_RECURRENCE) * 0.015, 0.90)
-
-            # Collect signals from predictive data — more granular
-            # v5.1: Map recurrence to multiple signal entries so sig_density
-            # reflects the institutional interest these counts represent.
-            signals = []
-            if count >= 30:
-                signals.extend([
-                    f"very_persistent_setup ({count}x)",
-                    "institutional_momentum",
-                    "recurring_confirmation",
-                    "strong_signal_cluster",
-                ])
-            elif count >= 20:
-                signals.extend([
-                    f"persistent_setup ({count}x)",
-                    "institutional_momentum",
-                    "recurring_confirmation",
-                ])
-            elif count >= 15:
-                signals.extend([
-                    f"recurring_signal ({count}x)",
-                    "institutional_momentum",
-                ])
-            else:
-                signals.append(f"recurring_signal ({count}x)")
-
-            if dp_info.get("total_value_m", 0) >= 50:
-                signals.append(f"dark_pool_${dp_info['total_value_m']:.0f}M")
-            elif dp_info.get("total_value_m", 0) >= 10:
-                signals.append("dark_pool_moderate")
-            if days >= 3:
-                signals.append(f"multiday_{days}d_strong")
-            elif days >= 2:
-                signals.append(f"multiday_{days}d")
-
-            # v5.1: Default MPS = 0.65 (high recurrence ⇒ high move potential)
-            # Evidence: all 20 top movers with 10-40x recurrence had >10% moves
-            default_mps = 0.65 if count >= 15 else 0.55
-
-            candidates.append({
-                "symbol": sym,
-                "score": round(score, 3),
-                "price": 0,  # Will be filled by ORM if available
-                "signals": signals,
-                "signal_types": ["Predictive-Recurrence"],
-                "option_type": "call",
-                "target_return": 0,
-                "engine": "Moonshot (Predictive Signals)",
-                "sector": "",
-                "volume_ratio": 0,
-                "short_interest": 0,
-                "action": "WATCH",
-                "entry_low": 0,
-                "entry_high": 0,
-                "target": 0,
-                "stop": 0,
-                "rsi": 50,
-                "uw_sentiment": "",
-                "data_source": "predictive_signals.json",
-                "data_age_days": 0,
-                "interval_persistence": count,
-                "_pred_recurrence_count": count,
-                "_multiday_days": days,
-                "_move_potential_score": default_mps,
-                "catalysts": [],
-            })
-
-        if candidates:
-            candidates.sort(key=lambda x: x["score"], reverse=True)
-            logger.info(
-                f"📡 Predictive signal candidates: {len(candidates)} symbols "
-                f"with ≥{MIN_RECURRENCE}x recurrence "
-                f"(top: {', '.join(c['symbol'] for c in candidates[:5])})"
-            )
-
-        return candidates
-
-    except Exception as e:
-        logger.debug(f"Failed to load predictive signal candidates: {e}")
         return []
 
 
@@ -2505,19 +2057,12 @@ def _enrich_moonshots_with_orm(
             f"(avg={avg_orm:.3f}, range={min_orm:.3f}–{max_orm:.3f})"
         )
 
-    # ── CONVICTION SCORING + TOP-N RANKING (Policy B v5) ──────────
+    # ── CONVICTION SCORING + TOP-N RANKING (Policy B v4) ──────────
     # Compute composite conviction score for each surviving candidate.
-    # Factors: base_score, ORM, MPS, signal_count, premium signals,
-    #          predictive recurrence, dark pool, multi-day persistence.
+    # Factors: base_score, ORM, MPS, signal_count, premium signals, regime.
     # Then rank and keep only top MAX_MOONSHOT_PER_SCAN to maximise WR.
-    #
-    # v5 changes (FEB 16):
-    #   - Expanded from 3→5 per scan to capture more winners (ROKU, AMAT, VST)
-    #   - Added predictive recurrence boost (all 20 movers had 10-40x)
-    #   - Added dark pool institutional flow boost ($175M AMAT, $370M MU)
-    #   - Added multi-day persistence boost (RIVN 3-day setup → Thu +27.7%)
-    MAX_MOONSHOT_PER_SCAN = 5  # v5: Expanded 3→5 (still selective but catches more winners)
-    MIN_CONVICTION_SCORE = 0.35  # v5.1: Lowered 0.45→0.35 (catches high-recurrence movers like RDDT, HOOD)
+    MAX_MOONSHOT_PER_SCAN = 3  # Ultra-selective: max 3 per scan for 80% WR target
+    MIN_CONVICTION_SCORE = 0.45  # Minimum conviction to pass (drops marginal picks)
     PM_CONVICTION_PENALTY = 0.75  # PM scans get 25% conviction penalty (PM momentum fades)
 
     for c in candidates:
@@ -2536,73 +2081,19 @@ def _enrich_moonshots_with_orm(
             features.get("institutional_accumulation", False),
         ])
 
-        # ── v5 new factors ──────────────────────────────────────
-        pred_recurrence = features.get("pred_recurrence_count", 0)
-        dp_value = features.get("dark_pool_value_m", 0)
-        dp_net_inst = features.get("dark_pool_net_institutional", 0)
-        multiday_days = features.get("multiday_persistence_days", 0)
-
-        # Predictive recurrence score (0.0-1.0) — v5.1 tuned
-        #   1x-9x   → 0.0  (not significant)
-        #   10x-14x → 0.40 (moderate — RDDT 13x, HOOD 11x)
-        #   15x-19x → 0.60 (strong — SHOP 14x, DDOG 17x)
-        #   20x-29x → 0.80 (very strong — DKNG 25x, OKLO 26x)
-        #   30x+    → 1.00 (elite — ROKU 42x, RIVN 37x, U 40x)
-        if pred_recurrence >= 30:
-            pred_score = 1.0
-        elif pred_recurrence >= 20:
-            pred_score = 0.80
-        elif pred_recurrence >= 15:
-            pred_score = 0.60
-        elif pred_recurrence >= 10:
-            pred_score = 0.40
-        else:
-            pred_score = 0.0
-
-        # Dark pool institutional score (0.0-1.0)
-        #   >$100M + net positive → 1.0 (massive institutional buying: AMAT, MU)
-        #   >$50M + net positive  → 0.6 (significant institutional buying)
-        #   >$10M + net positive  → 0.3 (moderate institutional buying)
-        #   negative net          → 0.0 (institutional selling: U -32.7%)
-        if dp_value >= 100 and dp_net_inst > 0:
-            dp_score = 1.0
-        elif dp_value >= 50 and dp_net_inst > 0:
-            dp_score = 0.6
-        elif dp_value >= 10 and dp_net_inst > 0:
-            dp_score = 0.3
-        else:
-            dp_score = 0.0
-
-        # Multi-day persistence score (0.0-1.0)
-        #   1 day  → 0.0  (first appearance)
-        #   2 days → 0.5  (sustained interest)
-        #   3+ days → 1.0 (very persistent — RIVN, AMAT multi-day → big move)
-        if multiday_days >= 3:
-            multiday_score = 1.0
-        elif multiday_days >= 2:
-            multiday_score = 0.5
-        else:
-            multiday_score = 0.0
-
-        # ── Conviction score formula (v5.1 — reweighted) ────────
-        #   25% base score (reduced — pred recurrence now more important)
-        #   20% MPS (move potential)
-        #   10% signal density (sig_count / 15, capped at 1.0)
-        #   10% premium signal bonus (0.10 per premium signal, max 0.50)
-        #   15% predictive recurrence (v5.1: raised 10→15%, key discriminator)
-        #   10% dark pool institutional flow (v5.1: raised 8→10%)
-        #   10% multi-day persistence (v5.1: raised 7→10%)
+        # Conviction score formula:
+        #   40% base score (already blended with ORM)
+        #   25% MPS (move potential)
+        #   15% signal density (sig_count / 15, capped at 1.0)
+        #   20% premium signal bonus (0.10 per premium signal, max 0.50)
         sig_density = min(sig_cnt / 15.0, 1.0)
         premium_bonus = min(premium_count * 0.10, 0.50)
 
         conviction = (
-            0.25 * base
-            + 0.20 * mps_val
-            + 0.10 * sig_density
-            + 0.10 * premium_bonus
-            + 0.15 * pred_score
-            + 0.10 * dp_score
-            + 0.10 * multiday_score
+            0.40 * base
+            + 0.25 * mps_val
+            + 0.15 * sig_density
+            + 0.20 * premium_bonus
         )
 
         # PM scan penalty: moonshot momentum fades by afternoon.
@@ -2618,19 +2109,6 @@ def _enrich_moonshots_with_orm(
             conviction *= PM_CONVICTION_PENALTY
 
         c["_conviction_score"] = round(conviction, 4)
-        # Store component breakdown for debugging
-        c["_conviction_breakdown"] = {
-            "base": round(0.25 * base, 4),
-            "mps": round(0.20 * mps_val, 4),
-            "sig_density": round(0.10 * sig_density, 4),
-            "premium": round(0.10 * premium_bonus, 4),
-            "pred_recurrence": round(0.15 * pred_score, 4),
-            "dark_pool": round(0.10 * dp_score, 4),
-            "multiday": round(0.10 * multiday_score, 4),
-            "pred_count": pred_recurrence,
-            "dp_value_m": round(dp_value, 1),
-            "multiday_days": multiday_days,
-        }
 
     # Drop candidates below conviction floor
     below_floor = [c for c in candidates if c.get("_conviction_score", 0) < MIN_CONVICTION_SCORE]
@@ -2661,7 +2139,7 @@ def _enrich_moonshots_with_orm(
 
     # Log final picks with ORM + conviction breakdown
     n_final = min(top_n, len(candidates))
-    logger.info(f"  📊 FINAL {n_final} MOONSHOT picks (Policy B v5 — expanded intelligence) "
+    logger.info(f"  📊 FINAL {n_final} MOONSHOT picks (Policy B v4 ultra-selective) "
                  f"(ORM blending: computed={ORM_WEIGHT_COMPUTED}, "
                  f"default={ORM_WEIGHT_DEFAULT}, missing={ORM_WEIGHT_MISSING}):")
     for i, c in enumerate(candidates[:top_n], 1):
@@ -2674,23 +2152,11 @@ def _enrich_moonshots_with_orm(
         fcts = c.get("_orm_factors", {})
         top_factors = sorted(fcts.items(), key=lambda x: x[1], reverse=True)[:3]
         factor_str = " ".join(f"{k[:3]}={v:.2f}" for k, v in top_factors)
-        # v5 breakdown
-        bd = c.get("_conviction_breakdown", {})
-        pred_cnt = bd.get("pred_count", 0)
-        dp_val = bd.get("dp_value_m", 0)
-        md_days = bd.get("multiday_days", 0)
-        v5_tag = ""
-        if pred_cnt >= 10:
-            v5_tag += f" 📡{pred_cnt}x"
-        if dp_val >= 10:
-            v5_tag += f" 🏦${dp_val:.0f}M"
-        if md_days >= 2:
-            v5_tag += f" 📅{md_days}d"
         logger.info(
             f"    #{i:2d} {c['symbol']:6s} "
             f"final={c['score']:.3f} conv={conv:.3f} "
-            f"(base={base:.3f} orm={orm:.3f} [{status}] mps={mps_val:.2f} sig={sig_cnt})"
-            f"{v5_tag} [{factor_str}]"
+            f"(base={base:.3f} orm={orm:.3f} [{status}] mps={mps_val:.2f} sig={sig_cnt}) "
+            f"[{factor_str}]"
         )
 
     # ── THETA AWARENESS FLAGS (FEB 16 v2) ─────────────────────
@@ -2765,24 +2231,6 @@ def _extract_pick_features(candidate: Dict[str, Any],
     total_prem = call_prem + put_prem
     call_pct = call_prem / total_prem if total_prem > 0 else 0.50
 
-    # ── Predictive signal recurrence (FEB 16 v5) ───────────
-    pred_recurrence = _load_predictive_recurrence()
-    pred_count = pred_recurrence.get(sym, 0)
-
-    # ── Dark pool institutional flow (FEB 16 v5) ──────────
-    dp_data = _load_dark_pool_activity()
-    dp_info = dp_data.get(sym, {})
-    dp_value_m = dp_info.get("total_value_m", 0)
-    dp_buyside = dp_info.get("buyside_pct", 0.5)
-    dp_net = dp_info.get("net_institutional", 0)
-
-    # ── Multi-day persistence (FEB 16 v5) ─────────────────
-    multiday = _load_multiday_persistence()
-    days_appeared = multiday.get(sym, 0)
-
-    # ── Earnings proximity flag ───────────────────────────
-    has_earnings = "earnings" in cat_str or "report" in cat_str
-
     return {
         "iv_inverted": any("iv_inverted" in s for s in sig_set),
         "neg_gex_explosive": any("neg_gex_explosive" in s for s in sig_set),
@@ -2799,14 +2247,6 @@ def _extract_pick_features(candidate: Dict[str, Any],
         "call_pct": round(call_pct, 3),
         "mps": candidate.get("_move_potential_score", 0) or 0,
         "signal_count": len(signals) if isinstance(signals, list) else 0,
-        "base_score": candidate.get("_base_score", candidate.get("score", 0)),
-        # ── New v5 features ───────────────────────────────
-        "pred_recurrence_count": pred_count,
-        "dark_pool_value_m": round(dp_value_m, 1),
-        "dark_pool_buyside_pct": round(dp_buyside, 3),
-        "dark_pool_net_institutional": round(dp_net, 3),
-        "multiday_persistence_days": days_appeared,
-        "has_earnings": has_earnings,
     }
 
 
@@ -2948,38 +2388,14 @@ def _apply_regime_shadow_and_hard_block(
         # overwhelms individual stock signals. Deploy moonshots ONLY in bull markets.
         
         if regime_label in ("STRONG_BEAR", "LEAN_BEAR"):
-            # v4: HARD BLOCK moonshots in bear regimes (11.1% WR)
-            # v5.1 ESCAPE HATCH: Allow if stock has very strong multi-source
-            # conviction — high pred recurrence + multi-day persistence.
-            # Evidence: SHOP (pred=14, 3 days, $123M DP) → +17.5% in bear week
-            # NET (pred=19, 4 days) → +17.2% in bear week
-            pred_cnt = features.get("pred_recurrence_count", 0)
-            md_days = features.get("multiday_persistence_days", 0)
-            dp_val = features.get("dark_pool_value_m", 0)
-
-            has_bear_escape = (
-                pred_cnt >= 10
-                and md_days >= 3
-                and (dp_val >= 30 or pred_cnt >= 20)
+            # v4: TOTAL HARD BLOCK in bear regimes
+            # Evidence: 1/9 = 11.1% WR in STRONG_BEAR (even with premium signals)
+            # Single winner (NET +11.8%) cannot justify 8 losers
+            gate_decision = "HARD_BLOCK"
+            gate_reasons.append(
+                f"{regime_label}: ALL moonshots blocked (11.1% WR in bear — "
+                f"market direction overwhelms individual signals)"
             )
-
-            if has_bear_escape:
-                gate_reasons.append(
-                    f"{regime_label}: Moonshot ESCAPE — "
-                    f"pred={pred_cnt}x + {md_days}d persistence"
-                    + (f" + DP=${dp_val:.0f}M" if dp_val >= 30 else "")
-                    + " (sustained multi-source conviction overrides bear regime)"
-                )
-                logger.info(
-                    f"  🔓 BEAR ESCAPE: {sym} — pred{pred_cnt}x + "
-                    f"{md_days}d persistence → allow moonshot in {regime_label}"
-                )
-            else:
-                gate_decision = "HARD_BLOCK"
-                gate_reasons.append(
-                    f"{regime_label}: Moonshot blocked (11.1% WR in bear — "
-                    f"market direction overwhelms individual signals)"
-                )
         elif regime_label == "NEUTRAL":
             # v4: BLOCK in neutral (no reliable edge without regime tailwind)
             gate_decision = "HARD_BLOCK"
@@ -3008,54 +2424,12 @@ def _apply_regime_shadow_and_hard_block(
         # ── Additional v4 override: bearish flow in bull regimes ──
         # (Bear/neutral already blocked above; this catches edge case
         # where call_buying=True but overall flow is bearish in bull regime)
-        #
-        # ESCAPE HATCH (FEB 16 v5): Earnings + call_buying + high pred recurrence
-        # can have artificially low call_pct due to market maker hedging. Example:
-        # SHOP had 3% call_pct but was the #2 call winner (+437%). Earnings +
-        # institutional call buying + 25x predictive recurrence = real conviction
-        # despite low call_pct. Allow if ALL three present:
-        #   1. has_earnings (catalyst)
-        #   2. call_buying (MWS detected heavy call buying)
-        #   3. pred_recurrence_count >= 10 (strong sustained signal)
         if gate_decision == "ALLOW" and features["bearish_flow"]:
-            pred_cnt_flow = features.get("pred_recurrence_count", 0)
-            md_days_flow = features.get("multiday_persistence_days", 0)
-            dp_val_flow = features.get("dark_pool_value_m", 0)
-
-            # Escape A: Earnings + call_buying + recurrence (original)
-            escape_flow_a = (
-                features.get("has_earnings", False)
-                and features.get("call_buying", False)
-                and pred_cnt_flow >= 10
+            gate_decision = "HARD_BLOCK"
+            gate_reasons.append(
+                f"Bearish UW flow override (call_pct={features['call_pct']:.0%}) "
+                f"in {regime_label}"
             )
-            # Escape B: Sustained multi-source conviction (v5.1)
-            # Evidence: SHOP (3% call_pct, pred=14, 3d, $123M DP) → +17.5%
-            escape_flow_b = (
-                pred_cnt_flow >= 10
-                and md_days_flow >= 3
-                and (dp_val_flow >= 30 or pred_cnt_flow >= 20)
-            )
-
-            if escape_flow_a or escape_flow_b:
-                esc_type = []
-                if escape_flow_a:
-                    esc_type.append(f"earnings+call_buying+pred{pred_cnt_flow}x")
-                if escape_flow_b:
-                    esc_type.append(f"sustained({pred_cnt_flow}x+{md_days_flow}d+${dp_val_flow:.0f}M)")
-                gate_reasons.append(
-                    f"UW flow bearish (call_pct={features['call_pct']:.0%}) "
-                    f"but ESCAPE: {' | '.join(esc_type)} → allow"
-                )
-                logger.info(
-                    f"  🔓 FLOW ESCAPE: {sym} — bearish flow BUT "
-                    f"{' | '.join(esc_type)} → allow"
-                )
-            else:
-                gate_decision = "HARD_BLOCK"
-                gate_reasons.append(
-                    f"Bearish UW flow override (call_pct={features['call_pct']:.0%}) "
-                    f"in {regime_label}"
-                )
 
         c["_regime_gate_decision"] = gate_decision
         c["_regime_gate_reasons"] = gate_reasons

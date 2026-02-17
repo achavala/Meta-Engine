@@ -139,15 +139,6 @@ def detect_gap_ups(
     for sec_info in sector_hot.values():
         all_tickers.update(sec_info.get("symbols", []))
 
-    # FEB 16 v5.2: ALSO add ALL pre-market gap tickers (>3%) from the
-    # FULL universe — not just tickers already in other sources.
-    # This catches VKTX/CVNA-type movers that gap up with zero prior signals.
-    if premarket_data:
-        for sym, pm_info in premarket_data.items():
-            gap_pct = pm_info.get("gap_pct", 0)
-            if abs(gap_pct) >= 3.0:
-                all_tickers.add(sym)
-
     # Filter to universe if available
     if universe:
         all_tickers = all_tickers & universe
