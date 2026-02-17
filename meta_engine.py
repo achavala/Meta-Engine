@@ -731,6 +731,32 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
         results["trading"] = {"status": "error", "error": str(e)}
 
     # ================================================================
+    # STEP 10: Deep Options Analysis (Strikes/Expiry/Entry/Exit)
+    # ================================================================
+    # Institutional-grade deep-dive: top 3 CALLS + top 3 PUTS with
+    # specific strike, expiry, entry zone, target, stop loss, technicals.
+    # Sends its own separate email + Telegram + X notifications.
+    logger.info("\n" + "=" * 50)
+    logger.info(f"STEP 10: Deep Options Analysis ({session_label})...")
+    logger.info("=" * 50)
+
+    results["deep_options_analysis"] = {"status": "skipped"}
+    try:
+        from _3pm_analysis import run_3pm_analysis
+        deep_calls, deep_puts, deep_report = run_3pm_analysis(
+            session_label=session_label
+        )
+        results["deep_options_analysis"] = {
+            "status": "completed",
+            "calls": len(deep_calls),
+            "puts": len(deep_puts),
+        }
+        logger.info(f"  ✅ Deep analysis: {len(deep_calls)} calls, {len(deep_puts)} puts")
+    except Exception as e:
+        logger.warning(f"  ⚠️ Deep options analysis failed: {e}")
+        results["deep_options_analysis"] = {"status": "error", "error": str(e)}
+
+    # ================================================================
     # FINAL STATUS
     # ================================================================
     results["status"] = "completed"
@@ -743,6 +769,7 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
     
     trading_status = results.get("trading", {})
     trades_placed = trading_status.get("trades_placed", 0)
+    deep_status = results.get("deep_options_analysis", {})
 
     logger.info("\n" + "=" * 70)
     logger.info("🏛️  META ENGINE — COMPLETED")
@@ -753,6 +780,7 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
     logger.info(f"   X/Twitter: {'✅' if results['notifications']['x_twitter'] else '❌'}")
     logger.info(f"   Chart: {'✅' if chart_path else '❌'}")
     logger.info(f"   Trading: {'✅' if trades_placed > 0 else '⏸️'} ({trades_placed} orders)")
+    logger.info(f"   Deep Options: {'✅' if deep_status.get('status') == 'completed' else '⚠️'}")
     logger.info(f"   Output: {output_dir}")
     logger.info("=" * 70)
     
