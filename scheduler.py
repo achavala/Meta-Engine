@@ -5,6 +5,10 @@ Runs the Meta Engine twice daily on every trading day:
   - 9:35 AM ET  (morning — real market data + gap detection)
   - 3:15 PM ET  (afternoon — intraday action + power hour setup)
 
+CRITICAL DESIGN: Each scheduled run launches meta_engine.py as a
+SUBPROCESS (not a Python import) so that code changes on disk are
+always picked up immediately — no manual restart required.
+
 Methods:
 1. APScheduler (preferred) — background daemon
 2. macOS launchd — system-level auto-start
@@ -57,6 +61,55 @@ EST = pytz.timezone("US/Eastern")
 # PID file for daemon management
 PID_FILE = META_DIR / "meta_scheduler.pid"
 
+# Git hash at scheduler startup — used to detect code changes
+_STARTUP_GIT_HASH: str = "unknown"
+
+# Path to venv Python interpreter
+VENV_PYTHON = str(META_DIR / "venv" / "bin" / "python3")
+
+
+# ═══════════════════════════════════════════════════════
+# Code-Freshness Safeguards
+# ═══════════════════════════════════════════════════════
+
+def _get_git_hash() -> str:
+    """Get current git commit hash (short) from disk."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(META_DIR),
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.stdout.strip() if result.returncode == 0 else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _check_and_restart_if_code_changed():
+    """
+    Compare current git hash on disk to what was loaded at startup.
+    If code has been updated (git commit/pull), self-restart so the
+    scheduler itself picks up any changes to scheduler.py.
+    launchd KeepAlive:true will immediately restart us.
+    """
+    global _STARTUP_GIT_HASH
+    if _STARTUP_GIT_HASH == "unknown":
+        return  # Can't compare
+    current_hash = _get_git_hash()
+    if current_hash != "unknown" and current_hash != _STARTUP_GIT_HASH:
+        logger.warning(
+            f"🔄 CODE CHANGE DETECTED — Startup: {_STARTUP_GIT_HASH} → "
+            f"Disk: {current_hash}"
+        )
+        logger.warning(
+            "   Self-restarting scheduler to load fresh code "
+            "(launchd will restart automatically)..."
+        )
+        # Clean exit — launchd KeepAlive will restart us with fresh code
+        if PID_FILE.exists():
+            PID_FILE.unlink()
+        os._exit(0)  # Hard exit to ensure clean restart
+
 
 def _write_pid():
     """Write current process PID to file."""
@@ -73,20 +126,84 @@ def _cleanup_pid(*args):
 
 
 def _scheduled_run(session_label: str = ""):
-    """Wrapper called by APScheduler at each scheduled time."""
+    """
+    Run meta_engine.py as a SUBPROCESS to always use the latest code.
+    
+    WHY SUBPROCESS (not Python import):
+      Python caches module imports globally. If meta_engine.py or any
+      adapter/module it uses is updated (e.g. via git push/commit),
+      a long-running scheduler process would still execute the OLD code
+      from memory. This was the root cause of the 2026-02-17 AM failure.
+      
+      Running as a subprocess starts a fresh Python process each time,
+      guaranteeing the latest on-disk code is always used.
+    """
     now_str = datetime.now(EST).strftime('%I:%M:%S %p ET')
     label = f" [{session_label}]" if session_label else ""
     logger.info("=" * 60)
     logger.info(f"⏰ Scheduled run triggered at {now_str}{label}")
     logger.info("=" * 60)
-    
+
+    # Log code version for audit trail
+    git_hash = _get_git_hash()
+    logger.info(f"   Code version (on disk): {git_hash}")
+
+    # If scheduler.py itself was updated, self-restart first
+    _check_and_restart_if_code_changed()
+
+    meta_script = str(META_DIR / "meta_engine.py")
+
     try:
-        from meta_engine import run_meta_engine
-        result = run_meta_engine(force=False)
-        run_status = result.get("status", "unknown")
-        logger.info(f"Run completed with status: {run_status}")
+        logger.info(f"   Launching subprocess: {VENV_PYTHON} {meta_script}")
+
+        proc = subprocess.run(
+            [VENV_PYTHON, meta_script],
+            cwd=str(META_DIR),
+            capture_output=True,
+            text=True,
+            timeout=900,  # 15 minute timeout — generous for API calls
+        )
+
+        if proc.returncode == 0:
+            stdout = proc.stdout or ""
+            if "META ENGINE — COMPLETED" in stdout:
+                logger.info("   ✅ Run completed successfully")
+                # Extract key metrics from the run's stdout
+                for line in stdout.split("\n"):
+                    stripped = line.strip()
+                    if any(k in stripped for k in [
+                        "Puts picks:", "Moonshot picks:", "Email:",
+                        "Telegram:", "X/Twitter:", "Deep Options:",
+                        "Trading:", "5x Potential:",
+                    ]):
+                        logger.info(f"      {stripped}")
+            elif "Not a trading day" in stdout:
+                logger.info("   📅 Skipped: Not a trading day")
+            elif "concurrent_run_blocked" in stdout:
+                logger.warning("   ⚠️ Skipped: Another run already in progress")
+            else:
+                logger.info("   ✅ Run completed (exit 0)")
+        else:
+            logger.error(f"   ❌ Run FAILED (exit code {proc.returncode})")
+            # Log last 20 lines of stderr for debugging
+            if proc.stderr:
+                for line in proc.stderr.strip().split("\n")[-20:]:
+                    logger.error(f"   STDERR: {line}")
+            if proc.stdout:
+                for line in proc.stdout.strip().split("\n")[-10:]:
+                    logger.error(f"   STDOUT: {line}")
+
+    except subprocess.TimeoutExpired:
+        logger.error(
+            "   ❌ Run TIMED OUT after 15 minutes — check for hung API calls"
+        )
+    except FileNotFoundError:
+        logger.error(
+            f"   ❌ Python interpreter not found: {VENV_PYTHON} — "
+            f"check venv exists"
+        )
     except Exception as e:
-        logger.error(f"Scheduled run FAILED: {e}", exc_info=True)
+        logger.error(f"   ❌ Scheduled run FAILED: {e}", exc_info=True)
 
 
 def _start_dashboard_thread():
@@ -226,7 +343,13 @@ def start_scheduler():
       - 9:35 AM ET  (morning scan — real market data + gap detection)
       - 3:15 PM ET  (afternoon scan — full intraday data + power hour setup)
     Also starts the trading dashboard on port 5050.
+    
+    IMPORTANT: Each run launches meta_engine.py as a SUBPROCESS so
+    code changes are always picked up without manual restart.
+    The scheduler also self-restarts if it detects its own code has changed.
     """
+    global _STARTUP_GIT_HASH
+
     try:
         from apscheduler.schedulers.blocking import BlockingScheduler
         from apscheduler.triggers.cron import CronTrigger
@@ -235,6 +358,9 @@ def start_scheduler():
         logger.error("APScheduler not installed. Run: pip install apscheduler")
         sys.exit(1)
     
+    # Record git hash at startup for code-change detection
+    _STARTUP_GIT_HASH = _get_git_hash()
+
     # Parse run times (2 daily scans)
     run_times = MetaConfig.RUN_TIMES_ET  # ["09:35", "15:15"]
     
@@ -242,6 +368,9 @@ def start_scheduler():
     logger.info("🏛️  META ENGINE SCHEDULER")
     logger.info(f"   Run times: {', '.join(run_times)} ET (every trading day)")
     logger.info(f"   PID: {os.getpid()}")
+    logger.info(f"   Code version: {_STARTUP_GIT_HASH}")
+    logger.info(f"   Python: {VENV_PYTHON}")
+    logger.info(f"   Mode: SUBPROCESS (always fresh code)")
     logger.info("=" * 60)
 
     # Start dashboards in background
@@ -324,6 +453,22 @@ def start_scheduler():
     )
     logger.info("  ✅ Job scheduled: Auto winner check every 30 min (9:30 AM - 4:00 PM ET), Mon-Fri")
 
+    # ── Job 6: Code-freshness watchdog (every 15 min) ──
+    # If code changes are detected (git commit/push), the scheduler
+    # self-restarts so it always runs the latest version.
+    # launchd KeepAlive:true ensures immediate restart.
+    scheduler.add_job(
+        _check_and_restart_if_code_changed,
+        trigger=IntervalTrigger(
+            minutes=15,
+            timezone=EST,
+        ),
+        id="code_freshness_watchdog",
+        name="Code Freshness Watchdog (every 15 min)",
+        misfire_grace_time=900,
+    )
+    logger.info("  ✅ Job scheduled: Code freshness watchdog every 15 min")
+
     # If Mac is currently awake and it's market hours, start caffeinate now
     now_et = datetime.now(EST)
     if now_et.weekday() < 5 and 9 <= now_et.hour < 16:
@@ -386,6 +531,10 @@ if __name__ == "__main__":
     elif args.action == "status":
         status()
     elif args.action == "run-now":
-        logger.info("Running Meta Engine NOW...")
-        from meta_engine import run_meta_engine
-        run_meta_engine(force=True)
+        logger.info("Running Meta Engine NOW (subprocess, fresh code)...")
+        meta_script = str(META_DIR / "meta_engine.py")
+        proc = subprocess.run(
+            [VENV_PYTHON, meta_script, "--force"],
+            cwd=str(META_DIR),
+        )
+        sys.exit(proc.returncode)
