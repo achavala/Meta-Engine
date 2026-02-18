@@ -562,6 +562,56 @@ def _fallback_from_cached_moonshots(top_n: int = 10) -> List[Dict[str, Any]]:
                 f"{len(results)} remain"
             )
 
+    # ── Inject real-time movers (gap-up stocks) ─────────────────────
+    # Upstream engines miss most intraday movers because they use overnight
+    # scans. Stocks surging +5% or +7% are THE strongest bullish signal.
+    try:
+        from engine_adapters.realtime_mover_scanner import (
+            scan_realtime_movers,
+            build_moonshot_candidates_from_movers,
+        )
+        rt_data = scan_realtime_movers(static_universe=_STATIC_UNIVERSE)
+        gap_up = rt_data.get("gap_up_movers", [])
+        if gap_up:
+            rt_candidates = build_moonshot_candidates_from_movers(gap_up)
+            existing_syms = {r.get("symbol", "") for r in results}
+            injected = 0
+            for rc in rt_candidates:
+                if rc["symbol"] not in existing_syms:
+                    results.append(rc)
+                    injected += 1
+                    existing_syms.add(rc["symbol"])
+                else:
+                    for r in results:
+                        if r.get("symbol") == rc["symbol"]:
+                            change = rc.get("_realtime_change_pct", 0)
+                            if change > 2.0:
+                                boost = min(change / 20.0, 0.15)
+                                r["score"] = min(r["score"] + boost, 1.0)
+                                r["signals"] = list(r.get("signals", [])) + rc.get("signals", [])
+                                r["_realtime_confirmed"] = True
+                                r["_realtime_change_pct"] = change
+                            break
+            if injected:
+                top_desc = ", ".join(
+                    "{} +{:.1f}%".format(m["symbol"], m["change_pct"])
+                    for m in gap_up[:5]
+                )
+                logger.info(
+                    f"  📈 Real-time movers: {injected} gap-up stocks injected "
+                    f"(top: {top_desc})"
+                )
+
+        all_price_data = rt_data.get("all_prices", {})
+        if all_price_data:
+            for r in results:
+                sym = r.get("symbol", "")
+                if sym in all_price_data and all_price_data[sym]["price"] > 0:
+                    r["price"] = all_price_data[sym]["price"]
+                    r["_realtime_change_pct"] = all_price_data[sym]["change_pct"]
+    except Exception as e:
+        logger.debug(f"  Real-time mover injection failed: {e}")
+
     # ── Deduplicate — keep highest-scoring entry per symbol ──────────
     # CRITICAL (FEB 11): Also merge metadata from lower-scored entries
     # so cross-source intelligence (MWS scores, pred signals, conviction)
@@ -1465,7 +1515,7 @@ def _apply_sector_momentum_boost(
     for sector, members in sector_candidates.items():
         strong_count = sum(
             1 for m in members
-            if m.get("_base_score", m.get("score", 0)) >= 0.70
+            if m.get("_base_score", m.get("score", 0)) >= 0.30
         )
         # FIX 3: Also count stocks from sector_sympathy_alerts
         if sector in sympathy_sector_counts:
@@ -1827,23 +1877,35 @@ def _enrich_moonshots_with_orm(
     # Backtested Feb 9-13: v1 had 62.5% WR but missed too many moonshot
     # winners due to inverted ORM filter and overly strict MPS/signal gates.
     #
-    # MOONSHOT ENGINE THRESHOLDS — POLICY B v3 (FEB 16, 2026) — ULTRA-SELECTIVE
-    # Target: 80% WR (quality over quantity, accepts 2-5 picks typical)
-    # Based on winner pattern analysis (Feb 9-13 backtest):
-    #   - Signal Count ≥ 6 (all winners had 6+ signals)
-    #   - Base Score ≥ 0.70 (winners avg 0.80-0.88, except AMD=0.35 outlier)
-    #   - MPS ≥ 0.65 (winners had 0.69-0.80, except TSM=0.40 outlier)
-    #   - Require at least 1 premium signal (call_buying, iv_inverted, dark_pool, neg_gex)
-    #   - Regime-aligned (STRONG_BULL requires call_buying, STRONG_BEAR requires iv_inverted OR score≥0.85)
-    #   - Block bearish_flow in ALL regimes
+    # MOONSHOT ENGINE THRESHOLDS — POLICY B v5 (FEB 17, 2026) — ADAPTIVE
+    # v3 had static thresholds (sigs>=6, score>=0.70) from a 5-day backtest.
+    # Problem: upstream delivers 0-3 signals with scores 0.30-0.50.
+    # Static gates killed 42/44 candidates today — 100% kill rate.
+    #
+    # v5: Tiered adaptive system (same architecture as puts v5).
+    # Premium signal requirement RELAXED: it was blocking everything because
+    # catalysts rarely contain "call buying" as a literal string.
     # ──────────────────────────────────────────────────────────
-    MIN_SIGNAL_COUNT = 6          # POLICY B v3: Raised 5→6 (ultra-selective for 80% WR)
-    MIN_BASE_SCORE = 0.70         # POLICY B v3: Raised 0.65→0.70 (winners avg 0.80-0.88)
-    MIN_MOVE_POTENTIAL = 0.65     # POLICY B v3: Raised 0.50→0.65 (winners had 0.69-0.80)
-    ORM_MISSING_PENALTY = 0.04    # Smaller penalty for moonshot (missing = likely volatile)
-    # Breakeven realism proxy (adapter-level pre-check)
+    ORM_MISSING_PENALTY = 0.04
     MIN_EXPECTED_MOVE_VS_BREAKEVEN = 1.3
-    TYPICAL_BREAKEVEN_PCT = 3.5   # v2: Lowered 5.0→3.5 (weekly ATM on 4%+ ATR stocks)
+    TYPICAL_BREAKEVEN_PCT = 3.5
+
+    # Tier 1: High-conviction
+    T1_SIGNAL_COUNT = 5
+    T1_BASE_SCORE = 0.60
+    T1_MOVE_POTENTIAL = 0.55
+
+    # Tier 2: Standard — where most real picks land
+    T2_SIGNAL_COUNT = 2
+    T2_BASE_SCORE = 0.30
+    T2_MOVE_POTENTIAL = 0.35
+
+    # Tier 3: Opportunistic (gap-up or high-ORM driven)
+    T3_SIGNAL_COUNT = 1
+    T3_BASE_SCORE = 0.20
+    T3_MOVE_POTENTIAL = 0.25
+
+    MIN_PICKS_BEFORE_RELAX = 3
 
     # ── THETA AWARENESS (adapter-level, FEB 16 v2: WARNING not BLOCK) ──
     # This is a SIGNAL ENGINE for manual execution — never block picks.
@@ -1879,66 +1941,33 @@ def _enrich_moonshots_with_orm(
         logger.warning(f"  ⚠️ Theta awareness: check failed ({e})")
 
     before_gates = len(candidates)
-    filtered_candidates = []
-    gate_reasons = []
-    
-    for c in candidates:
-        orm = c.get("_orm_score", 0)
-        orm_status = c.get("_orm_status", "missing")
+
+    def _passes_moon_tier(c, min_sig, min_base, min_mps):
+        """Check if candidate passes a given moonshot tier."""
         signals = c.get("signals", [])
         signal_count = len(signals) if isinstance(signals, list) else 0
         base_score = c.get("_base_score", c.get("score", 0))
-        
-        # ── ORM GATE — POLICY B v2: NO INVERSION ───────────────
-        # v1 rejected ORM ≥ 0.60 ("too stable for moonshot") but this
-        # rejected the biggest winners: IONQ (ORM=0.66, +37.9%),
-        # UNH (ORM=0.72, +10.8%), NET (ORM=0.67, +11.8%).
-        # High ORM = good options microstructure = GOOD for calls too.
-        # v2: No ORM rejection for moonshot. Missing ORM gets light penalty.
+        mps = c.get("_move_potential_score")
+
+        if signal_count < min_sig:
+            return False, f"{signal_count} signals < {min_sig}"
+        if base_score < min_base:
+            return False, f"base {base_score:.3f} < {min_base}"
+        pick_price = float(c.get("price", 0) or 0)
+        if pick_price <= 0 or pick_price < 1.0 or pick_price > 10000:
+            return False, f"price ${pick_price:.2f} invalid"
+        if mps is not None and mps < min_mps:
+            return False, f"MPS {mps:.3f} < {min_mps}"
+        return True, "passed"
+
+    # Apply ORM missing penalty and signal uniformity first
+    for c in candidates:
+        orm_status = c.get("_orm_status", "missing")
         if orm_status in ("missing", "default"):
-            # For moonshot, missing ORM is acceptable (volatile names often lack
-            # institutional coverage). Apply a light penalty only.
             c["score"] = max(c.get("score", 0) - ORM_MISSING_PENALTY, 0.10)
             c["_orm_missing_penalty"] = ORM_MISSING_PENALTY
-            # Still require minimum signal quality
-            if signal_count < 4 and base_score < 0.70:
-                gate_reasons.append(
-                    f"{c.get('symbol', '?')}: ORM {orm_status} + weak signals "
-                    f"({signal_count}) + low score ({base_score:.2f})"
-                )
-                continue
-            logger.debug(
-                f"     ℹ️ {c.get('symbol', '?')}: ORM {orm_status} — light penalty "
-                f"({ORM_MISSING_PENALTY:.0%}), signals={signal_count}, score={base_score:.2f}"
-            )
-
-        # ── SIGNAL COUNT GATE — POLICY B v3 (FEB 16, 2026) ────────
-        # v3: Raised to ≥6. Winner analysis: all moonshot winners had 6+ signals.
-        # Ultra-selective for maximum WR.
-        if signal_count < MIN_SIGNAL_COUNT:
-            gate_reasons.append(
-                f"{c.get('symbol', '?')}: {signal_count} signals < {MIN_SIGNAL_COUNT} (Policy B v3 MOONSHOT — ultra-selective)"
-            )
-            continue
-        if base_score < MIN_BASE_SCORE:
-            gate_reasons.append(
-                f"{c.get('symbol', '?')}: base score {base_score:.3f} < {MIN_BASE_SCORE} (Policy B v3 MOONSHOT — ultra-selective)"
-            )
-            continue
-        
-        # ── PRICE DATA VALIDATION GATE ────────────────────────────
-        pick_price = float(c.get("price", 0) or 0)
-        if pick_price <= 0:
-            gate_reasons.append(f"{c.get('symbol', '?')}: no valid price data (price={pick_price})")
-            continue
-        if pick_price < 1.0:
-            gate_reasons.append(f"{c.get('symbol', '?')}: penny stock price ${pick_price:.2f}")
-            continue
-        if pick_price > 10000:
-            gate_reasons.append(f"{c.get('symbol', '?')}: unrealistic price ${pick_price:.0f}")
-            continue
-
-        # ── SIGNAL UNIFORMITY PENALTY ─────────────────────────────
+        signals = c.get("signals", [])
+        signal_count = len(signals) if isinstance(signals, list) else 0
         if isinstance(signals, list) and signal_count >= 2:
             unique_signals = len(set(str(s) for s in signals))
             uniformity = 1.0 - (unique_signals / signal_count)
@@ -1946,87 +1975,63 @@ def _enrich_moonshots_with_orm(
                 penalty = 0.05 * uniformity
                 c["score"] = max(c["score"] - penalty, 0.20)
                 c["_signal_uniformity_penalty"] = penalty
-                logger.debug(
-                    f"     ⚠️ {c.get('symbol', '?')}: signal uniformity "
-                    f"{uniformity:.0%} — penalized {penalty:.3f}"
-                )
-        
-        # ── MOVE POTENTIAL GATE — POLICY B v3 (FEB 16, 2026) ────────
-        # v3: Raised to 0.65. Winner analysis: moonshot winners had MPS 0.69-0.80
-        # (except TSM=0.40 outlier). Ultra-selective for maximum WR.
-        mps = c.get("_move_potential_score")
-        if mps is not None and mps < MIN_MOVE_POTENTIAL:
-            gate_reasons.append(
-                f"{c.get('symbol', '?')}: MPS {mps:.3f} < {MIN_MOVE_POTENTIAL} "
-                f"(Policy B v3 MOONSHOT — ultra-selective)"
-            )
+
+    tier1_picks = []
+    tier2_picks = []
+    tier3_picks = []
+    all_gate_reasons = []
+
+    for c in candidates:
+        ok1, r1 = _passes_moon_tier(c, T1_SIGNAL_COUNT, T1_BASE_SCORE, T1_MOVE_POTENTIAL)
+        if ok1:
+            c["_quality_tier"] = "TIER1_HIGH_CONVICTION"
+            tier1_picks.append(c)
             continue
-        
-        # ── BREAKEVEN REALISM FILTER — v2 (FEB 16, 2026) ─────────
-        # v2: TYPICAL_BREAKEVEN_PCT lowered 5.0→3.5. New threshold = 4.55%.
-        # Weekly ATM calls/puts on 4%+ ATR stocks typically break even at ~3%.
-        # Definitive check with actual contract data is in executor.py.
-        if mps is not None and mps > 0:
-            expected_move_pct = mps * 10.0
-            required_for_breakeven = TYPICAL_BREAKEVEN_PCT * MIN_EXPECTED_MOVE_VS_BREAKEVEN
-            if expected_move_pct < required_for_breakeven:
-                gate_reasons.append(
-                    f"{c.get('symbol', '?')}: Breakeven proxy — "
-                    f"expected move {expected_move_pct:.1f}% < "
-                    f"{required_for_breakeven:.1f}% required (MPS={mps:.2f})"
-                )
-                continue
-        
-        # ── PREMIUM SIGNAL REQUIREMENT — POLICY B v3 (FEB 16, 2026) ────────
-        # v3: Require at least 1 premium signal (all winners had call_buying or iv_inverted).
-        # Premium signals: iv_inverted, call_buying, dark_pool_massive, neg_gex_explosive.
-        # This filters out low-conviction setups that pass basic gates but lack
-        # institutional-quality microstructure signals.
-        catalysts = c.get("catalysts", [])
-        if isinstance(catalysts, list):
-            cat_str = " ".join(str(cat) for cat in catalysts).lower()
-        else:
-            cat_str = str(catalysts).lower()
-        
-        sig_str = " ".join(str(s) for s in signals).lower() if isinstance(signals, list) else ""
-        
-        has_iv_inverted = "iv_inverted" in sig_str
-        has_call_buying = "call buying" in cat_str or "positive gex" in cat_str
-        has_dark_pool = "dark_pool_massive" in sig_str
-        has_neg_gex = "neg_gex_explosive" in sig_str
-        
-        premium_count = sum([has_iv_inverted, has_call_buying, has_dark_pool, has_neg_gex])
-        
-        if premium_count < 1:
-            gate_reasons.append(
-                f"{c.get('symbol', '?')}: No premium signal (require at least 1 of: "
-                f"iv_inverted, call_buying, dark_pool_massive, neg_gex_explosive) — "
-                f"Policy B v3 MOONSHOT ultra-selective"
-            )
+
+        ok2, r2 = _passes_moon_tier(c, T2_SIGNAL_COUNT, T2_BASE_SCORE, T2_MOVE_POTENTIAL)
+        if ok2:
+            c["_quality_tier"] = "TIER2_STANDARD"
+            tier2_picks.append(c)
             continue
-        
-        filtered_candidates.append(c)
-    
-    if gate_reasons:
-        logger.info(f"  🚫 Policy B Quality Gates: {len(gate_reasons)} candidates filtered out:")
-        for reason in gate_reasons[:15]:
+
+        ok3, r3 = _passes_moon_tier(c, T3_SIGNAL_COUNT, T3_BASE_SCORE, T3_MOVE_POTENTIAL)
+        if ok3:
+            c["_quality_tier"] = "TIER3_OPPORTUNISTIC"
+            tier3_picks.append(c)
+            continue
+
+        all_gate_reasons.append(f"{c.get('symbol', '?')}: {r1} (all tiers failed)")
+
+    filtered_candidates = tier1_picks[:]
+    if len(filtered_candidates) < MIN_PICKS_BEFORE_RELAX:
+        filtered_candidates.extend(tier2_picks)
+    if len(filtered_candidates) < MIN_PICKS_BEFORE_RELAX:
+        filtered_candidates.extend(tier3_picks)
+
+    filtered_candidates.sort(key=lambda x: x.get("score", 0), reverse=True)
+
+    logger.info(
+        f"  🎯 Adaptive gates: T1={len(tier1_picks)}, T2={len(tier2_picks)}, "
+        f"T3={len(tier3_picks)}, blocked={len(all_gate_reasons)}"
+    )
+    if all_gate_reasons:
+        logger.info(f"  🚫 Policy B v5 gates: {len(all_gate_reasons)} filtered out:")
+        for reason in all_gate_reasons[:10]:
             logger.info(f"     • {reason}")
-        if len(gate_reasons) > 15:
-            logger.info(f"     ... and {len(gate_reasons) - 15} more")
-    
+        if len(all_gate_reasons) > 10:
+            logger.info(f"     ... and {len(all_gate_reasons) - 10} more")
+
     candidates = filtered_candidates
-    
-    # ── LOW OPPORTUNITY DAY CHECK (POLICY B) ─────────────────
+
     if len(candidates) < 3:
-        logger.warning(
-            f"  ⚠️ LOW OPPORTUNITY DAY: Only {len(candidates)} moonshot candidates "
-            f"passed Policy B quality gates (of {before_gates} total). "
-            f"Capital preserved — quality over quantity."
+        logger.info(
+            f"  ℹ️ Thin day: {len(candidates)} moonshot candidates passed adaptive gates "
+            f"(of {before_gates} total)."
         )
         for c in candidates:
             c["_low_opportunity_day"] = True
-    
-    logger.info(f"  ✅ After Policy B gates: {len(candidates)}/{before_gates} candidates remain")
+
+    logger.info(f"  ✅ After Policy B v5 gates: {len(candidates)}/{before_gates} candidates remain")
 
     # ══════════════════════════════════════════════════════════════════
     # REGIME-AWARE SHADOW LOGGING + HARD BLOCK — FEB 16 v3
@@ -2057,13 +2062,10 @@ def _enrich_moonshots_with_orm(
             f"(avg={avg_orm:.3f}, range={min_orm:.3f}–{max_orm:.3f})"
         )
 
-    # ── CONVICTION SCORING + TOP-N RANKING (Policy B v4) ──────────
-    # Compute composite conviction score for each surviving candidate.
-    # Factors: base_score, ORM, MPS, signal_count, premium signals, regime.
-    # Then rank and keep only top MAX_MOONSHOT_PER_SCAN to maximise WR.
-    MAX_MOONSHOT_PER_SCAN = 3  # Ultra-selective: max 3 per scan for 80% WR target
-    MIN_CONVICTION_SCORE = 0.45  # Minimum conviction to pass (drops marginal picks)
-    PM_CONVICTION_PENALTY = 0.75  # PM scans get 25% conviction penalty (PM momentum fades)
+    # ── CONVICTION SCORING + TOP-N RANKING (Policy B v5) ──────────
+    MAX_MOONSHOT_PER_SCAN = 5  # v5: Increased 3→5.
+    MIN_CONVICTION_SCORE = 0.15  # v5: Lowered 0.45→0.15 to allow more picks through.
+    PM_CONVICTION_PENALTY = 0.85  # v5: Softened 0.75→0.85.
 
     for c in candidates:
         features = c.get("_features", {})
@@ -2107,6 +2109,10 @@ def _enrich_moonshots_with_orm(
             _is_pm = datetime.now().hour >= 14
         if _is_pm:
             conviction *= PM_CONVICTION_PENALTY
+
+        # Apply regime conviction multiplier (set by regime gate)
+        regime_mult = c.get("_regime_conviction_multiplier", 1.0)
+        conviction *= regime_mult
 
         c["_conviction_score"] = round(conviction, 4)
 
@@ -2322,20 +2328,29 @@ def _apply_regime_shadow_and_hard_block(
     flow_data: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
     """
-    Policy B v4 Regime Gate — hard block for 80% WR target.
+    Policy B v5 Regime Gate — balanced risk management.
 
-    Rules (based on Feb 9–13 forward backtest):
-      - STRONG_BEAR / LEAN_BEAR → BLOCK ALL moonshots (11.1% WR)
-      - NEUTRAL → BLOCK ALL moonshots (no edge without regime tailwind)
-      - STRONG_BULL / LEAN_BULL → ALLOW only with call_buying + score ≥ 0.70
-      - Bearish UW flow (call_pct < 40%) → BLOCK in ANY regime
+    v4 blocked ALL moonshots in LEAN_BEAR/NEUTRAL/UNKNOWN, which meant
+    zero output on ~70% of trading days (most days are neutral or slightly
+    bearish). This is not "risk management" — it's a broken system.
+
+    v5 FIX: Regime gates inform CONVICTION SCORING, not hard blocks.
+    Only STRONG_BEAR + overwhelmingly bearish flow triggers a hard block.
+    In all other regimes, sector rotation can produce 5%+ movers (today:
+    BYND +5.9%, SEDG +5.4%, ENPH +5.3% on a LEAN_BEAR day).
+
+    Rules:
+      - STRONG_BEAR + bearish flow → BLOCK (true crash day)
+      - LEAN_BEAR → Apply 25% conviction penalty (not block)
+      - NEUTRAL → Allow with minor penalty
+      - LEAN_BULL / STRONG_BULL → Full conviction
+      - Bearish UW flow (call_pct < 30%) → BLOCK (overwhelming put activity)
 
     Fields added to each candidate:
       _regime_label, _regime_score, _regime_asof_timestamp,
       _regime_gate_decision, _regime_gate_reasons,
       _features (full feature dict)
     """
-    # Get regime (with timestamp)
     regime_info = _get_regime_with_timestamp()
     regime_label = regime_info["regime_label"]
     regime_score = regime_info["regime_score"]
@@ -2346,95 +2361,65 @@ def _apply_regime_shadow_and_hard_block(
         f"as_of={regime_info['regime_asof_timestamp'][:19]})"
     )
 
-    bear_regimes = {"STRONG_BEAR", "LEAN_BEAR"}
     hard_blocked = []
     passed = []
 
     for c in candidates:
         sym = c.get("symbol", "")
 
-        # ── Task 5: Stable feature extraction ────────────────
         features = _extract_pick_features(c, flow_data)
         c["_features"] = features
 
-        # ── Task 2: Regime timestamp on every pick ───────────
         c["_regime_label"] = regime_label
         c["_regime_score"] = regime_score
         c["_regime_asof_timestamp"] = regime_info["regime_asof_timestamp"]
 
-        # ── Task 3: Shadow Smart Gate decision (logged, not enforced) ──
-        premium_count = sum([
-            features["iv_inverted"],
-            features["call_buying"],
-            features["dark_pool_massive"],
-            features["neg_gex_explosive"],
-        ])
-        
         base_score = c.get("_base_score", c.get("score", 0))
 
         gate_decision = "ALLOW"
         gate_reasons = []
+        conviction_multiplier = 1.0
 
-        # ── POLICY B v4: Regime-Aligned Hard Gate (Target: 80% WR) ──
-        # Based on Feb 9-13 forward backtest (institutional analysis):
-        #   - STRONG_BEAR moonshots: 1/9 = 11.1% WR → BLOCK ALL
-        #   - LEAN_BEAR moonshots: 0% WR historically → BLOCK ALL
-        #   - NEUTRAL moonshots: No edge → BLOCK ALL
-        #   - STRONG_BULL/LEAN_BULL: Allow ONLY with call_buying + score ≥ 0.70
-        #   - Bearish flow: Block in ALL regimes
-        #
-        # KEY INSIGHT: Even with iv_inverted + call_buying + dark_pool + score 0.93,
-        # moonshots in STRONG_BEAR fail 89% of the time. The market direction
-        # overwhelms individual stock signals. Deploy moonshots ONLY in bull markets.
-        
-        if regime_label in ("STRONG_BEAR", "LEAN_BEAR"):
-            # v4: TOTAL HARD BLOCK in bear regimes
-            # Evidence: 1/9 = 11.1% WR in STRONG_BEAR (even with premium signals)
-            # Single winner (NET +11.8%) cannot justify 8 losers
-            gate_decision = "HARD_BLOCK"
-            gate_reasons.append(
-                f"{regime_label}: ALL moonshots blocked (11.1% WR in bear — "
-                f"market direction overwhelms individual signals)"
-            )
-        elif regime_label == "NEUTRAL":
-            # v4: BLOCK in neutral (no reliable edge without regime tailwind)
-            gate_decision = "HARD_BLOCK"
-            gate_reasons.append(
-                "NEUTRAL: Moonshots blocked (no edge without bullish regime)"
-            )
-        elif regime_label in ("STRONG_BULL", "LEAN_BULL"):
-            # Allow ONLY with call_buying confirmation
-            if not features["call_buying"]:
+        if regime_label == "STRONG_BEAR" and regime_score < -0.40:
+            if features.get("bearish_flow", False):
                 gate_decision = "HARD_BLOCK"
                 gate_reasons.append(
-                    f"{regime_label} requires call_buying (all bull winners had it)"
-                )
-            elif base_score < 0.70:
-                gate_decision = "HARD_BLOCK"
-                gate_reasons.append(
-                    f"{regime_label} + call_buying but score={base_score:.2f} < 0.70"
+                    f"STRONG_BEAR ({regime_score:+.2f}) + bearish flow — "
+                    f"true crash day, blocking moonshots"
                 )
             else:
-                gate_reasons.append(f"{regime_label} + call_buying + score≥0.70 — allow")
+                conviction_multiplier = 0.60
+                gate_reasons.append(
+                    f"STRONG_BEAR but no bearish flow — "
+                    f"allowing with 40% conviction penalty"
+                )
+        elif regime_label == "LEAN_BEAR":
+            conviction_multiplier = 0.75
+            gate_reasons.append(
+                f"LEAN_BEAR ({regime_score:+.2f}) — "
+                f"allowing with 25% conviction penalty (sector rotation possible)"
+            )
+        elif regime_label == "NEUTRAL":
+            conviction_multiplier = 0.90
+            gate_reasons.append("NEUTRAL — allowing with minor penalty")
+        elif regime_label in ("STRONG_BULL", "LEAN_BULL"):
+            conviction_multiplier = 1.0
+            gate_reasons.append(f"{regime_label} — full conviction")
         else:
-            # UNKNOWN regime — block to be safe
-            gate_decision = "HARD_BLOCK"
-            gate_reasons.append(f"UNKNOWN regime '{regime_label}' — blocked for safety")
+            conviction_multiplier = 0.85
+            gate_reasons.append(f"UNKNOWN regime '{regime_label}' — allowing with caution")
 
-        # ── Additional v4 override: bearish flow in bull regimes ──
-        # (Bear/neutral already blocked above; this catches edge case
-        # where call_buying=True but overall flow is bearish in bull regime)
-        if gate_decision == "ALLOW" and features["bearish_flow"]:
+        # Block only on overwhelmingly bearish flow (< 30% call activity)
+        if gate_decision == "ALLOW" and features.get("call_pct", 0.5) < 0.30:
             gate_decision = "HARD_BLOCK"
             gate_reasons.append(
-                f"Bearish UW flow override (call_pct={features['call_pct']:.0%}) "
-                f"in {regime_label}"
+                f"Overwhelmingly bearish flow (call_pct={features['call_pct']:.0%} < 30%)"
             )
 
         c["_regime_gate_decision"] = gate_decision
         c["_regime_gate_reasons"] = gate_reasons
+        c["_regime_conviction_multiplier"] = conviction_multiplier
 
-        # ── Apply gate decision ──
         if gate_decision == "HARD_BLOCK":
             hard_blocked.append(c)
             logger.info(
@@ -2446,7 +2431,7 @@ def _apply_regime_shadow_and_hard_block(
 
     if hard_blocked:
         logger.info(
-            f"  🛡️ Policy B v4 Regime Gate: {len(hard_blocked)} moonshots blocked, "
+            f"  🛡️ Policy B v5 Regime Gate: {len(hard_blocked)} moonshots blocked, "
             f"{len(passed)} survive (regime={regime_label})"
         )
 

@@ -347,6 +347,21 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
     logger.info(f"  💾 Saved: {moon_file}")
     
     # ================================================================
+    # STEP 2a: Coverage Validation — did we miss any major movers?
+    # ================================================================
+    try:
+        from engine_adapters.realtime_mover_scanner import validate_scan_coverage
+        coverage = validate_scan_coverage(puts_top10, moonshot_top10)
+        results["coverage_validation"] = coverage
+        if not coverage.get("coverage_ok"):
+            logger.warning(
+                f"  ⚠️ COVERAGE ALERT: {len(coverage.get('missed_puts', []))} puts + "
+                f"{len(coverage.get('missed_calls', []))} calls missed (>3% movers not in Top 10)"
+            )
+    except Exception as e:
+        logger.debug(f"  Coverage validation skipped: {e}")
+
+    # ================================================================
     # STEP 2b: Gap-Up Detection (Same-Day Plays)
     # ================================================================
     logger.info("\n" + "=" * 50)

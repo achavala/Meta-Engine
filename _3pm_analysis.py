@@ -107,6 +107,34 @@ def load_all_data():
     else:
         data["moon_top10"] = []
 
+    # 7. Real-time mover injection — catch movers that appeared after the
+    #    morning scan, or when output files are empty/stale.
+    try:
+        from engine_adapters.realtime_mover_scanner import (
+            scan_realtime_movers,
+            build_puts_candidates_from_movers,
+            build_moonshot_candidates_from_movers,
+        )
+        rt = scan_realtime_movers()
+        existing_put_syms = {p.get("symbol", "") for p in data["puts_top10"]}
+        existing_call_syms = {c.get("symbol", "") for c in data["moon_top10"]}
+
+        for rc in build_puts_candidates_from_movers(rt.get("gap_down_movers", [])):
+            if rc["symbol"] not in existing_put_syms:
+                data["puts_top10"].append(rc)
+                existing_put_syms.add(rc["symbol"])
+
+        for rc in build_moonshot_candidates_from_movers(rt.get("gap_up_movers", [])):
+            if rc["symbol"] not in existing_call_syms:
+                data["moon_top10"].append(rc)
+                existing_call_syms.add(rc["symbol"])
+
+        data["realtime_snapshot"] = rt.get("all_prices", {})
+        logger.info(f"  ✅ Real-time movers: {len(rt.get('gap_up_movers', []))} gap-up, "
+                     f"{len(rt.get('gap_down_movers', []))} gap-down injected")
+    except Exception as e:
+        logger.warning(f"  ⚠️ Real-time mover injection skipped: {e}")
+
     return data
 
 

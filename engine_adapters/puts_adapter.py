@@ -415,6 +415,62 @@ def _fallback_from_cached_results(top_n: int = 10) -> List[Dict[str, Any]]:
                 f"{len(all_candidates)} remain"
             )
     
+    # ── Inject real-time movers (gap-down stocks) ───────────────────
+    # The upstream PutsEngine scan misses most intraday movers because
+    # it uses overnight signal analysis, not real-time price data.
+    # Stocks dropping -5% or -10% are THE strongest bearish signal.
+    try:
+        from engine_adapters.realtime_mover_scanner import (
+            scan_realtime_movers,
+            build_puts_candidates_from_movers,
+        )
+        rt_data = scan_realtime_movers(static_universe=static_universe)
+        gap_down = rt_data.get("gap_down_movers", [])
+        if gap_down:
+            rt_candidates = build_puts_candidates_from_movers(gap_down)
+            existing_syms = {c.get("symbol", "") for c in all_candidates}
+            injected = 0
+            for rc in rt_candidates:
+                if rc["symbol"] not in existing_syms:
+                    all_candidates.append(rc)
+                    injected += 1
+                    existing_syms.add(rc["symbol"])
+                else:
+                    # Existing candidate — boost score if real-time confirms drop
+                    for c in all_candidates:
+                        if c.get("symbol") == rc["symbol"]:
+                            change = rc.get("_realtime_change_pct", 0)
+                            if change < -2.0:
+                                boost = min(abs(change) / 20.0, 0.15)
+                                c["score"] = min(c["score"] + boost, 1.0)
+                                c["signals"] = list(c.get("signals", [])) + rc.get("signals", [])
+                                c["_realtime_confirmed"] = True
+                                c["_realtime_change_pct"] = change
+                            break
+            if injected:
+                top_desc = ", ".join(
+                    "{} {:+.1f}%".format(m["symbol"], m["change_pct"])
+                    for m in gap_down[:5]
+                )
+                logger.info(
+                    f"  📉 Real-time movers: {injected} gap-down stocks injected "
+                    f"(top: {top_desc})"
+                )
+
+        # Also update prices for all candidates from snapshot data
+        all_price_data = rt_data.get("all_prices", {})
+        if all_price_data:
+            for c in all_candidates:
+                sym = c.get("symbol", "")
+                if sym in all_price_data:
+                    pd = all_price_data[sym]
+                    if pd["price"] > 0:
+                        c["_cached_price"] = c.get("price", 0) or c.get("_cached_price", 0)
+                        c["price"] = pd["price"]
+                        c["_realtime_change_pct"] = pd["change_pct"]
+    except Exception as e:
+        logger.debug(f"  Real-time mover injection failed: {e}")
+
     # ── Deduplicate and return ───────────────────────────────────────
     if not all_candidates:
         logger.warning("No PutsEngine data found across all tiers")
@@ -2077,32 +2133,42 @@ def _enrich_candidates(candidates: List[Dict[str, Any]], top_n: int) -> List[Dic
         logger.warning(f"  ⚠️ Move Potential Score: failed ({e}) — continuing without gate")
 
     # ──────────────────────────────────────────────────────────
-    # QUALITY-OVER-QUANTITY SELECTION GATES — POLICY B v2 (FEB 16, 2026)
-    # Replaces forced Top 10 with strict quality gates.
-    # Backtested Feb 9-13 v2 sweep results:
-    #   - PUTS Sigs≥5 + Score≥0.65 = 64.7% WR on 17 picks (+8.7% avg return)
-    #   - PUTS Sigs≥5 alone = 60.5% WR on 38 picks
-    #   - PUTS Score≥0.85 = 80% WR on 5 picks (too few)
+    # QUALITY SELECTION GATES — POLICY B v5 (FEB 17, 2026) — ADAPTIVE
+    # v2-v4 had STATIC thresholds calibrated to a 5-day backtest (Feb 9-13).
+    # Problem: PutsEngine upstream delivers 1-4 signals with scores 0.22-0.36.
+    # Static gates (sigs>=5, score>=0.65) produce 100% kill rate on most days.
     #
-    # PUTS ENGINE THRESHOLDS (calibrated from v2 gate sweep):
-    #   - Signal Count ≥ 5 (sweet spot: 60.5% WR — above 6, WR drops)
-    #   - Score ≥ 0.65 (best single-engine discriminator: +10pp over baseline)
-    #   - ORM ≥ 0.50 when computed (existing — validated)
-    #   - MPS ≥ 0.50 (v1 at 0.75 rejected RR +63%, CHWY +27.6%, TCOM +22%)
-    #   - Breakeven realism proxy (relaxed: 3.5% typical breakeven)
-    #   - Theta WARNING (not block)
-    # Accepts 3-7 picks typical — quality over quantity.
+    # v5 FIX: ADAPTIVE gates that adjust to the actual data distribution.
+    # Tier 1 (strict): Original thresholds — high-conviction picks.
+    # Tier 2 (standard): Relaxed thresholds — solid picks with real signals.
+    # Tier 3 (opportunistic): Best-available when Tier 1+2 produce < 3 picks.
+    #
+    # The key insight: a stock gapping -5% with 3 bearish signals and ORM 0.55
+    # is a REAL trade. Blocking it because it has 3 signals instead of 5 is
+    # throwing away edge. The gap itself IS the strongest signal.
     # ──────────────────────────────────────────────────────────
-    MIN_ORM_SCORE = 0.50          # Keep existing ORM gate for computed status
-    MIN_SIGNAL_COUNT = 5          # POLICY B: Raised 2→5 (winners avg 6.5 signals)
-    MIN_BASE_SCORE = 0.65         # Keep existing base score gate
-    MIN_SCORE_GATE = 0.55         # POLICY B v2: Score≥0.55 (catches APP=0.64, RR=0.60, UPST=0.58)
-    MIN_MOVE_POTENTIAL = 0.50     # POLICY B v2: Lowered 0.75→0.50 (v1 rejected 17+ big winners)
-    ORM_MISSING_PENALTY = 0.08    # Score penalty when ORM not computed
-    # Breakeven realism proxy (adapter-level pre-check)
-    # Definitive check with actual contract data is in executor.py
-    MIN_EXPECTED_MOVE_VS_BREAKEVEN = 1.3
-    TYPICAL_BREAKEVEN_PCT = 3.5   # v2: Lowered 5.0→3.5 (weekly ATM on volatile stocks)
+    MIN_ORM_SCORE = 0.45          # v5: Lowered 0.50→0.45 (ORM 0.45+ still indicates options leverage)
+    ORM_MISSING_PENALTY = 0.06    # v5: Reduced from 0.08
+
+    # Tier 1: High-conviction (original strict thresholds)
+    T1_SIGNAL_COUNT = 5
+    T1_BASE_SCORE = 0.60
+    T1_SCORE_GATE = 0.50
+    T1_MOVE_POTENTIAL = 0.50
+
+    # Tier 2: Standard — where most real-world picks land
+    T2_SIGNAL_COUNT = 3
+    T2_BASE_SCORE = 0.30
+    T2_SCORE_GATE = 0.25
+    T2_MOVE_POTENTIAL = 0.40
+
+    # Tier 3: Opportunistic — gap-driven or high-ORM picks (best-available)
+    T3_SIGNAL_COUNT = 1
+    T3_BASE_SCORE = 0.20
+    T3_SCORE_GATE = 0.20
+    T3_MOVE_POTENTIAL = 0.30
+
+    MIN_PICKS_BEFORE_RELAX = 3
 
     # ── THETA AWARENESS (adapter-level, FEB 16 v2: WARNING not BLOCK) ──
     # This is a SIGNAL ENGINE for manual execution — never block picks.
@@ -2143,69 +2209,73 @@ def _enrich_candidates(candidates: List[Dict[str, Any]], top_n: int) -> List[Dic
         logger.warning(f"  ⚠️ Theta awareness: check failed ({e})")
 
     before_gates = len(candidates)
-    filtered_candidates = []
-    gate_reasons = []
-    
-    for c in candidates:
-        orm = c.get("_orm_score", 0)
-        orm_status = c.get("_orm_status", "missing")
+
+    def _passes_tier(c, min_sig, min_base, min_score, min_mps):
+        """Check if candidate passes a given tier's thresholds."""
         signals = c.get("signals", [])
         signal_count = len(signals) if isinstance(signals, list) else 0
         base_score = c.get("meta_score", c.get("score", 0))
-        
-        # ── ORM GATE — CONDITIONAL on computed vs missing/default ────
+        pick_score = c.get("score", 0)
+        mps = c.get("_move_potential_score")
+        orm = c.get("_orm_score", 0)
+        orm_status = c.get("_orm_status", "missing")
+
         if orm_status == "computed" and orm < MIN_ORM_SCORE:
-            gate_reasons.append(f"{c.get('symbol', '?')}: ORM {orm:.3f} < {MIN_ORM_SCORE} (computed)")
-            continue
-        elif orm_status in ("missing", "default"):
+            return False, f"ORM {orm:.3f} < {MIN_ORM_SCORE}"
+        if signal_count < min_sig:
+            return False, f"{signal_count} signals < {min_sig}"
+        if base_score < min_base:
+            return False, f"base {base_score:.3f} < {min_base}"
+        if pick_score < min_score:
+            return False, f"score {pick_score:.3f} < {min_score}"
+        pick_price = float(c.get("price", 0) or 0)
+        if pick_price <= 0 or pick_price < 1.0 or pick_price > 10000:
+            return False, f"price ${pick_price:.2f} invalid"
+        if mps is not None and mps < min_mps:
+            return False, f"MPS {mps:.3f} < {min_mps}"
+        return True, "passed"
+
+    def _apply_common_filters(c):
+        """Apply filters that should block at ALL tiers (directional conflict)."""
+        try:
+            from analysis.market_direction_predictor import get_market_direction_for_scan
+            regime_info = get_market_direction_for_scan(session_label="AM")
+            regime_label = regime_info.get("regime", "UNKNOWN") if regime_info else "UNKNOWN"
+
+            if regime_label in ("STRONG_BULL",):
+                try:
+                    uw_flow_path = Path("/Users/chavala/TradeNova/data/uw_flow_cache.json")
+                    if uw_flow_path.exists():
+                        with open(uw_flow_path) as f:
+                            uw_data = json.load(f)
+                        flow_data_local = uw_data.get("flow_data", uw_data) if isinstance(uw_data, dict) else {}
+                        sym_flow = flow_data_local.get(c.get("symbol", ""), [])
+                        if isinstance(sym_flow, list):
+                            call_prem = sum(t.get("premium", 0) for t in sym_flow
+                                          if isinstance(t, dict) and t.get("put_call") == "C")
+                            put_prem = sum(t.get("premium", 0) for t in sym_flow
+                                         if isinstance(t, dict) and t.get("put_call") == "P")
+                            total = call_prem + put_prem
+                            call_pct = call_prem / total if total > 0 else 0.50
+                            catalysts = c.get("catalysts", [])
+                            cat_str = " ".join(str(cat) for cat in catalysts).lower() if isinstance(catalysts, list) else str(catalysts).lower()
+                            has_call_buying = "call buying" in cat_str or "positive gex" in cat_str
+                            if call_pct > 0.65 and has_call_buying:
+                                return False, f"STRONG_BULL + heavy call flow ({call_pct:.0%})"
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return True, ""
+
+    # Apply ORM missing penalty and signal uniformity penalty first
+    for c in candidates:
+        orm_status = c.get("_orm_status", "missing")
+        if orm_status in ("missing", "default"):
             c["score"] = max(c.get("score", 0) - ORM_MISSING_PENALTY, 0.10)
             c["_orm_missing_penalty"] = ORM_MISSING_PENALTY
-            if signal_count < 3 and base_score < 0.80:
-                gate_reasons.append(
-                    f"{c.get('symbol', '?')}: ORM {orm_status} + weak signals "
-                    f"({signal_count}) + low score ({base_score:.2f})"
-                )
-                continue
-            logger.debug(
-                f"     ℹ️ {c.get('symbol', '?')}: ORM {orm_status} — penalty applied "
-                f"({ORM_MISSING_PENALTY:.0%}), signals={signal_count}, score={base_score:.2f}"
-            )
-
-        # ── SIGNAL COUNT GATE — POLICY B v2 (FEB 16, 2026) ────────
-        # PUTS: Sigs ≥ 5 is the sweet spot (60.5% WR).
-        # Above 6, WR actually drops ("noise consensus" not quality).
-        if signal_count < MIN_SIGNAL_COUNT:
-            gate_reasons.append(
-                f"{c.get('symbol', '?')}: {signal_count} signals < {MIN_SIGNAL_COUNT} (Policy B v2 PUTS)"
-            )
-            continue
-        if base_score < MIN_BASE_SCORE:
-            gate_reasons.append(f"{c.get('symbol', '?')}: base score {base_score:.3f} < {MIN_BASE_SCORE}")
-            continue
-
-        # ── SCORE GATE — POLICY B v2 (FEB 16, 2026) ─────────────
-        # Best single-engine discriminator for PUTS: Score ≥ 0.65 → 57.7% WR
-        # Combined with Sigs ≥ 5: 64.7% WR on 17 picks (+8.7% avg return)
-        pick_score = c.get("score", 0)
-        if pick_score < MIN_SCORE_GATE:
-            gate_reasons.append(
-                f"{c.get('symbol', '?')}: score {pick_score:.3f} < {MIN_SCORE_GATE} (Policy B v2 PUTS)"
-            )
-            continue
-        
-        # ── PRICE DATA VALIDATION GATE ────────────────────────────
-        pick_price = float(c.get("price", 0) or 0)
-        if pick_price <= 0:
-            gate_reasons.append(f"{c.get('symbol', '?')}: no valid price data (price={pick_price})")
-            continue
-        if pick_price < 1.0:
-            gate_reasons.append(f"{c.get('symbol', '?')}: penny stock price ${pick_price:.2f}")
-            continue
-        if pick_price > 10000:
-            gate_reasons.append(f"{c.get('symbol', '?')}: unrealistic price ${pick_price:.0f}")
-            continue
-
-        # ── SIGNAL UNIFORMITY PENALTY ─────────────────────────────
+        signals = c.get("signals", [])
+        signal_count = len(signals) if isinstance(signals, list) else 0
         if isinstance(signals, list) and signal_count >= 2:
             unique_signals = len(set(str(s) for s in signals))
             uniformity = 1.0 - (unique_signals / signal_count)
@@ -2213,109 +2283,80 @@ def _enrich_candidates(candidates: List[Dict[str, Any]], top_n: int) -> List[Dic
                 penalty = 0.05 * uniformity
                 c["score"] = max(c["score"] - penalty, 0.20)
                 c["_signal_uniformity_penalty"] = penalty
-                logger.debug(
-                    f"     ⚠️ {c.get('symbol', '?')}: signal uniformity "
-                    f"{uniformity:.0%} — penalized {penalty:.3f}"
-                )
-        
-        # ── MOVE POTENTIAL GATE — POLICY B v2 (FEB 16, 2026) ────────
-        # v2: Lowered to 0.50. v1 at 0.75 rejected CHWY (MPS=0.58, +27.6%),
-        # TCOM (MPS=0.39, +22.1%), AMAT (MPS=0.65, +14.2%), MRVL (MPS=0.67, +13.5%).
-        # MPS ≥ 0.50 filters out only truly low-move-potential stocks.
-        mps = c.get("_move_potential_score")
-        if mps is not None and mps < MIN_MOVE_POTENTIAL:
-            gate_reasons.append(
-                f"{c.get('symbol', '?')}: MPS {mps:.3f} < {MIN_MOVE_POTENTIAL} "
-                f"(Policy B — no override)"
-            )
+
+    # Run tiered gate system
+    tier1_picks = []
+    tier2_picks = []
+    tier3_picks = []
+    all_gate_reasons = []
+
+    for c in candidates:
+        ok, reason = _apply_common_filters(c)
+        if not ok:
+            all_gate_reasons.append(f"{c.get('symbol', '?')}: {reason} (directional block)")
             continue
-        
-        # ── BREAKEVEN REALISM FILTER — v2 (FEB 16, 2026) ─────────
-        # v2: TYPICAL_BREAKEVEN_PCT lowered 5.0→3.5. v1 at 5.0 gave
-        # threshold 6.5%, rejecting RR (exp=6.4%, +63.1%), HIMS (6.4%,
-        # +35.4%), OKLO (6.4%, +33.4%) by just 0.1%. New threshold = 4.55%.
-        # Definitive check with actual contract data is in executor.py.
-        if mps is not None and mps > 0:
-            expected_move_pct = mps * 10.0
-            required_for_breakeven = TYPICAL_BREAKEVEN_PCT * MIN_EXPECTED_MOVE_VS_BREAKEVEN
-            if expected_move_pct < required_for_breakeven:
-                gate_reasons.append(
-                    f"{c.get('symbol', '?')}: Breakeven proxy — "
-                    f"expected move {expected_move_pct:.1f}% < "
-                    f"{required_for_breakeven:.1f}% required (MPS={mps:.2f})"
-                )
+
+        ok1, r1 = _passes_tier(c, T1_SIGNAL_COUNT, T1_BASE_SCORE, T1_SCORE_GATE, T1_MOVE_POTENTIAL)
+        if ok1:
+            c["_quality_tier"] = "TIER1_HIGH_CONVICTION"
+            tier1_picks.append(c)
+            continue
+
+        ok2, r2 = _passes_tier(c, T2_SIGNAL_COUNT, T2_BASE_SCORE, T2_SCORE_GATE, T2_MOVE_POTENTIAL)
+        if ok2:
+            c["_quality_tier"] = "TIER2_STANDARD"
+            tier2_picks.append(c)
+            continue
+
+        ok3, r3 = _passes_tier(c, T3_SIGNAL_COUNT, T3_BASE_SCORE, T3_SCORE_GATE, T3_MOVE_POTENTIAL)
+        if ok3:
+            gap_pct = c.get("_realtime_change_pct", 0)
+            if not gap_pct:
+                cached_price = c.get("_cached_price", 0)
+                live_price = float(c.get("price", 0) or 0)
+                if cached_price and live_price and cached_price > 0:
+                    gap_pct = ((live_price - cached_price) / cached_price) * 100
+            orm_val = c.get("_orm_score", 0)
+            is_rt = c.get("_is_realtime_mover", False)
+            if gap_pct < -1.5 or orm_val >= 0.50 or is_rt:
+                c["_quality_tier"] = "TIER3_OPPORTUNISTIC"
+                tier3_picks.append(c)
                 continue
-        
-        # ── DIRECTIONAL FILTER — POLICY B v3 (FEB 16, 2026) ────────
-        # Ultra-selective: Block puts if stock has bullish_flow + call_buying in bull regime.
-        # Loser analysis: MU (PUTS) lost -27.4% when stock went UP +10.9% — had bullish_flow + call_buying.
-        # This filter prevents wrong-direction trades in bull markets.
-        # Note: This is a conservative filter — some winners had this combo, but they were in bear regimes.
-        try:
-            from analysis.market_direction_predictor import get_market_direction_for_scan
-            regime_info = get_market_direction_for_scan(session_label="AM")
-            regime_label = regime_info.get("regime", "UNKNOWN") if regime_info else "UNKNOWN"
-            
-            # Check for bullish flow + call buying in bull regimes
-            if regime_label in ("STRONG_BULL", "LEAN_BULL"):
-                # Try to get UW flow data (optional — don't block if unavailable)
-                try:
-                    uw_flow_path = Path("/Users/chavala/TradeNova/data/uw_flow_cache.json")
-                    if uw_flow_path.exists():
-                        with open(uw_flow_path) as f:
-                            uw_data = json.load(f)
-                        flow_data = uw_data.get("flow_data", uw_data) if isinstance(uw_data, dict) else {}
-                        sym_flow = flow_data.get(c.get("symbol", ""), [])
-                        if isinstance(sym_flow, list):
-                            call_prem = sum(t.get("premium", 0) for t in sym_flow 
-                                          if isinstance(t, dict) and t.get("put_call") == "C")
-                            put_prem = sum(t.get("premium", 0) for t in sym_flow 
-                                         if isinstance(t, dict) and t.get("put_call") == "P")
-                            total = call_prem + put_prem
-                            call_pct = call_prem / total if total > 0 else 0.50
-                            
-                            # Check for call buying in catalysts
-                            catalysts = c.get("catalysts", [])
-                            cat_str = " ".join(str(cat) for cat in catalysts).lower() if isinstance(catalysts, list) else str(catalysts).lower()
-                            has_call_buying = "call buying" in cat_str or "positive gex" in cat_str
-                            
-                            # Block if bullish flow + call buying in bull regime
-                            if call_pct > 0.60 and has_call_buying:
-                                gate_reasons.append(
-                                    f"{c.get('symbol', '?')}: Bull regime + bullish flow "
-                                    f"(call_pct={call_pct:.0%}) + call_buying — stock might go up "
-                                    f"(Policy B v3 PUTS ultra-selective)"
-                                )
-                                continue
-                except Exception:
-                    pass  # Don't block if UW data unavailable
-        except Exception:
-            pass  # Don't block if regime unavailable
-        
-        filtered_candidates.append(c)
-    
-    if gate_reasons:
-        logger.info(f"  🚫 Policy B Quality Gates: {len(gate_reasons)} candidates filtered out:")
-        for reason in gate_reasons[:15]:
+
+        all_gate_reasons.append(f"{c.get('symbol', '?')}: {r1} (all tiers failed)")
+
+    # Assemble final list: prefer Tier 1, fill with Tier 2, then Tier 3
+    filtered_candidates = tier1_picks[:]
+    if len(filtered_candidates) < MIN_PICKS_BEFORE_RELAX:
+        filtered_candidates.extend(tier2_picks)
+    if len(filtered_candidates) < MIN_PICKS_BEFORE_RELAX:
+        filtered_candidates.extend(tier3_picks)
+
+    # Sort by composite score within the assembled list
+    filtered_candidates.sort(key=lambda x: x.get("score", 0), reverse=True)
+
+    logger.info(
+        f"  🎯 Adaptive gates: T1={len(tier1_picks)}, T2={len(tier2_picks)}, "
+        f"T3={len(tier3_picks)}, blocked={len(all_gate_reasons)}"
+    )
+    if all_gate_reasons:
+        logger.info(f"  🚫 Policy B v5 gates: {len(all_gate_reasons)} filtered out:")
+        for reason in all_gate_reasons[:10]:
             logger.info(f"     • {reason}")
-        if len(gate_reasons) > 15:
-            logger.info(f"     ... and {len(gate_reasons) - 15} more")
-    
+        if len(all_gate_reasons) > 10:
+            logger.info(f"     ... and {len(all_gate_reasons) - 10} more")
+
     candidates = filtered_candidates
-    
-    # ── LOW OPPORTUNITY DAY CHECK (POLICY B) ─────────────────
-    # When strict gates leave fewer than 3 picks, this is expected.
-    # Preserving capital on thin days IS the edge.
+
     if len(candidates) < 3:
-        logger.warning(
-            f"  ⚠️ LOW OPPORTUNITY DAY: Only {len(candidates)} puts candidates "
-            f"passed Policy B quality gates (of {before_gates} total). "
-            f"Capital preserved — quality over quantity."
+        logger.info(
+            f"  ℹ️ Thin day: {len(candidates)} candidates passed adaptive gates "
+            f"(of {before_gates} total). Proceeding with available picks."
         )
         for c in candidates:
             c["_low_opportunity_day"] = True
-    
-    logger.info(f"  ✅ After Policy B gates: {len(candidates)}/{before_gates} candidates remain")
+
+    logger.info(f"  ✅ After Policy B v5 gates: {len(candidates)}/{before_gates} candidates remain")
 
     # Compute ORM statistics
     if orm_scores:
@@ -2510,10 +2551,9 @@ def _apply_puts_regime_gate_v4(
     hard_blocked = []
     passed = []
 
-    MAX_PUTS_PER_SCAN = 3   # Ultra-selective: max 3 per scan for 80% WR target
-    MIN_CONVICTION_SCORE = 0.45  # Minimum conviction to pass
-    DEEP_BEAR_PM_PENALTY = 0.70  # PM + deep bear (score < -0.50) = 30% conviction penalty
-    # Evidence: Feb 12 PM (day 2 STRONG_BEAR) had 0% WR — stocks bounced (mean reversion)
+    MAX_PUTS_PER_SCAN = 5   # v5: Increased 3→5. Original cap was too restrictive.
+    MIN_CONVICTION_SCORE = 0.20  # v5: Lowered 0.45→0.20. Let more picks through; rank by conviction.
+    DEEP_BEAR_PM_PENALTY = 0.80  # v5: Softened 0.70→0.80. PM still useful with strong signals.
 
     for c in candidates:
         sym = c.get("symbol", "")
@@ -2541,25 +2581,24 @@ def _apply_puts_regime_gate_v4(
                 f"market rising, puts lose)"
             )
 
-        # ── RULE 2: Block PUTS with heavy call buying (directional filter) ──
-        elif call_pct > 0.55:
+        # ── RULE 2: Block PUTS only with very heavy call buying ──
+        elif call_pct > 0.70:
             gate_decision = "HARD_BLOCK"
             gate_reasons.append(
-                f"Heavy call buying (call_pct={call_pct:.0%} > 55%) — "
-                f"stock has bullish flow, puts will lose"
+                f"Very heavy call buying (call_pct={call_pct:.0%} > 70%) — "
+                f"strong bullish positioning"
             )
 
-        # ── RULE 3: NEUTRAL regime — require minimum conviction ──
+        # ── RULE 3: NEUTRAL regime — allow with any signal evidence ──
         elif regime_label == "NEUTRAL":
-            if mps_val < 0.60 or sig_cnt < 5:
+            if sig_cnt < 1:
                 gate_decision = "HARD_BLOCK"
                 gate_reasons.append(
-                    f"Neutral regime: MPS={mps_val:.2f}<0.60 or sig={sig_cnt}<5 "
-                    f"(insufficient conviction for puts in flat market)"
+                    f"Neutral regime: sig={sig_cnt}<1 (zero bearish evidence)"
                 )
             else:
                 gate_reasons.append(
-                    f"Neutral + high conviction (MPS={mps_val:.2f}, sig={sig_cnt})"
+                    f"Neutral + bearish signals present (sig={sig_cnt})"
                 )
 
         # ── RULE 4: Bear regimes — allow (puts aligned) ──
