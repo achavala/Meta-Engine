@@ -1,7 +1,8 @@
 """
 Meta Engine Scheduler
 ======================
-Runs the Meta Engine twice daily on every trading day:
+Runs the Meta Engine three times daily on every trading day:
+  - 8:30 AM ET  (pre-market — overnight gaps, early institutional flow)
   - 9:35 AM ET  (morning — real market data + gap detection)
   - 3:15 PM ET  (afternoon — intraday action + power hour setup)
 
@@ -15,7 +16,7 @@ Methods:
 3. Manual — run once via command line
 
 Usage:
-    # Start scheduler daemon (runs at 9:35 AM + 3:15 PM ET):
+    # Start scheduler daemon (runs at 8:30 AM + 9:35 AM + 3:15 PM ET):
     python scheduler.py
     
     # Run once immediately:
@@ -301,8 +302,8 @@ _caffeinate_proc: subprocess.Popen = None  # type: ignore
 def _keep_awake_market_hours():
     """
     Prevent the Mac from idle-sleeping during market hours.
-    Called at 9:15 AM ET by APScheduler; keeps awake for ~7 hours
-    (covers 9:35 AM and 3:15 PM runs, plus market close at 4 PM).
+    Called at 8:15 AM ET by APScheduler; keeps awake for ~8 hours
+    (covers 8:30 AM, 9:35 AM, and 3:15 PM runs, plus market close at 4 PM).
     Uses macOS `caffeinate` — no sudo needed.
     """
     global _caffeinate_proc
@@ -311,14 +312,14 @@ def _keep_awake_market_hours():
         _caffeinate_proc.terminate()
         _caffeinate_proc = None
 
-    duration = 25200  # 7 hours in seconds (9:15 AM → 4:15 PM)
+    duration = 28800  # 8 hours in seconds (8:15 AM → 4:15 PM)
     try:
         _caffeinate_proc = subprocess.Popen(
             ["caffeinate", "-dims", "-t", str(duration)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        logger.info(f"  ☕ caffeinate started (7h) — Mac stays awake until market close "
+        logger.info(f"  ☕ caffeinate started (8h) — Mac stays awake until market close "
                      f"(PID {_caffeinate_proc.pid})")
     except Exception as e:
         logger.warning(f"  caffeinate failed: {e} (Mac may sleep during trading hours)")
@@ -388,7 +389,8 @@ def _auto_check_winners():
 
 def start_scheduler():
     """
-    Start the APScheduler daemon that runs Meta Engine twice daily:
+    Start the APScheduler daemon that runs Meta Engine three times daily:
+      - 8:30 AM ET  (pre-market scan — overnight gaps, early institutional flow)
       - 9:35 AM ET  (morning scan — real market data + gap detection)
       - 3:15 PM ET  (afternoon scan — full intraday data + power hour setup)
     Also starts the trading dashboard on port 5050.
@@ -436,23 +438,23 @@ def start_scheduler():
     # Create scheduler
     scheduler = BlockingScheduler(timezone=EST)
     
-    # ── Job 0: Keep Mac awake during market hours (9:15 AM) ──
+    # ── Job 0: Keep Mac awake during market hours (8:15 AM) ──
     scheduler.add_job(
         _keep_awake_market_hours,
         trigger=CronTrigger(
-            hour=9, minute=15,
+            hour=8, minute=15,
             day_of_week="mon-fri",
             timezone=EST,
         ),
         id="caffeinate_market_hours",
-        name="Keep Mac awake 9:15 AM - 4:15 PM ET",
+        name="Keep Mac awake 8:15 AM - 4:15 PM ET",
         misfire_grace_time=3600,
     )
-    logger.info("  ✅ Job scheduled: caffeinate at 9:15 AM ET, Mon-Fri")
+    logger.info("  ✅ Job scheduled: caffeinate at 8:15 AM ET, Mon-Fri")
 
-    # ── Jobs 1-2: Meta Engine runs (scan + report + trade) ──
+    # ── Jobs 1-3: Meta Engine runs (scan + report + trade) ──
     # Labels map index → descriptive name for logging and trade DB
-    session_labels = {0: "Morning", 1: "Afternoon"}
+    session_labels = {0: "Pre-Market", 1: "Morning", 2: "Afternoon"}
     for idx, run_time in enumerate(run_times):
         hour, minute = map(int, run_time.split(":"))
         label = session_labels.get(idx, f"Session-{idx+1}")
@@ -546,7 +548,7 @@ def start_scheduler():
 
     # If Mac is currently awake and it's market hours, start caffeinate now
     now_et = datetime.now(EST)
-    if now_et.weekday() < 5 and 9 <= now_et.hour < 16:
+    if now_et.weekday() < 5 and 8 <= now_et.hour < 16:
         _keep_awake_market_hours()
 
     # ── Missed-run recovery ──
@@ -556,14 +558,15 @@ def start_scheduler():
     # the morning run entirely (root cause of Feb 18 outage).
     if now_et.weekday() < 5:
         _run_times = [
+            (8, 30, 9, 0, "Pre-Market"),
             (9, 35, 10, 0, "Morning"),
             (15, 15, 15, 45, "Afternoon"),
         ]
+        _session_map = {"Pre-Market": "AM", "Morning": "AM", "Afternoon": "PM"}
         for start_h, start_m, end_h, end_m, label in _run_times:
             run_start = now_et.replace(hour=start_h, minute=start_m, second=0)
             run_end = now_et.replace(hour=end_h, minute=end_m, second=0)
             if run_start <= now_et <= run_end:
-                # Check if today's output file exists (i.e. run already completed)
                 today_str = now_et.strftime('%Y%m%d')
                 puts_file = META_DIR / "output" / f"puts_top10_{today_str}.json"
                 moon_file = META_DIR / "output" / f"moonshot_top10_{today_str}.json"
@@ -572,7 +575,7 @@ def start_scheduler():
                         f"⚠️ MISSED RUN RECOVERY: {label} run was missed "
                         f"(no output files for {today_str}). Running NOW..."
                     )
-                    _scheduled_run(session_label="AM" if label == "Morning" else "PM")
+                    _scheduled_run(session_label=_session_map.get(label, "AM"))
                 else:
                     logger.info(
                         f"  ✅ {label} run already completed today (output files exist)"

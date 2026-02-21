@@ -50,15 +50,17 @@ class MetaConfig:
     X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN", "")
 
     # ========== SCHEDULE ==========
-    # Two daily scans:
-    #   1. 9:35 AM  — Morning Scan: Real market data from Polygon,
-    #                 gap detection fully functional, opening range forming.
-    #                 Trades execute here.
+    # Three daily scans:
+    #   0. 8:30 AM  — Pre-Market Scan: Pre-market movers, overnight gaps,
+    #                 early institutional flow. Read-through before open.
+    #   1. 9:35 AM  — Morning Scan: Post-open data, gap detection,
+    #                 opening range forming. Trades execute here.
     #   2. 3:15 PM  — Afternoon Scan: Full intraday data, power hour setup.
     #                 Trades execute here.
+    RUN_TIME_PREMARKET_ET = os.getenv("META_RUN_TIME_PRE", "08:30")  # Pre-market
     RUN_TIME_ET = os.getenv("META_RUN_TIME", "09:35")  # Morning (post-open)
     RUN_TIME_PM_ET = os.getenv("META_RUN_TIME_PM", "15:15")  # Afternoon
-    RUN_TIMES_ET = [RUN_TIME_ET, RUN_TIME_PM_ET]
+    RUN_TIMES_ET = [RUN_TIME_PREMARKET_ET, RUN_TIME_ET, RUN_TIME_PM_ET]
     TIMEZONE = "US/Eastern"
 
     # ========== ENGINE SETTINGS ==========

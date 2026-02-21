@@ -2,7 +2,7 @@
 🏛️ META ENGINE — Core Orchestrator
 =====================================
 The Meta Engine sits on top of PutsEngine and Moonshot Engine,
-running 2× daily on every trading day (9:35 AM, 3:15 PM ET) to:
+running 3× daily on every trading day (8:30 AM, 9:35 AM, 3:15 PM ET) to:
 
 1. Get Top 10 picks from PutsEngine (bearish/distribution signals)
 2. Get Top 10 picks from Moonshot Engine (bullish/squeeze signals)
@@ -864,7 +864,7 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
         logger.error(f"Telegram failed: {e}")
     
     # Determine session label from current time (used by X poster and trading)
-    # 2-session schedule: Morning (9:35 AM), Afternoon (3:15 PM)
+    # 3-session schedule: Pre-Market (8:30 AM), Morning (9:35 AM), Afternoon (3:15 PM)
     if now.hour < 12:
         session_label = "AM"
     else:
