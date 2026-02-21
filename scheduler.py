@@ -148,8 +148,21 @@ def _scheduled_run(session_label: str = ""):
     git_hash = _get_git_hash()
     logger.info(f"   Code version (on disk): {git_hash}")
 
-    # If scheduler.py itself was updated, self-restart first
-    _check_and_restart_if_code_changed()
+    # CRITICAL FIX (Feb 18, 2026): Do NOT restart before running.
+    # The old code called _check_and_restart_if_code_changed() HERE,
+    # which killed the process at 09:35:00 before the scan executed.
+    # Since we run meta_engine as a subprocess, it already uses the
+    # latest on-disk code. We defer the restart to AFTER the run.
+    _pending_restart = False
+    global _STARTUP_GIT_HASH
+    if _STARTUP_GIT_HASH != "unknown":
+        current_hash = _get_git_hash()
+        if current_hash != "unknown" and current_hash != _STARTUP_GIT_HASH:
+            logger.info(
+                f"   Code changed ({_STARTUP_GIT_HASH} → {current_hash}) — "
+                f"will restart AFTER this run completes"
+            )
+            _pending_restart = True
 
     meta_script = str(META_DIR / "meta_engine.py")
 
@@ -185,25 +198,56 @@ def _scheduled_run(session_label: str = ""):
                 logger.info("   ✅ Run completed (exit 0)")
         else:
             logger.error(f"   ❌ Run FAILED (exit code {proc.returncode})")
-            # Log last 20 lines of stderr for debugging
+            stderr_tail = ""
             if proc.stderr:
-                for line in proc.stderr.strip().split("\n")[-20:]:
+                lines = proc.stderr.strip().split("\n")[-20:]
+                stderr_tail = "\n".join(lines)
+                for line in lines:
                     logger.error(f"   STDERR: {line}")
             if proc.stdout:
                 for line in proc.stdout.strip().split("\n")[-10:]:
                     logger.error(f"   STDOUT: {line}")
+            try:
+                from monitoring.health_alerts import alert_scheduler_failure
+                alert_scheduler_failure(
+                    session_label or "Unknown",
+                    f"Exit code {proc.returncode}\n{stderr_tail[:800]}"
+                )
+            except Exception:
+                pass
 
     except subprocess.TimeoutExpired:
-        logger.error(
-            "   ❌ Run TIMED OUT after 15 minutes — check for hung API calls"
-        )
+        err_msg = "Run TIMED OUT after 15 minutes — check for hung API calls"
+        logger.error(f"   ❌ {err_msg}")
+        try:
+            from monitoring.health_alerts import alert_scheduler_failure
+            alert_scheduler_failure(session_label or "Unknown", err_msg)
+        except Exception:
+            pass
     except FileNotFoundError:
-        logger.error(
-            f"   ❌ Python interpreter not found: {VENV_PYTHON} — "
-            f"check venv exists"
-        )
+        err_msg = f"Python interpreter not found: {VENV_PYTHON} — check venv exists"
+        logger.error(f"   ❌ {err_msg}")
+        try:
+            from monitoring.health_alerts import alert_scheduler_failure
+            alert_scheduler_failure(session_label or "Unknown", err_msg)
+        except Exception:
+            pass
     except Exception as e:
         logger.error(f"   ❌ Scheduled run FAILED: {e}", exc_info=True)
+        try:
+            from monitoring.health_alerts import alert_scheduler_failure
+            alert_scheduler_failure(session_label or "Unknown", str(e))
+        except Exception:
+            pass
+
+    # Deferred restart: now that the scan is done, restart if code changed
+    if _pending_restart:
+        logger.warning(
+            "🔄 Scan complete — now restarting scheduler for fresh code..."
+        )
+        if PID_FILE.exists():
+            PID_FILE.unlink()
+        os._exit(0)
 
 
 def _start_dashboard_thread():
@@ -294,6 +338,11 @@ def _midday_position_check():
                      f"Closed: {result.get('closed', 0)}")
     except Exception as e:
         logger.error(f"   Position check failed: {e}")
+        try:
+            from monitoring.health_alerts import alert_trading_error
+            alert_trading_error("position_check", str(e))
+        except Exception:
+            pass
 
 
 def _auto_check_winners():
@@ -453,7 +502,33 @@ def start_scheduler():
     )
     logger.info("  ✅ Job scheduled: Auto winner check every 30 min (9:30 AM - 4:00 PM ET), Mon-Fri")
 
-    # ── Job 6: Code-freshness watchdog (every 15 min) ──
+    # ── Job 6: Live Backtest Runner (every 30 min, market hours) ──
+    def _run_live_backtest():
+        try:
+            now_et = datetime.now(EST)
+            if now_et.weekday() >= 5:
+                return
+            t = now_et.hour * 60 + now_et.minute
+            if not (570 <= t <= 960):
+                return
+            from monitoring.live_backtest_runner import run_checkpoint
+            run_checkpoint()
+        except Exception as e:
+            logger.warning(f"Live backtest checkpoint failed: {e}")
+
+    scheduler.add_job(
+        _run_live_backtest,
+        trigger=IntervalTrigger(
+            minutes=30,
+            timezone=EST,
+        ),
+        id="live_backtest_runner",
+        name="Live Backtest Runner (every 30 min, market hours)",
+        misfire_grace_time=1800,
+    )
+    logger.info("  ✅ Job scheduled: Live backtest runner every 30 min (market hours)")
+
+    # ── Job 7: Code-freshness watchdog (every 15 min) ──
     # If code changes are detected (git commit/push), the scheduler
     # self-restarts so it always runs the latest version.
     # launchd KeepAlive:true ensures immediate restart.
@@ -473,6 +548,35 @@ def start_scheduler():
     now_et = datetime.now(EST)
     if now_et.weekday() < 5 and 9 <= now_et.hour < 16:
         _keep_awake_market_hours()
+
+    # ── Missed-run recovery ──
+    # If the scheduler (re)started within the grace window after a
+    # scheduled run time, fire that run immediately. This prevents
+    # the scenario where a code-change restart at 09:35 swallows
+    # the morning run entirely (root cause of Feb 18 outage).
+    if now_et.weekday() < 5:
+        _run_times = [
+            (9, 35, 10, 0, "Morning"),
+            (15, 15, 15, 45, "Afternoon"),
+        ]
+        for start_h, start_m, end_h, end_m, label in _run_times:
+            run_start = now_et.replace(hour=start_h, minute=start_m, second=0)
+            run_end = now_et.replace(hour=end_h, minute=end_m, second=0)
+            if run_start <= now_et <= run_end:
+                # Check if today's output file exists (i.e. run already completed)
+                today_str = now_et.strftime('%Y%m%d')
+                puts_file = META_DIR / "output" / f"puts_top10_{today_str}.json"
+                moon_file = META_DIR / "output" / f"moonshot_top10_{today_str}.json"
+                if not puts_file.exists() and not moon_file.exists():
+                    logger.warning(
+                        f"⚠️ MISSED RUN RECOVERY: {label} run was missed "
+                        f"(no output files for {today_str}). Running NOW..."
+                    )
+                    _scheduled_run(session_label="AM" if label == "Morning" else "PM")
+                else:
+                    logger.info(
+                        f"  ✅ {label} run already completed today (output files exist)"
+                    )
 
     logger.info("Waiting for next scheduled run time...")
     logger.info("(Press Ctrl+C to stop)")

@@ -49,6 +49,16 @@ LIVE_SCAN_TIMEOUT_SEC = 30  # 30 seconds — then fall back to cached data
 
 logger = logging.getLogger(__name__)
 
+_bullish_overflow_tickers: List[Dict[str, Any]] = []
+
+
+def get_bullish_overflow() -> List[Dict[str, Any]]:
+    """Return tickers blocked from puts due to heavy call buying (>70%).
+    These are confirmed bullish-positioned stocks that should be considered
+    for the calls/moonshot list."""
+    return list(_bullish_overflow_tickers)
+
+
 # Add PutsEngine to path
 PUTSENGINE_PATH = str(Path.home() / "PutsEngine")
 if PUTSENGINE_PATH not in sys.path:
@@ -164,8 +174,11 @@ def get_top_puts(top_n: int = 10) -> List[Dict[str, Any]]:
         finally:
             loop.close()
         
-        # Sort by composite score descending
-        results.sort(key=lambda x: x["score"], reverse=True)
+        # Sort by conviction score (if available from cached fallback), else by score
+        results.sort(
+            key=lambda x: x.get("_conviction_score", x.get("score", 0)),
+            reverse=True,
+        )
         
         top_picks = results[:top_n]
         
@@ -471,6 +484,42 @@ def _fallback_from_cached_results(top_n: int = 10) -> List[Dict[str, Any]]:
     except Exception as e:
         logger.debug(f"  Real-time mover injection failed: {e}")
 
+    # ── Inject Smart Money picks (forward-looking flow analysis) ────
+    # UW options flow reveals institutional positioning BEFORE moves happen.
+    # Stocks with >75% put flow + institutional premium = tomorrow's droppers.
+    try:
+        from engine_adapters.smart_money_scanner import (
+            scan_smart_money,
+            build_puts_candidates_from_smart_money,
+        )
+        sm_data = scan_smart_money(universe=static_universe)
+        sm_bearish = sm_data.get("bearish_candidates", [])
+        if sm_bearish:
+            sm_candidates = build_puts_candidates_from_smart_money(sm_bearish, top_n=15)
+            existing_syms = {c.get("symbol", "") for c in all_candidates}
+            injected = 0
+            for sc in sm_candidates:
+                if sc["symbol"] not in existing_syms:
+                    all_candidates.append(sc)
+                    injected += 1
+                    existing_syms.add(sc["symbol"])
+                else:
+                    for c in all_candidates:
+                        if c.get("symbol") == sc["symbol"]:
+                            c["_smart_money_conviction"] = sc.get("_smart_money_conviction", 0)
+                            c["_smart_money_put_pct"] = sc.get("_smart_money_put_pct", 0)
+                            c["_is_smart_money_pick"] = True
+                            boost = min(sc.get("_smart_money_conviction", 0) * 0.15, 0.10)
+                            c["score"] = min(c["score"] + boost, 1.0)
+                            break
+            if injected:
+                logger.info(
+                    f"  🧠 Smart Money: {injected} new bearish candidates injected "
+                    f"(flow-based forward-looking picks)"
+                )
+    except Exception as e:
+        logger.debug(f"  Smart money injection failed: {e}")
+
     # ── Deduplicate and return ───────────────────────────────────────
     if not all_candidates:
         logger.warning("No PutsEngine data found across all tiers")
@@ -482,7 +531,11 @@ def _fallback_from_cached_results(top_n: int = 10) -> List[Dict[str, Any]]:
         if sym and (sym not in seen or c["score"] > seen[sym]["score"]):
             seen[sym] = c
     
-    deduped = sorted(seen.values(), key=lambda x: x["score"], reverse=True)
+    deduped = sorted(
+        seen.values(),
+        key=lambda x: x.get("_conviction_score", x.get("score", 0)),
+        reverse=True,
+    )
     
     # ── Enrich missing prices / uniform scores from supplementary data ──
     deduped = _enrich_candidates(deduped, top_n)
@@ -2209,6 +2262,7 @@ def _enrich_candidates(candidates: List[Dict[str, Any]], top_n: int) -> List[Dic
         logger.warning(f"  ⚠️ Theta awareness: check failed ({e})")
 
     before_gates = len(candidates)
+    all_candidates_before_gates = list(candidates)
 
     def _passes_tier(c, min_sig, min_base, min_score, min_mps):
         """Check if candidate passes a given tier's thresholds."""
@@ -2220,8 +2274,12 @@ def _enrich_candidates(candidates: List[Dict[str, Any]], top_n: int) -> List[Dic
         orm = c.get("_orm_score", 0)
         orm_status = c.get("_orm_status", "missing")
 
-        if orm_status == "computed" and orm < MIN_ORM_SCORE:
-            return False, f"ORM {orm:.3f} < {MIN_ORM_SCORE}"
+        gap_pct = c.get("_realtime_change_pct", 0)
+        is_rt = c.get("_is_realtime_mover", False)
+        is_confirmed_gap = is_rt or gap_pct < -3.0
+        orm_floor = 0.35 if is_confirmed_gap else MIN_ORM_SCORE
+        if orm_status == "computed" and orm < orm_floor:
+            return False, f"ORM {orm:.3f} < {orm_floor}"
         if signal_count < min_sig:
             return False, f"{signal_count} signals < {min_sig}"
         if base_score < min_base:
@@ -2325,15 +2383,13 @@ def _enrich_candidates(candidates: List[Dict[str, Any]], top_n: int) -> List[Dic
 
         all_gate_reasons.append(f"{c.get('symbol', '?')}: {r1} (all tiers failed)")
 
-    # Assemble final list: prefer Tier 1, fill with Tier 2, then Tier 3
-    filtered_candidates = tier1_picks[:]
-    if len(filtered_candidates) < MIN_PICKS_BEFORE_RELAX:
-        filtered_candidates.extend(tier2_picks)
-    if len(filtered_candidates) < MIN_PICKS_BEFORE_RELAX:
-        filtered_candidates.extend(tier3_picks)
-
-    # Sort by composite score within the assembled list
-    filtered_candidates.sort(key=lambda x: x.get("score", 0), reverse=True)
+    # Assemble final list: ALL tiers included, T1 first then T2 then T3.
+    # Tiers are for conviction ranking, not elimination. A stock dropping
+    # -8% (T2/T3) should never be discarded just because T1 has enough picks.
+    tier1_picks.sort(key=lambda x: x.get("score", 0), reverse=True)
+    tier2_picks.sort(key=lambda x: x.get("score", 0), reverse=True)
+    tier3_picks.sort(key=lambda x: x.get("score", 0), reverse=True)
+    filtered_candidates = tier1_picks + tier2_picks + tier3_picks
 
     logger.info(
         f"  🎯 Adaptive gates: T1={len(tier1_picks)}, T2={len(tier2_picks)}, "
@@ -2348,7 +2404,21 @@ def _enrich_candidates(candidates: List[Dict[str, Any]], top_n: int) -> List[Dic
 
     candidates = filtered_candidates
 
-    if len(candidates) < 3:
+    if len(candidates) == 0 and before_gates > 0:
+        logger.warning(
+            f"  ⚠️ ZERO candidates passed Policy B v5 gates ({before_gates} blocked). "
+            f"Activating safety fallback: returning top 5 by meta-score to avoid empty scan."
+        )
+        fallback_pool = sorted(
+            all_candidates_before_gates,
+            key=lambda x: x.get("_meta_score", x.get("score", 0)),
+            reverse=True,
+        )[:5]
+        for c in fallback_pool:
+            c["_low_opportunity_day"] = True
+            c["_policy_b_fallback"] = True
+        candidates = fallback_pool
+    elif len(candidates) < 3:
         logger.info(
             f"  ℹ️ Thin day: {len(candidates)} candidates passed adaptive gates "
             f"(of {before_gates} total). Proceeding with available picks."
@@ -2533,6 +2603,9 @@ def _apply_puts_regime_gate_v4(
 
     After filtering, apply conviction scoring and keep top N.
     """
+    global _bullish_overflow_tickers
+    _bullish_overflow_tickers = []
+
     if not candidates:
         return candidates
 
@@ -2551,7 +2624,7 @@ def _apply_puts_regime_gate_v4(
     hard_blocked = []
     passed = []
 
-    MAX_PUTS_PER_SCAN = 5   # v5: Increased 3→5. Original cap was too restrictive.
+    MAX_PUTS_PER_SCAN = 10  # v6: Increased 5→10 to fill Top 10 list.
     MIN_CONVICTION_SCORE = 0.20  # v5: Lowered 0.45→0.20. Let more picks through; rank by conviction.
     DEEP_BEAR_PM_PENALTY = 0.80  # v5: Softened 0.70→0.80. PM still useful with strong signals.
 
@@ -2574,20 +2647,38 @@ def _apply_puts_regime_gate_v4(
         gate_reasons = []
 
         # ── RULE 1: Block PUTS in bullish regimes ──
-        if regime_label in ("STRONG_BULL", "LEAN_BULL"):
-            gate_decision = "HARD_BLOCK"
-            gate_reasons.append(
-                f"{regime_label}: ALL puts blocked (wrong direction — "
-                f"market rising, puts lose)"
-            )
+        # EXCEPT real-time movers dropping >5% — if a stock is crashing in
+        # a bull market, puts are even more justified (contrarian signal).
+        if regime_label in ("STRONG_BULL", "LEAN_BULL", "RISK_ON"):
+            rt_change = c.get("_realtime_change_pct", 0)
+            if rt_change < -5.0:
+                gate_reasons.append(
+                    f"{regime_label} BUT stock dropping {rt_change:+.1f}% — "
+                    f"contrarian put justified (stock-specific decline)"
+                )
+            else:
+                gate_decision = "HARD_BLOCK"
+                gate_reasons.append(
+                    f"{regime_label}: ALL puts blocked (wrong direction — "
+                    f"market rising, puts lose)"
+                )
 
-        # ── RULE 2: Block PUTS only with very heavy call buying ──
+        # ── RULE 2: Block PUTS with very heavy call buying ──
+        # EXCEPT real-time movers dropping >5% — price action overrides flow
+        # (call buying on a crashing stock is hedging, not bullish conviction)
         elif call_pct > 0.70:
-            gate_decision = "HARD_BLOCK"
-            gate_reasons.append(
-                f"Very heavy call buying (call_pct={call_pct:.0%} > 70%) — "
-                f"strong bullish positioning"
-            )
+            rt_change = c.get("_realtime_change_pct", 0)
+            if rt_change < -5.0:
+                gate_reasons.append(
+                    f"Heavy call buying ({call_pct:.0%}) BUT real-time drop "
+                    f"{rt_change:+.1f}% overrides — price action dominates"
+                )
+            else:
+                gate_decision = "HARD_BLOCK"
+                gate_reasons.append(
+                    f"Very heavy call buying (call_pct={call_pct:.0%} > 70%) — "
+                    f"strong bullish positioning"
+                )
 
         # ── RULE 3: NEUTRAL regime — allow with any signal evidence ──
         elif regime_label == "NEUTRAL":
@@ -2602,7 +2693,7 @@ def _apply_puts_regime_gate_v4(
                 )
 
         # ── RULE 4: Bear regimes — allow (puts aligned) ──
-        elif regime_label in ("STRONG_BEAR", "LEAN_BEAR"):
+        elif regime_label in ("STRONG_BEAR", "LEAN_BEAR", "RISK_OFF"):
             gate_reasons.append(f"{regime_label}: Puts aligned with regime — allow")
 
         else:
@@ -2617,8 +2708,25 @@ def _apply_puts_regime_gate_v4(
             logger.info(
                 f"  🔴 PUTS BLOCK: {sym} — {gate_reasons[0][:100]} → removed"
             )
+            if call_pct > 0.70:
+                c["_bullish_overflow"] = True
+                c["_bullish_overflow_call_pct"] = call_pct
+                _bullish_overflow_tickers.append({
+                    "symbol": sym,
+                    "call_pct": call_pct,
+                    "score": c.get("score", 0),
+                    "signals": c.get("signals", []),
+                    "_conviction_boost_reason": "puts_blocked_heavy_calls",
+                })
         else:
             passed.append(c)
+
+    if _bullish_overflow_tickers:
+        logger.info(
+            f"  📤 Bullish overflow: {len(_bullish_overflow_tickers)} tickers blocked from puts "
+            f"due to heavy call buying — available for calls promotion: "
+            f"{', '.join(t['symbol'] for t in _bullish_overflow_tickers[:5])}"
+        )
 
     if hard_blocked:
         logger.info(
@@ -2645,23 +2753,35 @@ def _apply_puts_regime_gate_v4(
 
         sig_density = min(sig_cnt / 12.0, 1.0)
 
-        # Conviction formula:
-        #   35% meta score (already blended with ORM)
-        #   20% MPS (move potential)
-        #   15% signal density
-        #   15% HQ signal bonus
-        #   15% EWS institutional pressure
+        # Conviction formula v6:
+        #   20% meta score (already blended with ORM)
+        #   10% MPS (move potential)
+        #   10% signal density
+        #   10% HQ signal bonus
+        #   10% EWS institutional pressure
+        #   25% real-time price drop magnitude
+        #   15% smart money flow conviction
+        rt_change = c.get("_realtime_change_pct", 0)
+        rt_magnitude = min(max(-rt_change, 0) / 10.0, 1.0)
+        sm_conv = c.get("_smart_money_conviction", 0)
+
         conviction = (
-            0.35 * meta
-            + 0.20 * mps_val
-            + 0.15 * sig_density
-            + 0.15 * hq_bonus
-            + 0.15 * ews_ipi
+            0.20 * meta
+            + 0.10 * mps_val
+            + 0.10 * sig_density
+            + 0.10 * hq_bonus
+            + 0.10 * ews_ipi
+            + 0.25 * rt_magnitude
+            + 0.15 * min(sm_conv, 1.0)
         )
+
+        # Real-time mover priority: stocks actually dropping >3% are the
+        # strongest put signals and must rank above signal-only candidates.
+        if rt_change < -3.0:
+            conviction *= (1.0 + abs(rt_change) / 15.0)
 
         # Deep bear + PM penalty: after 2+ consecutive bear days,
         # PM puts catch mean-reversion bounces (stocks oversold, snap back).
-        # Evidence: Feb 12 PM (regime_score=-0.60, day 2 STRONG_BEAR) had 0% WR.
         is_pm = _is_pm_scan()
         if is_pm and regime_score < -0.50:
             conviction *= DEEP_BEAR_PM_PENALTY
@@ -2733,6 +2853,115 @@ def _apply_puts_regime_gate_v4(
         logger.debug(f"  PUTS regime shadow save failed: {e}")
 
     return passed
+
+
+def get_top_puts_direct(top_n: int = 10) -> List[Dict[str, Any]]:
+    """
+    Read the EXACT Top 10 PUT candidates directly from PutsEngine's
+    convergence pipeline (latest_top10.json) — the same data the
+    Predictive System tab (port 8507) displays.
+
+    This bypasses ORM re-weighting, meta-scoring, and regime gates
+    that were corrupting the high-conviction convergence picks from
+    PutsEngine's 4-Step pipeline (EWS + Direction + Gamma + Weather).
+
+    Falls back to get_top_puts() if the direct file is unavailable.
+    """
+    top10_path = Path(PUTSENGINE_PATH) / "logs" / "convergence" / "latest_top10.json"
+    top9_path = Path(PUTSENGINE_PATH) / "logs" / "convergence" / "latest_top9.json"
+
+    conv_path = top10_path if top10_path.exists() else top9_path
+
+    try:
+        if not conv_path.exists():
+            logger.warning(
+                "  ⚠️ convergence latest_top10/top9.json not found — "
+                "falling back to processed puts pipeline"
+            )
+            return get_top_puts(top_n)
+
+        with open(conv_path, "r") as f:
+            data = json.load(f)
+
+        candidates = data.get("top10", data.get("top9", []))
+        if not candidates:
+            logger.warning(
+                "  ⚠️ convergence file has 0 candidates — "
+                "falling back to processed puts pipeline"
+            )
+            return get_top_puts(top_n)
+
+        age_hours = 0.0
+        gen_at = data.get("generated_at_et", data.get("generated_at_utc", ""))
+        if gen_at:
+            try:
+                gen_str = gen_at.replace(" ET", "").strip()
+                gen_dt = datetime.fromisoformat(gen_str)
+                age_hours = (datetime.now() - gen_dt).total_seconds() / 3600
+            except Exception:
+                pass
+
+        if age_hours > 6:
+            logger.warning(
+                f"  ⚠️ convergence data is {age_hours:.1f}h old — "
+                f"using anyway (PutsEngine may not have scanned recently)"
+            )
+
+        results = []
+        for r in candidates[:top_n]:
+            gamma_signals = r.get("gamma_signals", [])
+            source_list = r.get("source_list", [])
+
+            result = {
+                "symbol": r["symbol"],
+                "score": r.get("convergence_score", 0),
+                "price": r.get("current_price", 0),
+                "signals": gamma_signals,
+                "engine": f"PutsEngine ({r.get('gamma_engine', 'convergence')})",
+                "engine_type": r.get("gamma_engine", "convergence"),
+                "convergence_score": r.get("convergence_score", 0),
+                "ews_score": r.get("ews_score", 0),
+                "ews_level": r.get("ews_level", ""),
+                "gamma_score": r.get("gamma_score", 0),
+                "weather_forecast": r.get("weather_forecast", ""),
+                "weather_score": r.get("weather_score", 0),
+                "direction_alignment": r.get("direction_alignment", 0),
+                "sources_agreeing": r.get("sources_agreeing", 0),
+                "source_list": source_list,
+                "quality_tier": r.get("quality_tier", ""),
+                "days_on_list": r.get("days_on_list", 0),
+                "expected_drop": r.get("expected_drop", ""),
+                "timing": r.get("timing", ""),
+                "pump_magnitude": r.get("pump_magnitude", 0),
+                "signal_density": r.get("signal_density", 0),
+                "put_return_quality": r.get("put_return_quality", 0),
+                "sector": r.get("sector", ""),
+                "permission_light": r.get("permission_light", ""),
+                "institutional_quality_score": r.get("institutional_quality_score", 0),
+                "_conviction_score": r.get("convergence_score", 0),
+                "_is_direct_pick": True,
+            }
+            results.append(result)
+
+        n = len(results)
+        direction = data.get("summary", {}).get("direction_regime", "N/A")
+        logger.info(
+            f"🔴 Puts Direct: {n} picks loaded from PutsEngine "
+            f"convergence pipeline (Direction: {direction})"
+        )
+        for i, p in enumerate(results, 1):
+            logger.info(
+                f"  #{i} {p['symbol']} — Conv: {p['score']:.3f} — "
+                f"${p['price']:.2f} — EWS: {p['ews_score']:.2f} — "
+                f"Gamma: {p['gamma_score']:.2f} — "
+                f"Weather: {p['weather_forecast']} — "
+                f"Sources: {p['sources_agreeing']}/6"
+            )
+        return results
+
+    except Exception as e:
+        logger.error(f"Puts direct read failed: {e}")
+        return get_top_puts(top_n)
 
 
 def get_puts_universe() -> List[str]:

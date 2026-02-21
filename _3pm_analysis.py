@@ -1099,58 +1099,82 @@ def run_3pm_analysis(session_label: str = ""):
     logger.info(f"  {now.strftime('%B %d, %Y %I:%M:%S %p ET')}")
     logger.info("=" * 70)
 
-    # 1. Load all data
-    logger.info("\n📊 STEP 1: Loading all data sources...")
-    data = load_all_data()
+    try:
+        # 1. Load all data
+        logger.info("\n📊 STEP 1: Loading all data sources...")
+        data = load_all_data()
 
-    # 2. Select top candidates
-    logger.info("\n🔍 STEP 2: Selecting top candidates...")
-    calls, puts = select_top_candidates(data)
-    logger.info(f"  Top 3 CALLS: {[c['symbol'] for c in calls]}")
-    logger.info(f"  Top 3 PUTS:  {[p['symbol'] for p in puts]}")
+        # 2. Select top candidates
+        logger.info("\n🔍 STEP 2: Selecting top candidates...")
+        calls, puts = select_top_candidates(data)
+        logger.info(f"  Top 3 CALLS: {[c['symbol'] for c in calls]}")
+        logger.info(f"  Top 3 PUTS:  {[p['symbol'] for p in puts]}")
 
-    # Print details
-    for c in calls:
-        logger.info(f"\n  🟢 {c['symbol']} ${c['strike']:.0f}C {c['expiry_display']} "
-                     f"| Price: ${c['price']:.2f} | Conv: {c['conviction']:.0%}")
-    for p in puts:
-        logger.info(f"\n  🔴 {p['symbol']} ${p['strike']:.0f}P {p['expiry_display']} "
-                     f"| Price: ${p['price']:.2f} | Conv: {p['conviction']:.0%}")
+        for c in calls:
+            logger.info(f"\n  🟢 {c['symbol']} ${c['strike']:.0f}C {c['expiry_display']} "
+                         f"| Price: ${c['price']:.2f} | Conv: {c['conviction']:.0%}")
+        for p in puts:
+            logger.info(f"\n  🔴 {p['symbol']} ${p['strike']:.0f}P {p['expiry_display']} "
+                         f"| Price: ${p['price']:.2f} | Conv: {p['conviction']:.0%}")
 
-    # 3. Generate report
-    logger.info("\n📝 STEP 3: Generating report...")
-    report = generate_report(calls, puts, data, session_label=session_label)
+        # 3. Generate report
+        logger.info("\n📝 STEP 3: Generating report...")
+        report = generate_report(calls, puts, data, session_label=session_label)
 
-    # Save report
-    out_dir = Path("output")
-    out_dir.mkdir(exist_ok=True)
-    report_path = out_dir / f"options_analysis_{session_label}_{now.strftime('%Y%m%d')}.md"
-    with open(report_path, "w") as f:
-        f.write(report)
-    logger.info(f"  Saved: {report_path}")
+        # Save report
+        out_dir = Path("output")
+        out_dir.mkdir(exist_ok=True)
+        report_path = out_dir / f"options_analysis_{session_label}_{now.strftime('%Y%m%d')}.md"
+        try:
+            with open(report_path, "w") as f:
+                f.write(report)
+            logger.info(f"  Saved: {report_path}")
+        except IOError as e:
+            logger.error(f"  Failed to save report: {e}")
+            report_path = None
 
-    # 4. Send Email
-    logger.info("\n📧 STEP 4: Sending Email...")
-    email_ok = send_email(report, calls, puts, session_label=session_label)
+        # 4. Send Email
+        logger.info("\n📧 STEP 4: Sending Email...")
+        email_ok = send_email(report, calls, puts, session_label=session_label)
 
-    # 5. Send Telegram
-    logger.info("\n📱 STEP 5: Sending Telegram...")
-    tg_ok = send_telegram(calls, puts, session_label=session_label)
+        # 5. Send Telegram
+        logger.info("\n📱 STEP 5: Sending Telegram...")
+        tg_ok = send_telegram(calls, puts, session_label=session_label)
 
-    # 6. Post to X
-    logger.info(f"\n🐦 STEP 6: Posting to X ({session_label})...")
-    x_ok = post_to_x(calls, puts)
+        # 6. Post to X
+        logger.info(f"\n🐦 STEP 6: Posting to X ({session_label})...")
+        x_ok = post_to_x(calls, puts)
 
-    # Summary
-    logger.info("\n" + "=" * 70)
-    logger.info("  RESULTS SUMMARY")
-    logger.info(f"  Email:    {'✅' if email_ok else '❌'}")
-    logger.info(f"  Telegram: {'✅' if tg_ok else '❌'}")
-    logger.info(f"  X/Twitter:{'✅' if x_ok else '❌'}")
-    logger.info(f"  Report:   {report_path}")
-    logger.info("=" * 70)
+        # Summary
+        logger.info("\n" + "=" * 70)
+        logger.info("  RESULTS SUMMARY")
+        logger.info(f"  Email:    {'✅' if email_ok else '❌'}")
+        logger.info(f"  Telegram: {'✅' if tg_ok else '❌'}")
+        logger.info(f"  X/Twitter:{'✅' if x_ok else '❌'}")
+        logger.info(f"  Report:   {report_path}")
+        logger.info("=" * 70)
 
-    return calls, puts, report
+        return calls, puts, report
+
+    except Exception as e:
+        logger.error("❌ 3PM Analysis CRASHED: %s", e)
+        import traceback
+        traceback.print_exc()
+        # Try to send distress notifications (email + Telegram)
+        try:
+            from notifications.email_sender import send_meta_email
+            send_meta_email(
+                subject="⚠️ Meta Engine Analysis CRASHED",
+                summaries={"error": f"Analysis crashed: {e}"},
+            )
+        except Exception:
+            pass
+        try:
+            from monitoring.health_alerts import alert_pipeline_crash
+            alert_pipeline_crash("3PM Deep Analysis", str(e))
+        except Exception:
+            pass
+        return [], [], ""
 
 
 if __name__ == "__main__":

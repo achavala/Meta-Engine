@@ -132,7 +132,7 @@ def send_meta_email(
 
                 # Build styled HTML section for 5x Potential
                 five_x_html = (
-                    '<div style="background:#0d1117;border:1px solid rgba(255,165,0,0.3);'
+                    '<div style="background-color:#0d1117;border:1px solid #4d3200;'
                     'border-radius:12px;padding:24px;margin:24px 0;">'
                     '<h2 style="color:#ffa726;margin:0 0 6px 0;font-size:20px;">'
                     '🔥 System 2 — 5x Potential Watchlist</h2>'
@@ -147,13 +147,13 @@ def send_meta_email(
                     five_x_html += (
                         '<h3 style="color:#00e676;font-size:15px;margin:16px 0 8px 0;">'
                         f'📈 Top CALL Potential ({n_calls})</h3>'
-                        '<table style="width:100%;border-collapse:collapse;font-size:13px;">'
-                        '<tr style="border-bottom:1px solid rgba(255,255,255,0.1);">'
-                        '<th style="color:#78909c;padding:6px 10px;text-align:left;">#</th>'
-                        '<th style="color:#78909c;padding:6px 10px;text-align:left;">Symbol</th>'
-                        '<th style="color:#78909c;padding:6px 10px;text-align:right;">5x Score</th>'
-                        '<th style="color:#78909c;padding:6px 10px;text-align:left;">Sector</th>'
-                        '<th style="color:#78909c;padding:6px 10px;text-align:left;">Source</th>'
+                        '<table style="width:100%;border-collapse:collapse;font-size:13px;background-color:#0d1117;">'
+                        '<tr style="border-bottom:1px solid #2a2d45;">'
+                        '<th style="color:#78909c;padding:6px 10px;text-align:left;background-color:#131629;">#</th>'
+                        '<th style="color:#78909c;padding:6px 10px;text-align:left;background-color:#131629;">Symbol</th>'
+                        '<th style="color:#78909c;padding:6px 10px;text-align:right;background-color:#131629;">5x Score</th>'
+                        '<th style="color:#78909c;padding:6px 10px;text-align:left;background-color:#131629;">Sector</th>'
+                        '<th style="color:#78909c;padding:6px 10px;text-align:left;background-color:#131629;">Source</th>'
                         '</tr>'
                     )
                     for i, c in enumerate(five_x_data["call_potential"][:15], 1):
@@ -163,12 +163,12 @@ def send_meta_email(
                         src = c.get("_source", "—")
                         score_str = f"{score:.3f}" if isinstance(score, (int, float)) else str(score)
                         five_x_html += (
-                            f'<tr style="border-bottom:1px solid rgba(255,255,255,0.05);">'
-                            f'<td style="color:#e0e0e0;padding:5px 10px;">{i}</td>'
-                            f'<td style="color:#00e676;padding:5px 10px;font-weight:700;">{sym}</td>'
-                            f'<td style="color:#e0e0e0;padding:5px 10px;text-align:right;">{score_str}</td>'
-                            f'<td style="color:#90a4ae;padding:5px 10px;">{sector}</td>'
-                            f'<td style="color:#78909c;padding:5px 10px;">{src}</td>'
+                            f'<tr style="border-bottom:1px solid #1a1d30;">'
+                            f'<td style="color:#e0e0e0;padding:5px 10px;background-color:#0d1117;">{i}</td>'
+                            f'<td style="color:#00e676;padding:5px 10px;font-weight:700;background-color:#0d1117;">{sym}</td>'
+                            f'<td style="color:#e0e0e0;padding:5px 10px;text-align:right;background-color:#0d1117;">{score_str}</td>'
+                            f'<td style="color:#90a4ae;padding:5px 10px;background-color:#0d1117;">{sector}</td>'
+                            f'<td style="color:#78909c;padding:5px 10px;background-color:#0d1117;">{src}</td>'
                             f'</tr>'
                         )
                     five_x_html += '</table>'
@@ -178,13 +178,13 @@ def send_meta_email(
                     five_x_html += (
                         '<h3 style="color:#ff1744;font-size:15px;margin:16px 0 8px 0;">'
                         f'📉 Top PUT Potential ({n_puts})</h3>'
-                        '<table style="width:100%;border-collapse:collapse;font-size:13px;">'
-                        '<tr style="border-bottom:1px solid rgba(255,255,255,0.1);">'
-                        '<th style="color:#78909c;padding:6px 10px;text-align:left;">#</th>'
-                        '<th style="color:#78909c;padding:6px 10px;text-align:left;">Symbol</th>'
-                        '<th style="color:#78909c;padding:6px 10px;text-align:right;">5x Score</th>'
-                        '<th style="color:#78909c;padding:6px 10px;text-align:left;">Sector</th>'
-                        '<th style="color:#78909c;padding:6px 10px;text-align:left;">Source</th>'
+                        '<table style="width:100%;border-collapse:collapse;font-size:13px;background-color:#0d1117;">'
+                        '<tr style="border-bottom:1px solid #2a2d45;">'
+                        '<th style="color:#78909c;padding:6px 10px;text-align:left;background-color:#131629;">#</th>'
+                        '<th style="color:#78909c;padding:6px 10px;text-align:left;background-color:#131629;">Symbol</th>'
+                        '<th style="color:#78909c;padding:6px 10px;text-align:right;background-color:#131629;">5x Score</th>'
+                        '<th style="color:#78909c;padding:6px 10px;text-align:left;background-color:#131629;">Sector</th>'
+                        '<th style="color:#78909c;padding:6px 10px;text-align:left;background-color:#131629;">Source</th>'
                         '</tr>'
                     )
                     for i, c in enumerate(five_x_data["put_potential"][:15], 1):
@@ -194,12 +194,12 @@ def send_meta_email(
                         src = c.get("_source", "—")
                         score_str = f"{score:.3f}" if isinstance(score, (int, float)) else str(score)
                         five_x_html += (
-                            f'<tr style="border-bottom:1px solid rgba(255,255,255,0.05);">'
-                            f'<td style="color:#e0e0e0;padding:5px 10px;">{i}</td>'
-                            f'<td style="color:#ff1744;padding:5px 10px;font-weight:700;">{sym}</td>'
-                            f'<td style="color:#e0e0e0;padding:5px 10px;text-align:right;">{score_str}</td>'
-                            f'<td style="color:#90a4ae;padding:5px 10px;">{sector}</td>'
-                            f'<td style="color:#78909c;padding:5px 10px;">{src}</td>'
+                            f'<tr style="border-bottom:1px solid #1a1d30;">'
+                            f'<td style="color:#e0e0e0;padding:5px 10px;background-color:#0d1117;">{i}</td>'
+                            f'<td style="color:#ff1744;padding:5px 10px;font-weight:700;background-color:#0d1117;">{sym}</td>'
+                            f'<td style="color:#e0e0e0;padding:5px 10px;text-align:right;background-color:#0d1117;">{score_str}</td>'
+                            f'<td style="color:#90a4ae;padding:5px 10px;background-color:#0d1117;">{sector}</td>'
+                            f'<td style="color:#78909c;padding:5px 10px;background-color:#0d1117;">{src}</td>'
                             f'</tr>'
                         )
                     five_x_html += '</table>'
@@ -224,10 +224,10 @@ def send_meta_email(
 
                 # Two-system explainer
                 five_x_html += (
-                    '<div style="background:rgba(68,138,255,0.08);border:1px solid rgba(68,138,255,0.2);'
+                    '<div style="background-color:#0d1a2e;border:1px solid #1a3a5c;'
                     'border-radius:8px;padding:12px 16px;margin-top:16px;">'
                     '<p style="color:#90caf9;font-size:12px;margin:0;line-height:1.5;">'
-                    '<b>🏛️ Two-System Architecture:</b> '
+                    '<b style="color:#90caf9;">🏛️ Two-System Architecture:</b> '
                     '<span style="color:#00e676;">System 1 (Top Picks)</span> = '
                     'ultra-selective Policy B v4 trades (80% WR target). '
                     '<span style="color:#ffa726;">System 2 (5x Watchlist)</span> = '
@@ -362,58 +362,50 @@ def _build_html_from_summaries(summaries: Dict[str, Any], chart_path: Optional[s
     """Build HTML email from summaries data (fallback if .md not available)."""
     now = datetime.now()
     
+    # All styles are INLINE — Gmail / Outlook strip <style> blocks entirely.
+    _S = {
+        "body": (
+            "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;"
+            "margin:0;padding:20px;background-color:#0f0f23;color:#e0e0e0;"
+        ),
+        "container": "max-width:800px;margin:0 auto;",
+        "header": (
+            "background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);"
+            "padding:30px;border-radius:12px;margin-bottom:25px;text-align:center;"
+        ),
+        "section": "background-color:#1a1a2e;border-radius:10px;padding:20px;margin-bottom:20px;border-left:4px solid",
+        "pick": "background-color:#16213e;border-radius:8px;padding:15px;margin:12px 0;",
+        "pick_header": "margin-bottom:8px;",
+        "pick_symbol": "font-size:18px;font-weight:bold;color:#ffffff;",
+        "score_puts": "padding:4px 12px;border-radius:20px;font-size:13px;font-weight:bold;background-color:#3d1c1c;color:#ff6b6b;",
+        "score_moon": "padding:4px 12px;border-radius:20px;font-size:13px;font-weight:bold;background-color:#1c3d3a;color:#4ecdc4;",
+        "pick_summary": "font-size:14px;line-height:1.6;color:#bbbbbb;",
+        "final_summary": (
+            "background-color:#16213e;padding:20px;border-radius:10px;"
+            "font-size:15px;line-height:1.7;border:1px solid #3a3f6a;color:#e0e0e0;"
+        ),
+        "disclaimer": (
+            "background-color:#2a1515;border-left:3px solid #ff6b6b;"
+            "padding:12px 15px;margin:20px 0;font-size:12px;color:#999999;"
+        ),
+        "footer": "text-align:center;padding:20px;color:#888888;font-size:12px;",
+    }
+
     html = f"""
     <!DOCTYPE html>
     <html>
-    <head>
-        <meta charset="utf-8">
-        <style>
-            body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
-                   margin: 0; padding: 20px; background: #0f0f23; color: #e0e0e0; }}
-            .container {{ max-width: 800px; margin: 0 auto; }}
-            .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
-                       padding: 30px; border-radius: 12px; margin-bottom: 25px; text-align: center; }}
-            .header h1 {{ color: white; margin: 0; font-size: 28px; }}
-            .header p {{ color: #ddd; margin: 8px 0 0 0; font-size: 14px; }}
-            .section {{ background: #1a1a2e; border-radius: 10px; padding: 20px; margin-bottom: 20px; 
-                        border-left: 4px solid; }}
-            .section-puts {{ border-left-color: #ff6b6b; }}
-            .section-moonshot {{ border-left-color: #4ecdc4; }}
-            .section-conflict {{ border-left-color: #ffd93d; }}
-            .section-meta {{ border-left-color: #667eea; }}
-            .section h2 {{ color: #fff; margin-top: 0; font-size: 20px; }}
-            .pick {{ background: #16213e; border-radius: 8px; padding: 15px; margin: 12px 0; }}
-            .pick-header {{ display: flex; justify-content: space-between; align-items: center; 
-                            margin-bottom: 8px; }}
-            .pick-symbol {{ font-size: 18px; font-weight: bold; }}
-            .pick-score {{ padding: 4px 12px; border-radius: 20px; font-size: 13px; font-weight: bold; }}
-            .score-high {{ background: #ff6b6b33; color: #ff6b6b; }}
-            .score-moon {{ background: #4ecdc433; color: #4ecdc4; }}
-            .pick-summary {{ font-size: 14px; line-height: 1.6; color: #bbb; }}
-            .cross-label {{ font-size: 12px; padding: 3px 8px; border-radius: 4px; 
-                            display: inline-block; margin-top: 8px; }}
-            .label-low {{ background: #4ecdc422; color: #4ecdc4; }}
-            .label-moderate {{ background: #ffd93d22; color: #ffd93d; }}
-            .label-high {{ background: #ff6b6b22; color: #ff6b6b; }}
-            .final-summary {{ background: linear-gradient(135deg, #16213e, #1a1a2e); 
-                              padding: 20px; border-radius: 10px; font-size: 15px; 
-                              line-height: 1.7; border: 1px solid #667eea44; }}
-            .disclaimer {{ background: #ff6b6b11; border-left: 3px solid #ff6b6b; 
-                           padding: 12px 15px; margin: 20px 0; font-size: 12px; color: #888; }}
-            .footer {{ text-align: center; padding: 20px; color: #555; font-size: 12px; }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div class="header">
-                <h1>🏛️ META ENGINE DAILY REPORT</h1>
-                <p>{now.strftime('%B %d, %Y — %I:%M %p ET')}</p>
-                <p>Cross-Engine Analysis: PutsEngine × Moonshot</p>
+    <head><meta charset="utf-8"></head>
+    <body style="{_S['body']}">
+        <div style="{_S['container']}">
+            <div style="{_S['header']}">
+                <h1 style="color:#ffffff;margin:0;font-size:28px;">🏛️ META ENGINE DAILY REPORT</h1>
+                <p style="color:#dddddd;margin:8px 0 0 0;font-size:14px;">{now.strftime('%B %d, %Y — %I:%M %p ET')}</p>
+                <p style="color:#dddddd;margin:4px 0 0 0;font-size:14px;">Cross-Engine Analysis: PutsEngine × Moonshot</p>
             </div>
 
-            <div class="section section-meta">
-                <h2>📊 Executive Summary</h2>
-                <div class="final-summary">
+            <div style="{_S['section']} #667eea;">
+                <h2 style="color:#ffffff;margin-top:0;font-size:20px;">📊 Executive Summary</h2>
+                <div style="{_S['final_summary']}">
                     {summaries.get('final_summary', 'Analysis in progress...')}
                 </div>
             </div>
@@ -450,8 +442,8 @@ def _build_html_from_summaries(summaries: Dict[str, Any], chart_path: Optional[s
             signals_html += f"<li style='color: #bbb; margin: 4px 0;'>{s}</li>"
         
         html += f"""
-            <div class="section" style="border-left-color: {dir_border};">
-                <h2>🌤️ {header_text}</h2>
+            <div style="{_S['section']} {dir_border};">
+                <h2 style="color:#ffffff;margin-top:0;font-size:20px;">🌤️ {header_text}</h2>
                 <div style="background: linear-gradient(135deg, #16213e, #1a1a2e); 
                             padding: 20px; border-radius: 10px; border: 1px solid {dir_border}44;">
                     <div style="font-size: 24px; font-weight: bold; color: {dir_color}; margin-bottom: 10px;">
@@ -486,60 +478,60 @@ def _build_html_from_summaries(summaries: Dict[str, Any], chart_path: Optional[s
     # PutsEngine Picks
     puts_picks = summaries.get("puts_picks_summaries", [])
     if puts_picks:
-        html += """<div class="section section-puts"><h2>🔴 PutsEngine Top Picks (Bearish)</h2>"""
+        html += f'<div style="{_S["section"]} #ff6b6b;"><h2 style="color:#ffffff;margin-top:0;font-size:20px;">🔴 PutsEngine Top Picks (Bearish)</h2>'
         for i, pick in enumerate(puts_picks, 1):
             moon_level = pick.get("moonshot_level", "N/A")
-            label_class = {"HIGH": "label-high", "MODERATE": "label-moderate", "LOW": "label-low"}.get(moon_level, "label-low")
+            label_colors = {"HIGH": "#ff6b6b", "MODERATE": "#ffd93d", "LOW": "#4ecdc4"}.get(moon_level, "#4ecdc4")
             html += f"""
-                <div class="pick">
-                    <div class="pick-header">
-                        <span class="pick-symbol">#{i} {pick['symbol']}</span>
-                        <span class="pick-score score-high">PUT Score: {pick['puts_score']:.2f}</span>
+                <div style="{_S['pick']}">
+                    <div style="{_S['pick_header']}">
+                        <span style="{_S['pick_symbol']}">#{i} {pick['symbol']}</span>
+                        <span style="{_S['score_puts']}">PUT Score: {pick['puts_score']:.2f}</span>
                     </div>
-                    <div class="pick-summary">{pick['summary']}</div>
-                    <span class="cross-label {label_class}">Moonshot Counter-Signal: {moon_level}</span>
+                    <div style="{_S['pick_summary']}">{pick['summary']}</div>
+                    <span style="font-size:12px;padding:3px 8px;border-radius:4px;display:inline-block;margin-top:8px;color:{label_colors};">Moonshot Counter-Signal: {moon_level}</span>
                 </div>
             """
         html += "</div>"
-    
+
     # Moonshot Picks
     moon_picks = summaries.get("moonshot_picks_summaries", [])
     if moon_picks:
-        html += """<div class="section section-moonshot"><h2>🟢 Moonshot Top Picks (Bullish)</h2>"""
+        html += f'<div style="{_S["section"]} #4ecdc4;"><h2 style="color:#ffffff;margin-top:0;font-size:20px;">🟢 Moonshot Top Picks (Bullish)</h2>'
         for i, pick in enumerate(moon_picks, 1):
             puts_risk = pick.get("puts_risk", "N/A")
-            label_class = {"HIGH": "label-high", "MODERATE": "label-moderate", "LOW": "label-low"}.get(puts_risk, "label-low")
+            label_colors = {"HIGH": "#ff6b6b", "MODERATE": "#ffd93d", "LOW": "#4ecdc4"}.get(puts_risk, "#4ecdc4")
             html += f"""
-                <div class="pick">
-                    <div class="pick-header">
-                        <span class="pick-symbol">#{i} {pick['symbol']}</span>
-                        <span class="pick-score score-moon">Moonshot: {pick['moonshot_score']:.2f}</span>
+                <div style="{_S['pick']}">
+                    <div style="{_S['pick_header']}">
+                        <span style="{_S['pick_symbol']}">#{i} {pick['symbol']}</span>
+                        <span style="{_S['score_moon']}">Moonshot: {pick['moonshot_score']:.2f}</span>
                     </div>
-                    <div class="pick-summary">{pick['summary']}</div>
-                    <span class="cross-label {label_class}">PutsEngine Risk: {puts_risk}</span>
+                    <div style="{_S['pick_summary']}">{pick['summary']}</div>
+                    <span style="font-size:12px;padding:3px 8px;border-radius:4px;display:inline-block;margin-top:8px;color:{label_colors};">PutsEngine Risk: {puts_risk}</span>
                 </div>
             """
         html += "</div>"
-    
+
     # Conflicts
     conflicts = summaries.get("conflict_summaries", [])
     if conflicts:
-        html += """<div class="section section-conflict"><h2>⚡ Conflict Zones</h2>"""
+        html += f'<div style="{_S["section"]} #ffd93d;"><h2 style="color:#ffffff;margin-top:0;font-size:20px;">⚡ Conflict Zones</h2>'
         for c in conflicts:
-            html += f"""<div style="background: #ffd93d22; color: #ffd93d; padding: 10px 15px; border-radius: 6px; margin: 8px 0;">
-                <strong>{c['symbol']}</strong>: {c['summary']}
+            html += f"""<div style="background-color:#33300a;color:#ffd93d;padding:10px 15px;border-radius:6px;margin:8px 0;">
+                <strong style="color:#ffd93d;">{c['symbol']}</strong>: {c['summary']}
             </div>"""
         html += "</div>"
-    
+
     html += f"""
-            <div class="disclaimer">
-                <strong>⚠️ RISK DISCLAIMER:</strong> This report is generated by algorithmic 
-                signal analysis engines and is NOT financial advice. Options trading involves 
+            <div style="{_S['disclaimer']}">
+                <strong style="color:#ff6b6b;">⚠️ RISK DISCLAIMER:</strong> This report is generated by algorithmic
+                signal analysis engines and is NOT financial advice. Options trading involves
                 substantial risk of loss.
             </div>
-            <div class="footer">
-                <p>🏛️ <strong>Meta Engine</strong> — Cross-Engine Institutional Signal Analysis</p>
-                <p>Report generated: {now.strftime('%Y-%m-%d %H:%M:%S ET')}</p>
+            <div style="{_S['footer']}">
+                <p style="color:#888888;">🏛️ <strong style="color:#e0e0e0;">Meta Engine</strong> — Cross-Engine Institutional Signal Analysis</p>
+                <p style="color:#888888;">Report generated: {now.strftime('%Y-%m-%d %H:%M:%S ET')}</p>
             </div>
         </div>
     </body>

@@ -424,10 +424,117 @@ def generate_md_report(
     return str(report_path)
 
 
+def _inject_inline_styles(html: str) -> str:
+    """
+    Gmail, Outlook, and most email clients strip <style> blocks entirely.
+    This post-processes the markdown2 HTML output and injects inline styles
+    directly onto every element so the dark theme renders correctly.
+    """
+    import re
+
+    # --- Tables ---------------------------------------------------------
+    html = re.sub(
+        r'<table(?![^>]*style)',
+        '<table style="width:100%;border-collapse:collapse;margin:15px 0;'
+        'font-size:13px;background-color:#131629;border:1px solid #2a2d45;"',
+        html,
+    )
+    html = re.sub(
+        r'<thead(?![^>]*style)',
+        '<thead style="background-color:#1a1f3d;"',
+        html,
+    )
+    html = re.sub(
+        r'<th(?![^>]*style)',
+        '<th style="background-color:#1a1f3d;color:#4ecdc4;padding:10px 8px;'
+        'text-align:left;font-weight:600;border-bottom:2px solid #333333;"',
+        html,
+    )
+    html = re.sub(
+        r'<td(?![^>]*style)',
+        '<td style="padding:8px;border-bottom:1px solid #2a2d45;color:#e0e0e0;"',
+        html,
+    )
+    html = re.sub(
+        r'<tr(?![^>]*style)',
+        '<tr style="border-bottom:1px solid #2a2d45;"',
+        html,
+    )
+
+    # --- Headings -------------------------------------------------------
+    html = re.sub(
+        r'<h1(?![^>]*style)([^>]*)>',
+        r'<h1 style="background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);'
+        r'padding:25px 30px;border-radius:12px;text-align:center;'
+        r'color:#ffffff;font-size:26px;margin-bottom:25px;"\1>',
+        html,
+    )
+    html = re.sub(
+        r'<h2(?![^>]*style)([^>]*)>',
+        r'<h2 style="color:#4ecdc4;border-bottom:2px solid #333333;'
+        r'padding-bottom:8px;margin-top:30px;font-size:20px;"\1>',
+        html,
+    )
+    html = re.sub(
+        r'<h3(?![^>]*style)([^>]*)>',
+        r'<h3 style="color:#ffd93d;font-size:17px;margin-top:20px;"\1>',
+        html,
+    )
+
+    # --- Inline elements ------------------------------------------------
+    html = re.sub(
+        r'<strong(?![^>]*style)',
+        '<strong style="color:#ffffff;"',
+        html,
+    )
+    html = re.sub(
+        r'<em(?![^>]*style)',
+        '<em style="color:#aaaaaa;"',
+        html,
+    )
+    html = re.sub(
+        r'<code(?![^>]*style)',
+        '<code style="background-color:#16213e;padding:2px 6px;border-radius:3px;'
+        'font-size:12px;color:#4ecdc4;"',
+        html,
+    )
+
+    # --- Block elements -------------------------------------------------
+    html = re.sub(
+        r'<blockquote(?![^>]*style)',
+        '<blockquote style="background-color:#16213e;border-left:4px solid #667eea;'
+        'border-radius:6px;padding:15px 18px;margin:12px 0;font-size:14px;'
+        'color:#bbbbbb;line-height:1.7;"',
+        html,
+    )
+    html = re.sub(
+        r'<p(?![^>]*style)',
+        '<p style="margin:8px 0;color:#e0e0e0;"',
+        html,
+    )
+    html = re.sub(
+        r'<ul(?![^>]*style)',
+        '<ul style="padding-left:20px;color:#e0e0e0;"',
+        html,
+    )
+    html = re.sub(
+        r'<li(?![^>]*style)',
+        '<li style="margin:4px 0;color:#e0e0e0;"',
+        html,
+    )
+    html = re.sub(
+        r'<hr(?![^>]*style)',
+        '<hr style="border:none;border-top:1px solid #333333;margin:25px 0;"',
+        html,
+    )
+
+    return html
+
+
 def render_md_to_html(md_content: str) -> str:
     """
     Convert markdown content to beautifully styled HTML for email.
-    Uses markdown2 for conversion with a custom dark-themed stylesheet.
+    Uses markdown2 with inline styles for Gmail/Outlook compatibility.
     """
     try:
         import markdown2
@@ -441,77 +548,25 @@ def render_md_to_html(md_content: str) -> str:
         extras=["tables", "fenced-code-blocks", "header-ids", "break-on-newline"]
     )
     
-    # Wrap in styled HTML template
+    # Gmail strips <style> blocks — all styling MUST be inline.
+    # Use a dark theme with inline styles injected into every element.
+    html_body = _inject_inline_styles(html_body)
+
     styled_html = f"""<!DOCTYPE html>
 <html>
-<head>
-<meta charset="utf-8">
-<style>
-    body {{
-        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-        margin: 0; padding: 30px; background: #0f0f23; color: #e0e0e0;
-        line-height: 1.6;
-    }}
-    .container {{ max-width: 900px; margin: 0 auto; }}
-    h1 {{
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        padding: 25px 30px; border-radius: 12px; text-align: center;
-        color: white; font-size: 26px; margin-bottom: 25px;
-    }}
-    h2 {{
-        color: #4ecdc4; border-bottom: 2px solid #333; padding-bottom: 8px;
-        margin-top: 30px; font-size: 20px;
-    }}
-    h3 {{ color: #ffd93d; font-size: 17px; margin-top: 20px; }}
-    p {{ margin: 8px 0; }}
-    strong {{ color: #fff; }}
-    blockquote {{
-        background: #16213e; border-left: 4px solid #667eea; border-radius: 6px;
-        padding: 15px 18px; margin: 12px 0; font-size: 14px; color: #bbb;
-        line-height: 1.7;
-    }}
-    table {{
-        width: 100%; border-collapse: collapse; margin: 15px 0;
-        font-size: 13px;
-    }}
-    th {{
-        background: #16213e; color: #4ecdc4; padding: 10px 8px;
-        text-align: left; font-weight: 600; border-bottom: 2px solid #333;
-    }}
-    td {{
-        padding: 8px; border-bottom: 1px solid #222; color: #ccc;
-    }}
-    tr:hover td {{ background: #1a1a3e; }}
-    hr {{ border: none; border-top: 1px solid #333; margin: 25px 0; }}
-    em {{ color: #999; }}
-    code {{
-        background: #16213e; padding: 2px 6px; border-radius: 3px;
-        font-size: 12px; color: #4ecdc4;
-    }}
-    ul {{ padding-left: 20px; }}
-    li {{ margin: 4px 0; }}
-    .disclaimer {{
-        background: #ff6b6b11; border-left: 3px solid #ff6b6b;
-        padding: 12px 15px; margin: 25px 0; font-size: 12px; color: #888;
-    }}
-    .footer {{
-        text-align: center; padding: 20px; color: #555; font-size: 12px;
-        margin-top: 30px; border-top: 1px solid #222;
-    }}
-</style>
-</head>
-<body>
-<div class="container">
+<head><meta charset="utf-8"></head>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;margin:0;padding:30px;background-color:#0f0f23;color:#e0e0e0;line-height:1.6;">
+<div style="max-width:900px;margin:0 auto;">
 {html_body}
 
-<div class="disclaimer">
-<strong>⚠️ RISK DISCLAIMER:</strong> This report is generated by algorithmic signal analysis
+<div style="background-color:rgba(255,107,107,0.08);border-left:3px solid #ff6b6b;padding:12px 15px;margin:25px 0;font-size:12px;color:#999999;">
+<strong style="color:#ff6b6b;">⚠️ RISK DISCLAIMER:</strong> This report is generated by algorithmic signal analysis
 engines and is NOT financial advice. Options trading involves substantial risk of loss.
 Never risk more than you can afford to lose. Past performance does not guarantee future results.
 </div>
 
-<div class="footer">
-🏛️ <strong>Meta Engine</strong> — Cross-Engine Institutional Signal Analysis<br>
+<div style="text-align:center;padding:20px;color:#888888;font-size:12px;margin-top:30px;border-top:1px solid #333333;">
+🏛️ <strong style="color:#e0e0e0;">Meta Engine</strong> — Cross-Engine Institutional Signal Analysis<br>
 PutsEngine (PUT Detection) × Moonshot (Momentum/Squeeze Detection)<br>
 Report generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S ET')}
 </div>

@@ -612,6 +612,42 @@ def _fallback_from_cached_moonshots(top_n: int = 10) -> List[Dict[str, Any]]:
     except Exception as e:
         logger.debug(f"  Real-time mover injection failed: {e}")
 
+    # ── Inject Smart Money picks (forward-looking flow analysis) ────
+    # UW options flow reveals institutional positioning BEFORE moves happen.
+    # Stocks with >75% call flow + institutional premium = tomorrow's movers.
+    try:
+        from engine_adapters.smart_money_scanner import (
+            scan_smart_money,
+            build_moonshot_candidates_from_smart_money,
+        )
+        sm_data = scan_smart_money(universe=_STATIC_UNIVERSE)
+        sm_bullish = sm_data.get("bullish_candidates", [])
+        if sm_bullish:
+            sm_candidates = build_moonshot_candidates_from_smart_money(sm_bullish, top_n=15)
+            existing_syms = {r.get("symbol", "") for r in results}
+            injected = 0
+            for sc in sm_candidates:
+                if sc["symbol"] not in existing_syms:
+                    results.append(sc)
+                    injected += 1
+                    existing_syms.add(sc["symbol"])
+                else:
+                    for r in results:
+                        if r.get("symbol") == sc["symbol"]:
+                            r["_smart_money_conviction"] = sc.get("_smart_money_conviction", 0)
+                            r["_smart_money_call_pct"] = sc.get("_smart_money_call_pct", 0)
+                            r["_is_smart_money_pick"] = True
+                            boost = min(sc.get("_smart_money_conviction", 0) * 0.15, 0.10)
+                            r["score"] = min(r["score"] + boost, 1.0)
+                            break
+            if injected:
+                logger.info(
+                    f"  🧠 Smart Money: {injected} new bullish candidates injected "
+                    f"(flow-based forward-looking picks)"
+                )
+    except Exception as e:
+        logger.debug(f"  Smart money injection failed: {e}")
+
     # ── Deduplicate — keep highest-scoring entry per symbol ──────────
     # CRITICAL (FEB 11): Also merge metadata from lower-scored entries
     # so cross-source intelligence (MWS scores, pred signals, conviction)
@@ -1941,6 +1977,7 @@ def _enrich_moonshots_with_orm(
         logger.warning(f"  ⚠️ Theta awareness: check failed ({e})")
 
     before_gates = len(candidates)
+    all_candidates_before_gates = list(candidates)
 
     def _passes_moon_tier(c, min_sig, min_base, min_mps):
         """Check if candidate passes a given moonshot tier."""
@@ -2002,13 +2039,13 @@ def _enrich_moonshots_with_orm(
 
         all_gate_reasons.append(f"{c.get('symbol', '?')}: {r1} (all tiers failed)")
 
-    filtered_candidates = tier1_picks[:]
-    if len(filtered_candidates) < MIN_PICKS_BEFORE_RELAX:
-        filtered_candidates.extend(tier2_picks)
-    if len(filtered_candidates) < MIN_PICKS_BEFORE_RELAX:
-        filtered_candidates.extend(tier3_picks)
-
-    filtered_candidates.sort(key=lambda x: x.get("score", 0), reverse=True)
+    # ALL tiers included, T1 first then T2 then T3.
+    # Tiers are for conviction ranking, not elimination. A stock surging
+    # +10% (T2/T3) should never be discarded just because T1 has enough.
+    tier1_picks.sort(key=lambda x: x.get("score", 0), reverse=True)
+    tier2_picks.sort(key=lambda x: x.get("score", 0), reverse=True)
+    tier3_picks.sort(key=lambda x: x.get("score", 0), reverse=True)
+    filtered_candidates = tier1_picks + tier2_picks + tier3_picks
 
     logger.info(
         f"  🎯 Adaptive gates: T1={len(tier1_picks)}, T2={len(tier2_picks)}, "
@@ -2023,7 +2060,21 @@ def _enrich_moonshots_with_orm(
 
     candidates = filtered_candidates
 
-    if len(candidates) < 3:
+    if len(candidates) == 0 and before_gates > 0:
+        logger.warning(
+            f"  ⚠️ ZERO moonshot candidates passed Policy B v5 gates ({before_gates} blocked). "
+            f"Activating safety fallback: returning top 5 by meta-score to avoid empty scan."
+        )
+        fallback_pool = sorted(
+            all_candidates_before_gates,
+            key=lambda x: x.get("_meta_score", x.get("score", 0)),
+            reverse=True,
+        )[:5]
+        for c in fallback_pool:
+            c["_low_opportunity_day"] = True
+            c["_policy_b_fallback"] = True
+        candidates = fallback_pool
+    elif len(candidates) < 3:
         logger.info(
             f"  ℹ️ Thin day: {len(candidates)} moonshot candidates passed adaptive gates "
             f"(of {before_gates} total)."
@@ -2063,7 +2114,7 @@ def _enrich_moonshots_with_orm(
         )
 
     # ── CONVICTION SCORING + TOP-N RANKING (Policy B v5) ──────────
-    MAX_MOONSHOT_PER_SCAN = 5  # v5: Increased 3→5.
+    MAX_MOONSHOT_PER_SCAN = 10  # v6: Increased 5→10 to fill Top 10 list.
     MIN_CONVICTION_SCORE = 0.15  # v5: Lowered 0.45→0.15 to allow more picks through.
     PM_CONVICTION_PENALTY = 0.85  # v5: Softened 0.75→0.85.
 
@@ -2083,24 +2134,41 @@ def _enrich_moonshots_with_orm(
             features.get("institutional_accumulation", False),
         ])
 
-        # Conviction score formula:
-        #   40% base score (already blended with ORM)
-        #   25% MPS (move potential)
-        #   15% signal density (sig_count / 15, capped at 1.0)
-        #   20% premium signal bonus (0.10 per premium signal, max 0.50)
+        # Conviction score formula v6:
+        #   30% base score (already blended with ORM)
+        #   15% MPS (move potential)
+        #   10% signal density (sig_count / 15, capped at 1.0)
+        #   15% premium signal bonus (0.10 per premium signal, max 0.50)
+        #   30% real-time price magnitude (the most direct evidence of momentum)
         sig_density = min(sig_cnt / 15.0, 1.0)
         premium_bonus = min(premium_count * 0.10, 0.50)
 
+        rt_change = c.get("_realtime_change_pct", 0)
+        rt_magnitude = min(max(rt_change, 0) / 10.0, 1.0)
+
+        # Smart money flow conviction (0 if no UW flow data)
+        sm_conv = c.get("_smart_money_conviction", 0)
+
         conviction = (
-            0.40 * base
-            + 0.25 * mps_val
-            + 0.15 * sig_density
-            + 0.20 * premium_bonus
+            0.25 * base
+            + 0.10 * mps_val
+            + 0.10 * sig_density
+            + 0.10 * premium_bonus
+            + 0.25 * rt_magnitude
+            + 0.20 * min(sm_conv, 1.0)
         )
 
+        # Real-time mover priority: stocks surging >3% are the strongest
+        # bullish signals and must rank above signal-only candidates.
+        if rt_change > 3.0:
+            conviction *= (1.0 + rt_change / 15.0)
+
+        # Smart money priority: stocks with strong institutional flow get
+        # a conviction multiplier so they rank above noise.
+        if sm_conv >= 0.50:
+            conviction *= (1.0 + sm_conv * 0.3)
+
         # PM scan penalty: moonshot momentum fades by afternoon.
-        # AM captures gap-ups / morning momentum; PM catches reversals.
-        # Evidence: Feb 9 PM moonshots 0% WR vs AM 66.7% WR.
         try:
             from zoneinfo import ZoneInfo
             _et = datetime.now(ZoneInfo("America/New_York"))
@@ -2402,19 +2470,30 @@ def _apply_regime_shadow_and_hard_block(
         elif regime_label == "NEUTRAL":
             conviction_multiplier = 0.90
             gate_reasons.append("NEUTRAL — allowing with minor penalty")
-        elif regime_label in ("STRONG_BULL", "LEAN_BULL"):
+        elif regime_label in ("STRONG_BULL", "LEAN_BULL", "RISK_ON"):
             conviction_multiplier = 1.0
             gate_reasons.append(f"{regime_label} — full conviction")
+        elif regime_label in ("RISK_OFF",):
+            conviction_multiplier = 0.70
+            gate_reasons.append(f"RISK_OFF — allowing with 30% conviction penalty")
         else:
-            conviction_multiplier = 0.85
-            gate_reasons.append(f"UNKNOWN regime '{regime_label}' — allowing with caution")
+            conviction_multiplier = 0.90
+            gate_reasons.append(f"Unrecognized regime '{regime_label}' — allowing with minor penalty")
 
         # Block only on overwhelmingly bearish flow (< 30% call activity)
+        # EXCEPT real-time movers surging >5% — price action overrides flow
         if gate_decision == "ALLOW" and features.get("call_pct", 0.5) < 0.30:
-            gate_decision = "HARD_BLOCK"
-            gate_reasons.append(
-                f"Overwhelmingly bearish flow (call_pct={features['call_pct']:.0%} < 30%)"
-            )
+            rt_change = c.get("_realtime_change_pct", 0)
+            if rt_change > 5.0:
+                gate_reasons.append(
+                    f"Bearish flow ({features.get('call_pct', 0):.0%}) BUT real-time surge "
+                    f"+{rt_change:.1f}% overrides — price action dominates"
+                )
+            else:
+                gate_decision = "HARD_BLOCK"
+                gate_reasons.append(
+                    f"Overwhelmingly bearish flow (call_pct={features['call_pct']:.0%} < 30%)"
+                )
 
         c["_regime_gate_decision"] = gate_decision
         c["_regime_gate_reasons"] = gate_reasons
@@ -2462,6 +2541,105 @@ def _apply_regime_shadow_and_hard_block(
         logger.debug(f"  Regime shadow save failed: {e}")
 
     return passed
+
+
+def get_top_moonshots_direct(top_n: int = 10) -> List[Dict[str, Any]]:
+    """
+    Read the EXACT Top 10 moonshot candidates directly from TradeNova's
+    final_recommendations.json — the same data the Moonshot dashboard (port 8506)
+    displays as the "Final Recommendation Table".
+
+    This bypasses ORM re-weighting, Policy B gates, and regime filtering
+    that were corrupting the high-conviction picks from TradeNova's
+    cross-referenced Trinity Engines + UW Flow + MWS Forecast + Live Technicals.
+
+    Falls back to get_top_moonshots() if the direct file is unavailable.
+    """
+    recs_path = Path(TRADENOVA_PATH) / "data" / "final_recommendations.json"
+    try:
+        if not recs_path.exists():
+            logger.warning(
+                "  ⚠️ final_recommendations.json not found — "
+                "falling back to processed moonshot pipeline"
+            )
+            return get_top_moonshots(top_n)
+
+        with open(recs_path, "r") as f:
+            data = json.load(f)
+
+        recs = data.get("recommendations", [])
+        if not recs:
+            logger.warning(
+                "  ⚠️ final_recommendations.json has 0 recommendations — "
+                "falling back to processed moonshot pipeline"
+            )
+            return get_top_moonshots(top_n)
+
+        age_hours = 0.0
+        gen_at = data.get("generated_at", "")
+        if gen_at:
+            try:
+                gen_dt = datetime.fromisoformat(gen_at)
+                age_hours = (datetime.now() - gen_dt).total_seconds() / 3600
+            except Exception:
+                pass
+
+        if age_hours > 6:
+            logger.warning(
+                f"  ⚠️ final_recommendations.json is {age_hours:.1f}h old — "
+                f"using anyway (TradeNova may not have scanned recently)"
+            )
+
+        results = []
+        for r in recs[:top_n]:
+            engines_list = r.get("engines", [])
+            composite = r.get("composite_score", 0)
+            conviction_stars = r.get("conviction", 3)
+
+            result = {
+                "symbol": r["symbol"],
+                "score": min(composite / 200.0, 1.0),
+                "price": r.get("current_price", 0),
+                "signals": r.get("signals", []),
+                "engine": f"TradeNova ({', '.join(engines_list)})",
+                "engine_type": "moonshot_direct",
+                "entry_low": r.get("entry_low", 0),
+                "entry_high": r.get("entry_high", 0),
+                "target": r.get("target", 0),
+                "stop": r.get("stop", 0),
+                "why": r.get("why", ""),
+                "rsi": r.get("rsi", 0),
+                "macd_bullish": r.get("macd_bullish", False),
+                "uw_sentiment": r.get("uw_sentiment", "N/A"),
+                "sector": _SECTOR_MAP.get(r["symbol"], r.get("sector", "")),
+                "composite_score": composite,
+                "conviction_stars": conviction_stars,
+                "engines": engines_list,
+                "engine_count": r.get("engine_count", len(engines_list)),
+                "trade_grade": r.get("trade_grade", ""),
+                "mws_score": r.get("mws_score", 0),
+                "scan_label": data.get("scan_label", ""),
+                "_conviction_score": min(conviction_stars / 5.0, 1.0),
+                "_is_direct_pick": True,
+            }
+            results.append(result)
+
+        n = len(results)
+        logger.info(
+            f"🟢 Moonshot Direct: {n} picks loaded from TradeNova "
+            f"final_recommendations.json ({data.get('scan_label', '?')})"
+        )
+        for i, p in enumerate(results, 1):
+            logger.info(
+                f"  #{i} {p['symbol']} — Score: {p['score']:.3f} — "
+                f"${p['price']:.2f} — Engines: {p['engines']} — "
+                f"Sentiment: {p['uw_sentiment']}"
+            )
+        return results
+
+    except Exception as e:
+        logger.error(f"Moonshot direct read failed: {e}")
+        return get_top_moonshots(top_n)
 
 
 def get_moonshot_universe() -> List[str]:

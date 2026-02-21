@@ -583,18 +583,19 @@ def post_thread(tweets: List[str], scan_timestamp: str = None, session_label: st
                     in_reply_to_tweet_id=previous_tweet_id
                 )
             
-            if response and response.data:
-                previous_tweet_id = response.data["id"]
+            tweet_id = None
+            if response:
+                if hasattr(response, "data") and response.data:
+                    tweet_id = response.data["id"]
+                elif isinstance(response, dict) and "data" in response:
+                    tweet_id = response["data"]["id"]
+
+            if tweet_id:
+                previous_tweet_id = tweet_id
                 if first_tweet_id is None:
                     first_tweet_id = str(previous_tweet_id)
                 logger.info(f"  Tweet {i+1}/{len(tweets)} posted (ID: {previous_tweet_id})")
                 
-                # ── TWITTER ALGO WORKAROUND ──────────────────────────
-                # Self-like + self-bookmark the FIRST tweet immediately.
-                # This signals to Twitter's algo that the tweet has
-                # engagement, preventing it from being suppressed on
-                # mobile timelines.  (Known workaround since 2024.)
-                # ─────────────────────────────────────────────────────
                 if i == 0:
                     try:
                         client.like(previous_tweet_id)
@@ -814,11 +815,17 @@ def check_and_post_winners(
             quote_tweet_id=original_tweet_id
         )
         
-        if not response or not response.data:
+        header_id = None
+        if response:
+            if hasattr(response, "data") and response.data:
+                header_id = response.data["id"]
+            elif isinstance(response, dict) and "data" in response:
+                header_id = response["data"]["id"]
+        if not header_id:
             logger.error("Failed to post winner header tweet")
             return False
         
-        previous_tweet_id = response.data["id"]
+        previous_tweet_id = header_id
         logger.info(f"  Winner header posted (ID: {previous_tweet_id})")
         time.sleep(2)
         
@@ -865,8 +872,14 @@ def check_and_post_winners(
                 in_reply_to_tweet_id=previous_tweet_id
             )
             
-            if response and response.data:
-                previous_tweet_id = response.data["id"]
+            w_id = None
+            if response:
+                if hasattr(response, "data") and response.data:
+                    w_id = response.data["id"]
+                elif isinstance(response, dict) and "data" in response:
+                    w_id = response["data"]["id"]
+            if w_id:
+                previous_tweet_id = w_id
                 logger.info(f"  Winner #{i} posted: {sym} +{pnl_pct:.0f}%")
             else:
                 logger.error(f"  Failed to post winner #{i}")
@@ -891,7 +904,13 @@ def check_and_post_winners(
             in_reply_to_tweet_id=previous_tweet_id
         )
         
-        if response and response.data:
+        s_id = None
+        if response:
+            if hasattr(response, "data") and response.data:
+                s_id = response.data["id"]
+            elif isinstance(response, dict) and "data" in response:
+                s_id = response["data"]["id"]
+        if s_id:
             logger.info(f"  Summary posted")
         
         # Mark as posted to avoid duplicates
@@ -1174,16 +1193,18 @@ def check_and_post_milestones(min_profit_pct: float = 50.0) -> Dict[str, Any]:
                 else:
                     response = client.create_tweet(text=milestone_tweet)
                 
-                if response and response.data:
-                    tweet_id = str(response.data["id"])
-                    _mark_milestone_posted(trade_id, milestone, tweet_id)
+                m_id = None
+                if response:
+                    if hasattr(response, "data") and response.data:
+                        m_id = str(response.data["id"])
+                    elif isinstance(response, dict) and "data" in response:
+                        m_id = str(response["data"]["id"])
+                if m_id:
+                    _mark_milestone_posted(trade_id, milestone, m_id)
                     stats["milestones_posted"] += 1
                     logger.info(f"  ✅ Posted {milestone}% milestone for {sym} (trade: {trade_id[:12]})")
-                    
-                    # Send Telegram alert simultaneously
                     _send_milestone_telegram_alert(trade, milestone, pnl_pct)
-                    
-                    time.sleep(2)  # Rate limit
+                    time.sleep(2)
                 else:
                     logger.error(f"  ❌ Failed to post {milestone}% milestone for {sym}")
                     

@@ -277,12 +277,39 @@ def run_meta_engine(force: bool = False) -> Dict[str, Any]:
 
 def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
     """Internal: Execute the pipeline after lock is acquired."""
+
+    # ── PRE-FLIGHT SAFEGUARDS ──────────────────────────────────────
+    try:
+        from monitoring.safeguards import pre_flight_check
+        logger.info("\n🛡️  Running pre-flight safeguard checks...")
+        all_ok, warnings = pre_flight_check()
+        if not all_ok and not force:
+            logger.error("❌ Safeguard check FAILED — pipeline halted")
+            for w in warnings:
+                logger.error("   %s", w)
+            return {"status": "halted", "reason": "safeguard_failure", "warnings": warnings}
+        elif warnings:
+            logger.warning("⚠️  Safeguards passed with warnings:")
+            for w in warnings:
+                logger.warning("   %s", w)
+    except ImportError:
+        logger.warning("⚠️  Safeguards module not available — proceeding without checks")
+    except Exception as e:
+        logger.warning("⚠️  Safeguard check error (non-fatal): %s", e)
+
     # Validate configuration
     config_status = MetaConfig.validate()
     logger.info(f"📋 Config: APIs={config_status['apis']} | "
                 f"Email={config_status['email']['configured']} | "
                 f"Telegram={config_status['telegram']['configured']} | "
                 f"X={config_status['x_twitter']['configured']}")
+
+    # Alert on missing API keys
+    try:
+        from monitoring.health_alerts import check_api_keys_and_alert
+        check_api_keys_and_alert()
+    except Exception:
+        pass
     
     results = {
         "timestamp": now.isoformat(),
@@ -299,20 +326,22 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # ================================================================
-    # STEP 1: Get Top Puts (Policy B: quality over quantity)
+    # STEP 1: Get Top Puts — DIRECT from PutsEngine Convergence Pipeline
     # ================================================================
+    # Reads the exact Top 10 that the PutsEngine Predictive System
+    # dashboard displays. No ORM re-weighting, no meta-scoring, no
+    # regime gates — the convergence pipeline already perfected these.
     logger.info("\n" + "=" * 50)
-    logger.info("STEP 1: Getting PutsEngine picks (Policy B)...")
+    logger.info("STEP 1: Getting PutsEngine picks (Direct Convergence)...")
     logger.info("=" * 50)
     
-    from engine_adapters.puts_adapter import get_top_puts
-    puts_top10 = get_top_puts(top_n=MetaConfig.TOP_N_PICKS)
+    from engine_adapters.puts_adapter import get_top_puts_direct
+    puts_top10 = get_top_puts_direct(top_n=MetaConfig.TOP_N_PICKS)
     results["puts_top10"] = puts_top10
     
-    # Log quality-over-quantity status
     if len(puts_top10) < 3:
         logger.warning(
-            f"  ⚠️ LOW OPPORTUNITY: Only {len(puts_top10)} puts passed Policy B gates. "
+            f"  ⚠️ LOW OPPORTUNITY: Only {len(puts_top10)} puts from convergence pipeline. "
             f"Capital preserved — this is expected on quiet days."
         )
     
@@ -323,20 +352,22 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
     logger.info(f"  💾 Saved: {puts_file}")
     
     # ================================================================
-    # STEP 2: Get Top Moonshots (Policy B: quality over quantity)
+    # STEP 2: Get Top Moonshots — DIRECT from TradeNova Recommendations
     # ================================================================
+    # Reads the exact Top 10 that the TradeNova Moonshot dashboard
+    # displays. No ORM re-weighting, no Policy B gates — the Trinity
+    # Engines + UW Flow + MWS Forecast already perfected these.
     logger.info("\n" + "=" * 50)
-    logger.info("STEP 2: Getting Moonshot picks (Policy B)...")
+    logger.info("STEP 2: Getting Moonshot picks (Direct TradeNova)...")
     logger.info("=" * 50)
     
-    from engine_adapters.moonshot_adapter import get_top_moonshots
-    moonshot_top10 = get_top_moonshots(top_n=MetaConfig.TOP_N_PICKS)
+    from engine_adapters.moonshot_adapter import get_top_moonshots_direct
+    moonshot_top10 = get_top_moonshots_direct(top_n=MetaConfig.TOP_N_PICKS)
     results["moonshot_top10"] = moonshot_top10
     
-    # Log quality-over-quantity status
     if len(moonshot_top10) < 3:
         logger.warning(
-            f"  ⚠️ LOW OPPORTUNITY: Only {len(moonshot_top10)} moonshots passed Policy B gates. "
+            f"  ⚠️ LOW OPPORTUNITY: Only {len(moonshot_top10)} moonshots from TradeNova. "
             f"Capital preserved — this is expected on quiet days."
         )
     
@@ -347,17 +378,144 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
     logger.info(f"  💾 Saved: {moon_file}")
     
     # ================================================================
-    # STEP 2a: Coverage Validation — did we miss any major movers?
+    # STEP 2a: Smart Money Enrichment (BOOST-ONLY — no displacement)
     # ================================================================
+    # Direct picks from TradeNova/PutsEngine dashboards are PROTECTED.
+    # Smart Money can only:
+    #   1. Boost conviction of picks already in the Top 10
+    #   2. Fill empty slots if fewer than top_n direct picks loaded
+    # It can NEVER push a direct pick out of the Top 10.
+    logger.info("\n" + "=" * 50)
+    logger.info("STEP 2a: Smart Money Enrichment (boost-only)...")
+    logger.info("=" * 50)
+    try:
+        from engine_adapters.smart_money_scanner import scan_smart_money
+        sm_result = scan_smart_money()
+        sm_bullish = sm_result.get("bullish_candidates", [])
+        sm_bearish = sm_result.get("bearish_candidates", [])
+
+        # Count how many direct picks we have (protected slots)
+        direct_moon_count = sum(1 for p in moonshot_top10 if p.get("_is_direct_pick"))
+        direct_puts_count = sum(1 for p in puts_top10 if p.get("_is_direct_pick"))
+        moon_open_slots = max(0, MetaConfig.TOP_N_PICKS - direct_moon_count)
+        puts_open_slots = max(0, MetaConfig.TOP_N_PICKS - direct_puts_count)
+
+        # Boost existing moonshot picks with Smart Money conviction
+        moon_syms = {p.get("symbol", "") for p in moonshot_top10}
+        sm_boosted_moon = 0
+        sm_injected_moon = 0
+        for sm in sm_bullish:
+            sym = sm.get("symbol", "")
+            if sym in moon_syms:
+                for p in moonshot_top10:
+                    if p.get("symbol") == sym:
+                        p["_smart_money_conviction"] = sm.get("conviction", 0)
+                        p["_is_smart_money_pick"] = True
+                        p["is_predictive"] = True
+                        sm_boosted_moon += 1
+                        break
+            elif moon_open_slots > 0 and sm.get("conviction", 0) >= 0.50:
+                moonshot_top10.append({
+                    "symbol": sym,
+                    "score": min(sm["conviction"] * 1.5, 1.0),
+                    "price": 0,
+                    "signals": sm.get("signals", []),
+                    "engine": "SmartMoney_Predictive",
+                    "engine_type": "smart_money_flow",
+                    "_is_smart_money_pick": True,
+                    "_smart_money_conviction": sm["conviction"],
+                    "_conviction_score": sm["conviction"],
+                    "is_predictive": True,
+                })
+                moon_syms.add(sym)
+                sm_injected_moon += 1
+                moon_open_slots -= 1
+
+        # Boost existing puts picks with Smart Money conviction
+        put_syms = {p.get("symbol", "") for p in puts_top10}
+        sm_boosted_puts = 0
+        sm_injected_puts = 0
+        for sm in sm_bearish:
+            sym = sm.get("symbol", "")
+            if sym in put_syms:
+                for p in puts_top10:
+                    if p.get("symbol") == sym:
+                        p["_smart_money_conviction"] = sm.get("conviction", 0)
+                        p["_is_smart_money_pick"] = True
+                        p["is_predictive"] = True
+                        sm_boosted_puts += 1
+                        break
+            elif puts_open_slots > 0 and sm.get("conviction", 0) >= 0.50:
+                puts_top10.append({
+                    "symbol": sym,
+                    "score": min(sm["conviction"] * 1.5, 1.0),
+                    "price": 0,
+                    "signals": sm.get("signals", []),
+                    "engine": "SmartMoney_Predictive",
+                    "engine_type": "smart_money_flow",
+                    "_is_smart_money_pick": True,
+                    "_smart_money_conviction": sm["conviction"],
+                    "_conviction_score": sm["conviction"],
+                    "is_predictive": True,
+                })
+                put_syms.add(sym)
+                sm_injected_puts += 1
+                puts_open_slots -= 1
+
+        # Truncate to TOP_N but NEVER drop direct picks
+        moonshot_top10 = moonshot_top10[:MetaConfig.TOP_N_PICKS]
+        puts_top10 = puts_top10[:MetaConfig.TOP_N_PICKS]
+
+        results["puts_top10"] = puts_top10
+        results["moonshot_top10"] = moonshot_top10
+
+        logger.info(
+            f"  🧠 Smart Money: boosted {sm_boosted_moon} calls + {sm_boosted_puts} puts | "
+            f"filled {sm_injected_moon} call slots + {sm_injected_puts} put slots"
+        )
+        logger.info(f"  📈 Final Moonshot Top 10: {', '.join(p.get('symbol','?') for p in moonshot_top10[:10])}")
+        logger.info(f"  📉 Final Puts Top 10: {', '.join(p.get('symbol','?') for p in puts_top10[:10])}")
+
+        with open(puts_file, "w") as f:
+            json.dump({"timestamp": now.isoformat(), "picks": puts_top10}, f, indent=2, default=str)
+        with open(moon_file, "w") as f:
+            json.dump({"timestamp": now.isoformat(), "picks": moonshot_top10}, f, indent=2, default=str)
+
+        results["smart_money_scan"] = {
+            "bullish_count": len(sm_bullish),
+            "bearish_count": len(sm_bearish),
+            "boosted_moonshots": sm_boosted_moon,
+            "boosted_puts": sm_boosted_puts,
+            "injected_moonshots": sm_injected_moon,
+            "injected_puts": sm_injected_puts,
+            "sources": sm_result.get("sources_loaded", []),
+        }
+    except Exception as e:
+        logger.warning(f"  ⚠️ Smart Money enrichment failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+    # ================================================================
+    # STEP 2a-2: Coverage Validation (LOG-ONLY — no displacement)
+    # ================================================================
+    # Direct picks are protected. Coverage gaps are logged for awareness
+    # but do NOT inject new picks that would displace the dashboard Top 10.
     try:
         from engine_adapters.realtime_mover_scanner import validate_scan_coverage
         coverage = validate_scan_coverage(puts_top10, moonshot_top10)
         results["coverage_validation"] = coverage
         if not coverage.get("coverage_ok"):
-            logger.warning(
-                f"  ⚠️ COVERAGE ALERT: {len(coverage.get('missed_puts', []))} puts + "
-                f"{len(coverage.get('missed_calls', []))} calls missed (>3% movers not in Top 10)"
+            missed_puts_list = coverage.get("missed_puts", [])
+            missed_calls_list = coverage.get("missed_calls", [])
+            logger.info(
+                f"  ℹ️ Coverage info: {len(missed_puts_list)} puts + "
+                f"{len(missed_calls_list)} calls movers not in Top 10 "
+                f"(logged only — direct picks protected)"
             )
+            for m in missed_puts_list[:3]:
+                logger.info(f"    📉 {m.get('symbol','?')}: {m.get('change_pct',0):.1f}% (not injected)")
+            for m in missed_calls_list[:3]:
+                logger.info(f"    📈 {m.get('symbol','?')}: +{m.get('change_pct',0):.1f}% (not injected)")
     except Exception as e:
         logger.debug(f"  Coverage validation skipped: {e}")
 
@@ -678,6 +836,11 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
         results["notifications"]["email"] = email_sent
     except Exception as e:
         logger.error(f"Email failed: {e}")
+        try:
+            from monitoring.health_alerts import alert_pipeline_crash
+            alert_pipeline_crash("Email notification", str(e))
+        except Exception:
+            pass
     
     # ================================================================
     # STEP 7: Send Telegram (Summaries + Conflict Matrix ONLY)
@@ -744,6 +907,11 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"Trading execution failed: {e}", exc_info=True)
         results["trading"] = {"status": "error", "error": str(e)}
+        try:
+            from monitoring.health_alerts import alert_trading_error
+            alert_trading_error("portfolio", str(e))
+        except Exception:
+            pass
 
     # ================================================================
     # STEP 10: Deep Options Analysis (Strikes/Expiry/Entry/Exit)
