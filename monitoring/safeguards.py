@@ -466,6 +466,33 @@ def pre_flight_check() -> Tuple[bool, List[str]]:
     return all_passed, warnings
 
 
+def check_empty_picks(calls_count: int, puts_count: int,
+                      session_label: str = "AM") -> bool:
+    """
+    Check if the scan produced empty picks and fire an alert.
+    Should be called after pick generation in the pipeline.
+
+    Returns True if picks are present, False if empty (alert fired).
+    """
+    if calls_count == 0 and puts_count == 0:
+        logger.warning(
+            "EMPTY PICKS: %s scan returned 0 calls, 0 puts", session_label
+        )
+        try:
+            from monitoring.health_alerts import alert_empty_picks
+            alert_empty_picks(session_label, calls_count, puts_count)
+        except Exception:
+            pass
+        return False
+
+    if calls_count == 0:
+        logger.warning("EMPTY CALLS: %s scan returned 0 call candidates", session_label)
+    if puts_count == 0:
+        logger.warning("EMPTY PUTS: %s scan returned 0 put candidates", session_label)
+
+    return True
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # STATE PERSISTENCE
 # ═══════════════════════════════════════════════════════════════════════

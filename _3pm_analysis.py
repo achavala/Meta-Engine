@@ -217,6 +217,132 @@ def calc_ema(bars: List[Dict], period: int = 20) -> float:
 
 
 # ═══════════════════════════════════════════════════════
+# POLYGON OPTIONS CHAIN & VIX
+# ═══════════════════════════════════════════════════════
+
+def fetch_options_chain(symbol: str, direction: str, target_expiry: date,
+                        price: float) -> Optional[Dict]:
+    """
+    Fetch real options chain from Polygon snapshot API.
+    Selects the contract closest to 0.30-0.35 delta with adequate liquidity.
+    Returns contract details with greeks, or None if unavailable.
+    """
+    api_key = MetaConfig.POLYGON_API_KEY
+    if not api_key or price <= 0:
+        return None
+    try:
+        expiry_str = target_expiry.isoformat()
+        contract_type = "call" if direction == "call" else "put"
+
+        strike_lo = price * 0.90
+        strike_hi = price * 1.10
+
+        r = requests.get(
+            f"https://api.polygon.io/v3/snapshot/options/{symbol}",
+            params={
+                "apiKey": api_key,
+                "expiration_date": expiry_str,
+                "contract_type": contract_type,
+                "strike_price.gte": f"{strike_lo:.2f}",
+                "strike_price.lte": f"{strike_hi:.2f}",
+                "limit": 50,
+                "order": "asc",
+                "sort": "strike_price",
+            },
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return None
+
+        results = r.json().get("results", [])
+        if not results:
+            return None
+
+        TARGET_DELTA = 0.32
+        best = None
+        best_diff = float("inf")
+
+        for contract in results:
+            greeks = contract.get("greeks") or {}
+            raw_delta = greeks.get("delta", 0) or 0
+            delta = abs(raw_delta)
+            if delta < 0.10 or delta > 0.55:
+                continue
+
+            oi = contract.get("open_interest", 0) or 0
+            if oi < 50:
+                continue
+
+            quote = contract.get("last_quote") or {}
+            bid = quote.get("bid", 0) or 0
+            ask = quote.get("ask", 0) or 0
+            mid = (bid + ask) / 2 if bid and ask else 0
+            spread_pct = (ask - bid) / mid * 100 if mid > 0 else 999
+            if spread_pct > 30:
+                continue
+
+            details = contract.get("details") or {}
+            strike = details.get("strike_price", 0)
+            day = contract.get("day") or {}
+
+            diff = abs(delta - TARGET_DELTA)
+            if diff < best_diff:
+                best_diff = diff
+                best = {
+                    "strike": strike,
+                    "delta": raw_delta,
+                    "gamma": greeks.get("gamma", 0),
+                    "theta": greeks.get("theta", 0),
+                    "vega": greeks.get("vega", 0),
+                    "iv": contract.get("implied_volatility", 0),
+                    "open_interest": oi,
+                    "volume": day.get("volume", 0),
+                    "bid": bid,
+                    "ask": ask,
+                    "spread_pct": round(spread_pct, 1),
+                    "mid_price": round(mid, 2),
+                    "ticker": details.get("ticker", ""),
+                }
+
+        if best:
+            logger.info(
+                f"  📊 Options chain ({symbol} {direction}): "
+                f"${best['strike']} Δ={best['delta']:.2f} IV={best['iv']:.0%} "
+                f"OI={best['open_interest']} Spread={best['spread_pct']:.1f}%"
+            )
+        return best
+
+    except Exception as e:
+        logger.debug(f"Options chain fetch failed for {symbol}: {e}")
+        return None
+
+
+def fetch_vix() -> float:
+    """
+    Fetch current VIX level from Polygon for regime-aware conviction scaling.
+    Returns VIX value, or 20.0 as a neutral default if unavailable.
+    """
+    api_key = MetaConfig.POLYGON_API_KEY
+    if not api_key:
+        return 20.0
+    try:
+        r = requests.get(
+            "https://api.polygon.io/v2/aggs/ticker/I:VIX/prev",
+            params={"apiKey": api_key},
+            timeout=10,
+        )
+        if r.status_code == 200:
+            results = r.json().get("results", [])
+            if results:
+                vix = results[0].get("c", 20.0)
+                logger.info(f"  📈 VIX: {vix:.1f}")
+                return float(vix)
+    except Exception as e:
+        logger.debug(f"VIX fetch failed: {e}")
+    return 20.0
+
+
+# ═══════════════════════════════════════════════════════
 # UW FLOW ANALYSIS (Dark Pool & Institutional)
 # ═══════════════════════════════════════════════════════
 
@@ -368,10 +494,17 @@ def deep_analyze_symbol(symbol: str, direction: str, data: Dict) -> Dict:
     return result
 
 
-def compute_trade_recommendation(analysis: Dict) -> Dict:
+def compute_trade_recommendation(analysis: Dict, vix: float = 20.0) -> Dict:
     """
     Given deep analysis, compute specific strike + expiry + entry/exit.
     Targeting 3x-10x returns.
+
+    Improvements over v1:
+      - Delta-based strike selection via Polygon options chain (Fix 1)
+      - ATR/EMA-anchored entry zones (Fix 2)
+      - Conviction-scaled position sizing (Fix 3)
+      - ATR-based stop loss (Fix 5)
+      - VIX-regime conviction adjustment (Fix 8)
     """
     sym = analysis["symbol"]
     direction = analysis["direction"]
@@ -379,129 +512,255 @@ def compute_trade_recommendation(analysis: Dict) -> Dict:
     atr = analysis.get("atr", 0)
     rsi = analysis.get("rsi", 50)
     uw = analysis.get("uw", {})
+    ema9 = analysis.get("ema9", price)
+    ema20 = analysis.get("ema20", price)
 
     if price <= 0:
         return {"symbol": sym, "tradeable": False, "reason": "no price data"}
 
-    # ── Strike Selection ──
-    # For 3x-10x returns: need OTM contracts with enough gamma
-    if direction == "call":
-        # OTM by ~4-7% for calls
-        otm_pct = 0.05
-        if rsi < 40:
-            otm_pct = 0.04  # less OTM when oversold (higher chance)
-        elif rsi > 60:
-            otm_pct = 0.06  # more OTM when overbought
-        target_strike = price * (1 + otm_pct)
-    else:
-        # OTM by ~4-7% for puts
-        otm_pct = 0.05
-        if rsi > 60:
-            otm_pct = 0.04  # less OTM when overbought (higher chance of drop)
-        elif rsi < 40:
-            otm_pct = 0.06  # more OTM when oversold
-        target_strike = price * (1 - otm_pct)
-
-    # Round to standard strikes
-    if price < 30:
-        target_strike = round(target_strike)
-    elif price < 100:
-        target_strike = round(target_strike / 2.5) * 2.5
-    elif price < 500:
-        target_strike = round(target_strike / 5) * 5
-    else:
-        target_strike = round(target_strike / 10) * 10
-
-    # ── Expiry Selection ──
-    # Feb 20 is ~10 DTE — good gamma/theta sweet spot for 3x-10x
-    # Also check Feb 14 (7 DTE) for higher gamma if conviction is high
+    # ── Expiry Selection (dynamic) ──
     today = date.today()
-    feb20 = date(2026, 2, 20)
-    feb14 = date(2026, 2, 14)
-    feb28 = date(2026, 2, 27)  # or nearest monthly
 
-    dte_20 = (feb20 - today).days
-    dte_14 = (feb14 - today).days
+    def _next_friday(from_date, min_dte=4):
+        d = from_date + timedelta(days=min_dte)
+        while d.weekday() != 4:
+            d += timedelta(days=1)
+        return d
 
-    # Default to Feb 20 (10 DTE)
-    recommended_expiry = feb20
-    dte = dte_20
-    expiry_rationale = f"Feb 20 ({dte}d) — optimal gamma/theta for 3x-10x"
+    near_expiry = _next_friday(today, min_dte=4)
+    far_expiry = _next_friday(today, min_dte=9)
+    near_dte = (near_expiry - today).days
+    far_dte = (far_expiry - today).days
+
+    if near_dte >= 5:
+        recommended_expiry = near_expiry
+        dte = near_dte
+    else:
+        recommended_expiry = far_expiry
+        dte = far_dte
+
+    expiry_rationale = (
+        f"{recommended_expiry.strftime('%b %d')} ({dte}d) — "
+        f"optimal gamma/theta for 3x-10x"
+    )
+
+    # ── Strike Selection: Real Options Chain First, Estimated Fallback ──
+    chain_data = fetch_options_chain(sym, direction, recommended_expiry, price)
+    strike_source = "estimated"
+    chain_greeks = {}
+
+    if chain_data and chain_data.get("strike"):
+        target_strike = chain_data["strike"]
+        strike_source = "chain"
+        chain_greeks = {
+            "delta": chain_data.get("delta", 0),
+            "gamma": chain_data.get("gamma", 0),
+            "theta": chain_data.get("theta", 0),
+            "vega": chain_data.get("vega", 0),
+            "iv": chain_data.get("iv", 0),
+            "open_interest": chain_data.get("open_interest", 0),
+            "volume": chain_data.get("volume", 0),
+            "bid": chain_data.get("bid", 0),
+            "ask": chain_data.get("ask", 0),
+            "spread_pct": chain_data.get("spread_pct", 0),
+            "mid_price": chain_data.get("mid_price", 0),
+        }
+        otm_pct = abs(target_strike - price) / price if price > 0 else 0.05
+    else:
+        if direction == "call":
+            otm_pct = 0.05
+            if rsi < 40:
+                otm_pct = 0.04
+            elif rsi > 60:
+                otm_pct = 0.06
+            target_strike = price * (1 + otm_pct)
+        else:
+            otm_pct = 0.05
+            if rsi > 60:
+                otm_pct = 0.04
+            elif rsi < 40:
+                otm_pct = 0.06
+            target_strike = price * (1 - otm_pct)
+
+        if price < 30:
+            target_strike = round(target_strike)
+        elif price < 100:
+            target_strike = round(target_strike / 2.5) * 2.5
+        elif price < 500:
+            target_strike = round(target_strike / 5) * 5
+        else:
+            target_strike = round(target_strike / 10) * 10
 
     # ── UW Flow Integration ──
     flow_signals = []
     if uw.get("has_data"):
         if direction == "call" and uw.get("sentiment") == "BULLISH":
-            flow_signals.append("🟢 UW flow BULLISH (P/C ratio: {:.2f})".format(uw.get("pc_ratio", 0)))
-        elif direction == "put" and uw.get("sentiment") == "BEARISH":
-            flow_signals.append("🔴 UW flow BEARISH (P/C ratio: {:.2f})".format(uw.get("pc_ratio", 0)))
-
-        if uw.get("unusual_call_count", 0) > 3 and direction == "call":
-            flow_signals.append(f"⚡ {uw['unusual_call_count']} unusual call sweeps detected")
-        if uw.get("unusual_put_count", 0) > 3 and direction == "put":
-            flow_signals.append(f"⚡ {uw['unusual_put_count']} unusual put sweeps detected")
-
-        if uw.get("dark_pool_calls", 0) > 0 and direction == "call":
-            flow_signals.append(f"🌑 {uw['dark_pool_calls']} dark pool call positions")
-        if uw.get("dark_pool_puts", 0) > 0 and direction == "put":
-            flow_signals.append(f"🌑 {uw['dark_pool_puts']} dark pool put positions")
-
-        # Check if institutional is aligned
-        top_contracts = uw.get("top_calls" if direction == "call" else "top_puts", [])
-        if top_contracts:
-            best = top_contracts[0]
-            inst_strike = best.get("strike", 0)
-            inst_vol = best.get("volume", 0)
-            inst_oi = best.get("open_interest", 0)
-            inst_exp = best.get("expiration", "?")
             flow_signals.append(
-                f"📊 Top institutional: ${inst_strike} {inst_exp} "
-                f"(Vol={inst_vol:,} OI={inst_oi:,})"
+                "🟢 UW flow BULLISH (P/C: {:.2f})".format(uw.get("pc_ratio", 0))
+            )
+        elif direction == "put" and uw.get("sentiment") == "BEARISH":
+            flow_signals.append(
+                "🔴 UW flow BEARISH (P/C: {:.2f})".format(uw.get("pc_ratio", 0))
             )
 
-    # ── Scoring ──
-    conviction = 0.5
-    # RSI alignment
-    if direction == "call" and rsi < 45:
-        conviction += 0.15
-    elif direction == "put" and rsi > 55:
-        conviction += 0.15
+        if uw.get("unusual_call_count", 0) > 3 and direction == "call":
+            flow_signals.append(
+                f"⚡ {uw['unusual_call_count']} unusual call sweeps detected"
+            )
+        if uw.get("unusual_put_count", 0) > 3 and direction == "put":
+            flow_signals.append(
+                f"⚡ {uw['unusual_put_count']} unusual put sweeps detected"
+            )
+
+        if uw.get("dark_pool_calls", 0) > 0 and direction == "call":
+            flow_signals.append(
+                f"🌑 {uw['dark_pool_calls']} dark pool call positions"
+            )
+        if uw.get("dark_pool_puts", 0) > 0 and direction == "put":
+            flow_signals.append(
+                f"🌑 {uw['dark_pool_puts']} dark pool put positions"
+            )
+
+        top_contracts = uw.get(
+            "top_calls" if direction == "call" else "top_puts", []
+        )
+        if top_contracts:
+            best = top_contracts[0]
+            flow_signals.append(
+                "📊 Top institutional: ${} {} (Vol={:,} OI={:,})".format(
+                    best.get("strike", 0),
+                    best.get("expiration", "?"),
+                    best.get("volume", 0),
+                    best.get("open_interest", 0),
+                )
+            )
+
+    # ══════════════════════════════════════════════════════
+    # FIX 8: VIX-REGIME CONVICTION SCORING
+    # ══════════════════════════════════════════════════════
+    # Base conviction starts at 35 (on 0-100 scale) to give more headroom.
+    # VIX regime adjusts thresholds and bonuses:
+    #   Low VIX (<16):  Tighter thresholds — need stronger signals
+    #   Normal (16-25): Standard thresholds
+    #   High VIX (>25): Elevated put conviction, reduced call conviction
+    #   Extreme (>35):  Heavy put bias, suppressed call conviction
+
+    conviction = 35
+
+    if vix < 16:
+        vix_regime = "low"
+        rsi_bonus = 12 if (direction == "call" and rsi < 40) or \
+                          (direction == "put" and rsi > 60) else 0
+    elif vix <= 25:
+        vix_regime = "normal"
+        rsi_bonus = 15 if (direction == "call" and rsi < 45) or \
+                          (direction == "put" and rsi > 55) else 0
+    elif vix <= 35:
+        vix_regime = "elevated"
+        if direction == "put":
+            rsi_bonus = 18 if rsi > 50 else 10
+        else:
+            rsi_bonus = 8 if rsi < 40 else 0
+    else:
+        vix_regime = "extreme"
+        if direction == "put":
+            rsi_bonus = 20
+        else:
+            rsi_bonus = 5 if rsi < 35 else 0
+
+    conviction += rsi_bonus
 
     # UW flow alignment
     if direction == "call" and uw.get("sentiment") == "BULLISH":
-        conviction += 0.1
+        conviction += 10
     elif direction == "put" and uw.get("sentiment") == "BEARISH":
-        conviction += 0.1
+        conviction += 10
 
     # Cross-analysis alignment
     if direction == "call" and analysis.get("puts_counter") == "LOW":
-        conviction += 0.1
+        conviction += 10
     elif direction == "put" and analysis.get("moon_counter") == "LOW":
-        conviction += 0.1
+        conviction += 10
 
-    # Unusual activity
-    if uw.get("unusual_call_count", 0) > 2 and direction == "call":
-        conviction += 0.1
-    if uw.get("unusual_put_count", 0) > 2 and direction == "put":
-        conviction += 0.1
+    # Unusual activity (strong institutional signal)
+    unusual_count = (uw.get("unusual_call_count", 0) if direction == "call"
+                     else uw.get("unusual_put_count", 0))
+    if unusual_count > 4:
+        conviction += 12
+    elif unusual_count > 2:
+        conviction += 8
 
-    # Interval persistence
-    if analysis.get("interval_persistence", 0) >= 3:
-        conviction += 0.05
+    # Dark pool positioning
+    dp_count = (uw.get("dark_pool_calls", 0) if direction == "call"
+                else uw.get("dark_pool_puts", 0))
+    if dp_count > 0:
+        conviction += 5
 
-    conviction = min(conviction, 1.0)
+    # Interval persistence (appeared in 3+ scans)
+    persistence = analysis.get("interval_persistence", 0)
+    if persistence >= 5:
+        conviction += 8
+    elif persistence >= 3:
+        conviction += 5
 
-    # ── Entry/Exit ──
+    # Real options chain bonus (we have actual Greeks)
+    if chain_data:
+        conviction += 5
+
+    # EMA trend alignment
+    if direction == "call" and ema9 > ema20:
+        conviction += 5
+    elif direction == "put" and ema9 < ema20:
+        conviction += 5
+
+    conviction = min(conviction, 100)
+
+    # ══════════════════════════════════════════════════════
+    # FIX 2: ATR/EMA-ANCHORED ENTRY ZONES
+    # ══════════════════════════════════════════════════════
+    # Uses EMA9/EMA20 as anchor levels with ATR-scaled bands
+    # instead of simplistic ±0.5%.
+    atr_half = atr * 0.5 if atr > 0 else price * 0.005
+
     if direction == "call":
-        entry_low = price * 0.995
-        entry_high = price * 1.005
-        target_3x = price * (1 + otm_pct + atr / price * 2) if price > 0 else 0
-        stop = price * 0.97
+        anchor = min(price, ema9) if ema9 > 0 else price
+        entry_low = anchor - atr_half
+        entry_high = anchor + atr_half * 0.3
     else:
-        entry_low = price * 0.995
-        entry_high = price * 1.005
+        anchor = max(price, ema9) if ema9 > 0 else price
+        entry_low = anchor - atr_half * 0.3
+        entry_high = anchor + atr_half
+
+    # ══════════════════════════════════════════════════════
+    # FIX 5: ATR-BASED STOP LOSS (1.5× ATR)
+    # ══════════════════════════════════════════════════════
+    stop_distance = atr * 1.5 if atr > 0 else price * 0.03
+    if direction == "call":
+        stop = price - stop_distance
+        target_3x = price * (1 + otm_pct + atr / price * 2) if price > 0 else 0
+    else:
+        stop = price + stop_distance
         target_3x = price * (1 - otm_pct - atr / price * 2) if price > 0 else 0
-        stop = price * 1.03
+
+    # ══════════════════════════════════════════════════════
+    # FIX 3: CONVICTION-BASED POSITION SIZING
+    # ══════════════════════════════════════════════════════
+    # Scale contracts by conviction:
+    #   <40  → 2 contracts (low confidence, probe size)
+    #   40-59 → 3 contracts
+    #   60-74 → 5 contracts (standard)
+    #   75-89 → 7 contracts
+    #   90+  → 10 contracts (max conviction)
+    if conviction >= 90:
+        contracts = 10
+    elif conviction >= 75:
+        contracts = 7
+    elif conviction >= 60:
+        contracts = 5
+    elif conviction >= 40:
+        contracts = 3
+    else:
+        contracts = 2
 
     # ── Technical Signals ──
     tech_signals = []
@@ -514,8 +773,6 @@ def compute_trade_recommendation(analysis: Dict) -> Dict:
     elif rsi > 55:
         tech_signals.append("Approaching Overbought (RSI {:.0f})".format(rsi))
 
-    ema9 = analysis.get("ema9", price)
-    ema20 = analysis.get("ema20", price)
     if ema9 > ema20:
         tech_signals.append("EMA9 > EMA20 (Bullish Cross)")
     else:
@@ -528,12 +785,22 @@ def compute_trade_recommendation(analysis: Dict) -> Dict:
     change5d = analysis.get("5d_change_pct", 0)
     tech_signals.append(f"5D Change: {change5d:+.1f}%")
 
+    tech_signals.append(f"VIX Regime: {vix_regime} ({vix:.1f})")
+
+    if strike_source == "chain":
+        tech_signals.append(
+            f"Δ={chain_greeks.get('delta', 0):.2f} "
+            f"IV={chain_greeks.get('iv', 0):.0%} "
+            f"Spread={chain_greeks.get('spread_pct', 0):.1f}%"
+        )
+
     return {
         "symbol": sym,
         "tradeable": True,
         "direction": direction,
         "price": price,
         "strike": target_strike,
+        "strike_source": strike_source,
         "expiry": recommended_expiry.isoformat(),
         "expiry_display": recommended_expiry.strftime("%b %d"),
         "dte": dte,
@@ -550,7 +817,10 @@ def compute_trade_recommendation(analysis: Dict) -> Dict:
         "change_5d": change5d,
         "tech_signals": tech_signals,
         "flow_signals": flow_signals,
-        "contracts": 5,
+        "contracts": contracts,
+        "vix": vix,
+        "vix_regime": vix_regime,
+        "chain_greeks": chain_greeks,
     }
 
 
@@ -683,11 +953,14 @@ def select_top_candidates(data: Dict) -> Tuple[List[Dict], List[Dict]]:
     call_ranked = sorted(call_candidates.items(), key=lambda x: total_score(x[1]), reverse=True)
     put_ranked = sorted(put_candidates.items(), key=lambda x: total_score(x[1]), reverse=True)
 
+    # Fetch VIX once for regime-aware conviction scoring
+    current_vix = fetch_vix()
+
     # Deep-analyze top candidates
     top_calls = []
     for sym, meta in call_ranked[:6]:  # analyze top 6, pick best 3
         analysis = deep_analyze_symbol(sym, "call", data)
-        rec = compute_trade_recommendation(analysis)
+        rec = compute_trade_recommendation(analysis, vix=current_vix)
         rec["meta_score"] = total_score(meta)
         rec["source"] = meta.get("source", "?")
         if rec["tradeable"]:
@@ -696,7 +969,7 @@ def select_top_candidates(data: Dict) -> Tuple[List[Dict], List[Dict]]:
     top_puts = []
     for sym, meta in put_ranked[:6]:
         analysis = deep_analyze_symbol(sym, "put", data)
-        rec = compute_trade_recommendation(analysis)
+        rec = compute_trade_recommendation(analysis, vix=current_vix)
         rec["meta_score"] = total_score(meta)
         rec["source"] = meta.get("source", "?")
         if rec["tradeable"]:
@@ -752,7 +1025,8 @@ def generate_report(calls: List[Dict], puts: List[Dict], data: Dict,
         report.append(f"| ATR | ${c['atr']:.2f} |")
         report.append(f"| RVOL | {c['rvol']:.1f}x |")
         report.append(f"| 5D Change | {c['change_5d']:+.1f}% |")
-        report.append(f"| Conviction | {c['conviction']:.0%} |")
+        report.append(f"| Conviction | {c['conviction']:.0f}% |")
+        report.append(f"| Strike Source | {c.get('strike_source', 'estimated')} |")
         report.append(f"| Source | {c['source']} |")
         report.append("")
         if c.get("tech_signals"):
@@ -784,7 +1058,8 @@ def generate_report(calls: List[Dict], puts: List[Dict], data: Dict,
         report.append(f"| ATR | ${p['atr']:.2f} |")
         report.append(f"| RVOL | {p['rvol']:.1f}x |")
         report.append(f"| 5D Change | {p['change_5d']:+.1f}% |")
-        report.append(f"| Conviction | {p['conviction']:.0%} |")
+        report.append(f"| Conviction | {p['conviction']:.0f}% |")
+        report.append(f"| Strike Source | {p.get('strike_source', 'estimated')} |")
         report.append(f"| Source | {p['source']} |")
         report.append("")
         if p.get("tech_signals"):
@@ -916,20 +1191,21 @@ def send_telegram(calls: List[Dict], puts: List[Dict],
         f"{now.strftime('%b %d, %Y %I:%M %p ET')}\n\n"
         f"🟢 <b>CALLS</b>: {call_syms}\n"
         f"🔴 <b>PUTS</b>: {put_syms}\n"
-        f"Target: 3x-10x returns | 5 contracts each"
+        f"Target: 3x-10x returns | Conviction-scaled sizing"
     )
     msgs.append(header)
 
     # Call details
     call_msg = "🟢 <b>CALL RECOMMENDATIONS</b>\n"
     for i, c in enumerate(calls, 1):
+        src_tag = " (Δ)" if c.get("strike_source") == "chain" else ""
         call_msg += (
-            f"\n<b>#{i} {c['symbol']} ${c['strike']:.0f}C {c['expiry_display']}</b>\n"
+            f"\n<b>#{i} {c['symbol']} ${c['strike']:.0f}C {c['expiry_display']}{src_tag}</b>\n"
             f"  Price: ${c['price']:.2f} | {c['otm_pct']:.1f}% OTM\n"
             f"  RSI: {c['rsi']:.0f} | RVOL: {c['rvol']:.1f}x | 5D: {c['change_5d']:+.1f}%\n"
             f"  Entry: ${c['entry_low']:.2f}-${c['entry_high']:.2f}\n"
             f"  Target: ${c['target_3x']:.2f} | Stop: ${c['stop']:.2f}\n"
-            f"  Conviction: {c['conviction']:.0%}\n"
+            f"  Conviction: {c['conviction']:.0f}% | {c['contracts']}x contracts\n"
         )
         if c.get("flow_signals"):
             call_msg += "  Flow: " + " | ".join(c["flow_signals"][:2]) + "\n"
@@ -938,13 +1214,14 @@ def send_telegram(calls: List[Dict], puts: List[Dict],
     # Put details
     put_msg = "🔴 <b>PUT RECOMMENDATIONS</b>\n"
     for i, p in enumerate(puts, 1):
+        src_tag = " (Δ)" if p.get("strike_source") == "chain" else ""
         put_msg += (
-            f"\n<b>#{i} {p['symbol']} ${p['strike']:.0f}P {p['expiry_display']}</b>\n"
+            f"\n<b>#{i} {p['symbol']} ${p['strike']:.0f}P {p['expiry_display']}{src_tag}</b>\n"
             f"  Price: ${p['price']:.2f} | {p['otm_pct']:.1f}% OTM\n"
             f"  RSI: {p['rsi']:.0f} | RVOL: {p['rvol']:.1f}x | 5D: {p['change_5d']:+.1f}%\n"
             f"  Entry: ${p['entry_low']:.2f}-${p['entry_high']:.2f}\n"
             f"  Target: ${p['target_3x']:.2f} | Stop: ${p['stop']:.2f}\n"
-            f"  Conviction: {p['conviction']:.0%}\n"
+            f"  Conviction: {p['conviction']:.0f}% | {p['contracts']}x contracts\n"
         )
         if p.get("flow_signals"):
             put_msg += "  Flow: " + " | ".join(p["flow_signals"][:2]) + "\n"
@@ -983,8 +1260,10 @@ def send_telegram(calls: List[Dict], puts: List[Dict],
 # X/TWITTER POSTER
 # ═══════════════════════════════════════════════════════
 
-def post_to_x(calls: List[Dict], puts: List[Dict]) -> bool:
-    """Post analysis as X thread."""
+def post_to_x(calls: List[Dict], puts: List[Dict],
+              session_label: str = "",
+              quote_tweet_id: Optional[str] = None) -> bool:
+    """Post analysis as X thread (or quote-tweet of Step 8's thread)."""
     try:
         import tweepy
     except ImportError:
@@ -1016,25 +1295,30 @@ def post_to_x(calls: List[Dict], puts: List[Dict]) -> bool:
     call_syms = ",".join(c["symbol"] for c in calls)
     put_syms = ",".join(p["symbol"] for p in puts)
 
-    # Header tweet
+    # Header tweet — use session-aware label and dynamic expiry
+    display_label = "Morning" if now.hour < 12 else "Afternoon"
+    first_expiry = calls[0]["expiry_display"] if calls else (puts[0]["expiry_display"] if puts else "TBD")
+    vix_val = calls[0].get("vix", 0) if calls else (puts[0].get("vix", 0) if puts else 0)
+    vix_tag = f" | VIX:{vix_val:.0f}" if vix_val else ""
     header = (
-        f"🎯 3PM OPTIONS PICKS {now.strftime('%b %d')}\n\n"
+        f"🎯 {display_label} OPTIONS PICKS {now.strftime('%b %d')}\n\n"
         f"🟢 Top 3 CALL candidates: {call_syms}\n"
         f"🔴 Top 3 PUT candidates: {put_syms}\n\n"
-        f"Target: 3x-10x | 5 contracts each\n"
-        f"Exp: Feb 20 | {now.strftime('%I:%M %p ET')}"
+        f"Target: 3x-10x | Exp: {first_expiry}{vix_tag}\n"
+        f"{now.strftime('%I:%M %p ET')}"
     )
 
     tweets = [header]
 
     # Individual call tweets
     for c in calls:
+        strike_tag = "Δ" if c.get("strike_source") == "chain" else ""
         tweet = (
-            f"🟢 {c['symbol']} ${c['strike']:.0f}C {c['expiry_display']}\n\n"
+            f"🟢 {c['symbol']} ${c['strike']:.0f}C {c['expiry_display']}{strike_tag}\n\n"
             f"Entry: ${c['entry_low']:.2f}-${c['entry_high']:.2f}\n"
             f"Target: ${c['target_3x']:.2f} | Stop: ${c['stop']:.2f}\n"
             f"RSI: {c['rsi']:.0f} | RVOL: {c['rvol']:.1f}x\n"
-            f"Conviction: {c['conviction']:.0%}"
+            f"Conviction: {c['conviction']:.0f}% | {c['contracts']}x"
         )
         if c.get("flow_signals"):
             tweet += "\n" + c["flow_signals"][0][:60]
@@ -1042,30 +1326,45 @@ def post_to_x(calls: List[Dict], puts: List[Dict]) -> bool:
 
     # Individual put tweets
     for p in puts:
+        strike_tag = "Δ" if p.get("strike_source") == "chain" else ""
         tweet = (
-            f"🔴 {p['symbol']} ${p['strike']:.0f}P {p['expiry_display']}\n\n"
+            f"🔴 {p['symbol']} ${p['strike']:.0f}P {p['expiry_display']}{strike_tag}\n\n"
             f"Entry: ${p['entry_low']:.2f}-${p['entry_high']:.2f}\n"
             f"Target: ${p['target_3x']:.2f} | Stop: ${p['stop']:.2f}\n"
             f"RSI: {p['rsi']:.0f} | RVOL: {p['rvol']:.1f}x\n"
-            f"Conviction: {p['conviction']:.0%}"
+            f"Conviction: {p['conviction']:.0f}% | {p['contracts']}x"
         )
         if p.get("flow_signals"):
             tweet += "\n" + p["flow_signals"][0][:60]
         tweets.append(tweet)
 
-    # Post thread
+    # Post thread — if quote_tweet_id provided, first tweet is a quote-tweet
+    # of Step 8's alert thread, linking the deep analysis to the picks.
     try:
         prev_id = None
         for i, tweet_text in enumerate(tweets):
-            resp = client.create_tweet(
-                text=tweet_text,
-                in_reply_to_tweet_id=prev_id,
-            )
-            tweet_id = resp.data.get("id") if hasattr(resp, "data") else None
+            if len(tweet_text) > 280:
+                tweet_text = tweet_text[:277] + "..."
+
+            kwargs = {"text": tweet_text}
+            if i == 0 and quote_tweet_id:
+                kwargs["quote_tweet_id"] = quote_tweet_id
+            elif prev_id:
+                kwargs["in_reply_to_tweet_id"] = prev_id
+
+            resp = client.create_tweet(**kwargs)
+            tweet_id = None
+            if resp:
+                if hasattr(resp, "data") and resp.data:
+                    tweet_id = resp.data["id"]
+                elif isinstance(resp, dict) and "data" in resp:
+                    tweet_id = resp["data"]["id"]
             if tweet_id:
                 prev_id = tweet_id
                 logger.info(f"  ✅ Tweet {i+1}/{len(tweets)} posted (ID: {tweet_id})")
-            time.sleep(2)
+            else:
+                logger.error(f"  ❌ Tweet {i+1} failed — no response data")
+            time.sleep(4)
 
         logger.info(f"✅ X thread posted ({len(tweets)} tweets)")
         return True
@@ -1079,16 +1378,19 @@ def post_to_x(calls: List[Dict], puts: List[Dict]) -> bool:
 # MAIN
 # ═══════════════════════════════════════════════════════
 
-def run_3pm_analysis(session_label: str = ""):
+def run_3pm_analysis(session_label: str = "",
+                     step8_tweet_id: Optional[str] = None):
     """
     Full institutional-grade options analysis pipeline.
     
-    Runs automatically at BOTH 9:35 AM and 3:15 PM via meta_engine.py.
+    Runs automatically at all scan times via meta_engine.py.
     Produces deep-dive strike/expiry/entry/exit recommendations for
     top 3 CALLS + top 3 PUTS.
     
     Args:
         session_label: "AM" or "PM" — auto-detected from current time if empty.
+        step8_tweet_id: If provided, the X post will quote-tweet the Step 8
+            alert thread instead of creating a separate standalone thread.
     """
     now = datetime.now(EST)
     if not session_label:
@@ -1112,10 +1414,10 @@ def run_3pm_analysis(session_label: str = ""):
 
         for c in calls:
             logger.info(f"\n  🟢 {c['symbol']} ${c['strike']:.0f}C {c['expiry_display']} "
-                         f"| Price: ${c['price']:.2f} | Conv: {c['conviction']:.0%}")
+                         f"| Price: ${c['price']:.2f} | Conv: {c['conviction']:.0f}% | {c['contracts']}x")
         for p in puts:
             logger.info(f"\n  🔴 {p['symbol']} ${p['strike']:.0f}P {p['expiry_display']} "
-                         f"| Price: ${p['price']:.2f} | Conv: {p['conviction']:.0%}")
+                         f"| Price: ${p['price']:.2f} | Conv: {p['conviction']:.0f}% | {p['contracts']}x")
 
         # 3. Generate report
         logger.info("\n📝 STEP 3: Generating report...")
@@ -1141,9 +1443,15 @@ def run_3pm_analysis(session_label: str = ""):
         logger.info("\n📱 STEP 5: Sending Telegram...")
         tg_ok = send_telegram(calls, puts, session_label=session_label)
 
-        # 6. Post to X
+        # 6. Post to X (quote-tweet Step 8's alert if available)
         logger.info(f"\n🐦 STEP 6: Posting to X ({session_label})...")
-        x_ok = post_to_x(calls, puts)
+        if step8_tweet_id:
+            logger.info(f"  Linking to Step 8 alert thread (ID: {step8_tweet_id})")
+        x_ok = post_to_x(
+            calls, puts,
+            session_label=session_label,
+            quote_tweet_id=step8_tweet_id,
+        )
 
         # Summary
         logger.info("\n" + "=" * 70)

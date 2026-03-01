@@ -377,6 +377,13 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
         json.dump({"timestamp": now.isoformat(), "picks": moonshot_top10}, f, indent=2, default=str)
     logger.info(f"  💾 Saved: {moon_file}")
     
+    # ── Empty Picks Safeguard (Fix 7) ──
+    try:
+        from monitoring.safeguards import check_empty_picks
+        check_empty_picks(len(moonshot_top10), len(puts_top10), session_label)
+    except Exception:
+        pass
+
     # ================================================================
     # STEP 2a: Smart Money Enrichment (BOOST-ONLY — no displacement)
     # ================================================================
@@ -872,20 +879,32 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
 
     # ================================================================
     # STEP 8: Post to X/Twitter (Top 3 Puts + Top 3 Calls)
+    #  X-worthy selector: prefer 1x same-day / 5x potential from TradeNova
+    #  so posted picks have minimum 1x same-day options potential.
     # ================================================================
     logger.info("\n" + "=" * 50)
-    logger.info("STEP 8: Posting to X/Twitter (Top 3 each)...")
+    logger.info("STEP 8: Posting to X/Twitter (Top 3 each, X-worthy)...")
     logger.info("=" * 50)
     
+    step8_tweet_id = None
     try:
-        from notifications.x_poster import post_meta_to_x
+        from engine_adapters.x_worthy_selector import get_cross_results_for_x
+        from notifications.x_poster import post_meta_to_x, post_thread
+        cross_results_for_x = get_cross_results_for_x(cross_results)
         x_posted = post_meta_to_x(
             summaries=summaries,
-            cross_results=cross_results,
+            cross_results=cross_results_for_x,
             session_label=session_label,
             gap_up_data=gap_up_data,
         )
         results["notifications"]["x_twitter"] = x_posted
+        if x_posted:
+            from notifications.x_poster import _get_x_post_id
+            scan_ts = cross_results.get("timestamp", "") if cross_results else ""
+            if scan_ts:
+                step8_tweet_id = _get_x_post_id(scan_ts, session_label)
+                if step8_tweet_id:
+                    logger.info(f"  📌 Step 8 tweet ID captured: {step8_tweet_id}")
     except Exception as e:
         logger.error(f"X/Twitter failed: {e}")
     
@@ -927,7 +946,8 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
     try:
         from _3pm_analysis import run_3pm_analysis
         deep_calls, deep_puts, deep_report = run_3pm_analysis(
-            session_label=session_label
+            session_label=session_label,
+            step8_tweet_id=step8_tweet_id,
         )
         results["deep_options_analysis"] = {
             "status": "completed",

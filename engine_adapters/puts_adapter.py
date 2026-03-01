@@ -240,9 +240,17 @@ def _fallback_from_cached_results(top_n: int = 10) -> List[Dict[str, Any]]:
             
             # Calculate data age from file modification time
             file_mtime = datetime.fromtimestamp(results_file.stat().st_mtime)
+            data_age_hours = (datetime.now() - file_mtime).total_seconds() / 3600
             data_age_days = (datetime.now() - file_mtime).days
             scan_ts = data.get("scan_time", data.get("timestamp", ""))
             data_source_label = f"scheduled_scan_results ({scan_ts or file_mtime.strftime('%Y-%m-%d %H:%M')})"
+
+            if data_age_hours > 18:
+                logger.warning(
+                    f"  ⚠️ Tier 1 scheduled_scan_results.json is {data_age_hours:.1f}h old (>18h) — "
+                    f"skipping stale data"
+                )
+                raise ValueError("stale Tier 1 data")
 
             for engine_key in ["gamma_drain", "distribution", "liquidity"]:
                 for c in data.get(engine_key, []):
@@ -2901,10 +2909,16 @@ def get_top_puts_direct(top_n: int = 10) -> List[Dict[str, Any]]:
             except Exception:
                 pass
 
-        if age_hours > 6:
+        if age_hours > 18:
+            logger.warning(
+                f"  ⚠️ convergence data is {age_hours:.1f}h old (>18h) — "
+                f"STALE, falling back to processed puts pipeline"
+            )
+            return get_top_puts(top_n)
+        elif age_hours > 6:
             logger.warning(
                 f"  ⚠️ convergence data is {age_hours:.1f}h old — "
-                f"using anyway (PutsEngine may not have scanned recently)"
+                f"using with caution (PutsEngine may not have scanned recently)"
             )
 
         results = []

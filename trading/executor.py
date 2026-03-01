@@ -734,6 +734,34 @@ def check_and_manage_positions(db: TradeDB = None, client: AlpacaClient = None) 
         if not occ or entry_px <= 0:
             continue
 
+        # ── Already expired: mark closed in DB (no Alpaca call needed) ──
+        if expiry_str:
+            try:
+                exp_date = date.fromisoformat(expiry_str)
+                if exp_date < today:
+                    contracts = int(trade.get("contracts", 5))
+                    pnl_expired = -entry_px * contracts * 100  # Full loss of premium
+                    db.update_trade(
+                        trade["trade_id"],
+                        status="closed",
+                        exit_price=0.0,
+                        exit_reason="expired",
+                        pnl=round(pnl_expired, 2),
+                        pnl_pct=-100.0,
+                        closed_at=datetime.utcnow().isoformat(),
+                    )
+                    result["closed"] += 1
+                    result["details"].append({
+                        "symbol": trade["symbol"],
+                        "reason": "expired",
+                        "pnl": round(pnl_expired, 2),
+                    })
+                    logger.info(f"  ⏰ EXPIRED (past expiry): {trade['symbol']} ({occ}) "
+                                f"expiry {expiry_str} — marked closed in DB")
+                    continue
+            except ValueError:
+                pass
+
         # Get current price from Alpaca position
         pos = live_positions.get(occ, {})
         current_px = float(pos.get("current_price", 0) or 0)

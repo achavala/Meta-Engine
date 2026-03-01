@@ -228,6 +228,17 @@ def alert_api_key_missing(key_name: str):
     )
 
 
+def alert_empty_picks(session_label: str, calls_count: int, puts_count: int):
+    """Alert when engines return zero candidates for a scan session."""
+    send_health_alert(
+        AlertLevel.WARNING,
+        f"empty_picks_{session_label.lower()}",
+        f"EMPTY PICKS: {session_label} scan returned {calls_count} calls, {puts_count} puts",
+        "Both engines returned no candidates. Check data sources, API keys, "
+        "and engine health. The X/Telegram posts may contain empty data.",
+    )
+
+
 def check_api_keys_and_alert():
     """
     Validate that all critical API keys are present and alert on any missing ones.

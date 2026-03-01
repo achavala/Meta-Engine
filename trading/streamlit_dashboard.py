@@ -94,6 +94,19 @@ def get_all_trades():
         return pd.DataFrame()
 
 
+def get_all_trades_fresh():
+    """Read trade history directly from SQLite (no cache). Use in Trade History tab so updates appear immediately."""
+    conn = get_db_conn()
+    if not conn:
+        return pd.DataFrame()
+    try:
+        df = pd.read_sql("SELECT * FROM trades ORDER BY created_at DESC", conn)
+        conn.close()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
 @st.cache_data(ttl=10)
 def get_open_trades():
     conn = get_db_conn()
@@ -800,8 +813,18 @@ with tabs[1]:
 
 # ─────────────────────────────────────────────────────
 #  TAB 3: Trade History  (Persistent P&L Dashboard)
+#  Uses get_all_trades_fresh() (no cache) + fragment run_every=300 so
+#  trade history updates on every interaction and auto-refreshes every 5 min.
 # ─────────────────────────────────────────────────────
-with tabs[2]:
+try:
+    _th_fragment = st.fragment(run_every=300)  # Streamlit 1.37+
+except (TypeError, AttributeError):
+    def _th_fragment(f):
+        return f  # Older Streamlit: no auto-refresh, manual/button refresh still works
+
+
+@_th_fragment
+def _trade_history_content():
     st.markdown("# 📋 Persistent Trade History")
     st.caption("All trades stored in SQLite database — persists across restarts (last 6 months)")
 
@@ -848,7 +871,8 @@ with tabs[2]:
     range_days = range_days_map.get(time_range, 90)
     cutoff_date = (date.today() - timedelta(days=range_days)).isoformat()
 
-    all_df = get_all_trades()
+    # Fresh read from DB (no cache) so new/updated trades always show
+    all_df = get_all_trades_fresh()
 
     if all_df.empty:
         st.markdown(
@@ -1039,6 +1063,10 @@ with tabs[2]:
 
         st.dataframe(display_df, hide_index=True, width="stretch")
         st.caption(f"Showing {len(display_df)} of {len(all_df)} total trades — {time_range}")
+
+
+with tabs[2]:
+    _trade_history_content()
 
 
 # ─────────────────────────────────────────────────────

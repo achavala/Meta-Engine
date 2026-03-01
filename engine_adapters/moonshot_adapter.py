@@ -2584,10 +2584,16 @@ def get_top_moonshots_direct(top_n: int = 10) -> List[Dict[str, Any]]:
             except Exception:
                 pass
 
-        if age_hours > 6:
+        if age_hours > 18:
+            logger.warning(
+                f"  ⚠️ final_recommendations.json is {age_hours:.1f}h old (>18h) — "
+                f"STALE, falling back to processed moonshot pipeline"
+            )
+            return get_top_moonshots(top_n)
+        elif age_hours > 6:
             logger.warning(
                 f"  ⚠️ final_recommendations.json is {age_hours:.1f}h old — "
-                f"using anyway (TradeNova may not have scanned recently)"
+                f"using with caution (TradeNova may not have scanned recently)"
             )
 
         results = []
