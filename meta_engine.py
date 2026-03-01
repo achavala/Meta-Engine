@@ -890,7 +890,7 @@ def _run_pipeline(now: datetime, force: bool = False) -> Dict[str, Any]:
     try:
         from engine_adapters.x_worthy_selector import get_cross_results_for_x
         from notifications.x_poster import post_meta_to_x, post_thread
-        cross_results_for_x = get_cross_results_for_x(cross_results)
+        cross_results_for_x = get_cross_results_for_x(cross_results, gap_up_data=gap_up_data)
         x_posted = post_meta_to_x(
             summaries=summaries,
             cross_results=cross_results_for_x,
