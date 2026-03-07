@@ -136,6 +136,16 @@ class TradeDB:
         logger.debug(f"Trade DB ready at {self.db_path}")
 
     # ── Insert / Update ───────────────────────────────────
+
+    @staticmethod
+    def _sqlite_safe(val: Any, col: str) -> Any:
+        """Coerce a value to a SQLite-safe type (str, int, float, None, bytes)."""
+        if val is None or isinstance(val, (str, int, float, bytes)):
+            return val
+        if isinstance(val, (list, dict, tuple)):
+            return json.dumps(val)
+        return str(val)
+
     def insert_trade(self, trade: Dict[str, Any]) -> int:
         """Insert a new trade record. Returns row id."""
         cols = [
@@ -145,19 +155,28 @@ class TradeDB:
             "source_engine", "entry_order_id", "status",
         ]
         vals = [trade.get(c, "") for c in cols]
-        # Serialize meta_signals if it's a list
+        # Serialize meta_signals if it's a list/dict
         idx = cols.index("meta_signals")
-        if isinstance(vals[idx], list):
+        if isinstance(vals[idx], (list, dict, tuple)):
             vals[idx] = json.dumps(vals[idx])
+        # Coerce all values to SQLite-safe types
+        vals = [self._sqlite_safe(v, c) for v, c in zip(vals, cols)]
 
         placeholders = ", ".join(["?"] * len(cols))
         col_names = ", ".join(cols)
-        with self._get_conn() as conn:
-            cur = conn.execute(
-                f"INSERT INTO trades ({col_names}) VALUES ({placeholders})", vals
+        try:
+            with self._get_conn() as conn:
+                cur = conn.execute(
+                    f"INSERT INTO trades ({col_names}) VALUES ({placeholders})", vals
+                )
+                conn.commit()
+                return cur.lastrowid
+        except Exception as e:
+            logger.error(
+                f"insert_trade failed: {e} | "
+                f"types=[{', '.join(f'{c}:{type(v).__name__}' for c, v in zip(cols, vals))}]"
             )
-            conn.commit()
-            return cur.lastrowid
+            raise
 
     def update_trade(self, trade_id: str, **fields) -> None:
         """Update specific fields on a trade."""

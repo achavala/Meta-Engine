@@ -132,17 +132,42 @@ class AlpacaClient:
     ) -> Dict:
         payload: Dict[str, Any] = {
             "symbol": symbol,
-            "qty": str(qty),
+            "qty": str(int(qty)),
             "side": side,
             "type": order_type,
             "time_in_force": time_in_force,
         }
         if order_type == "limit" and limit_price is not None:
-            payload["limit_price"] = str(round(limit_price, 2))
+            payload["limit_price"] = str(round(float(limit_price), 2))
         r = requests.post(
             f"{self.base_url}/v2/orders",
             headers=self.headers, json=payload, timeout=15,
         )
+        if r.status_code >= 400:
+            body = ""
+            try:
+                body = r.text[:500]
+            except Exception:
+                pass
+            logger.error(
+                f"  Alpaca order error {r.status_code} for {symbol}: {body} | "
+                f"payload={payload}"
+            )
+            if r.status_code == 400 and order_type == "limit":
+                logger.info(f"  🔄 Retrying {symbol} as MARKET order (limit rejected)")
+                payload["type"] = "market"
+                payload.pop("limit_price", None)
+                r2 = requests.post(
+                    f"{self.base_url}/v2/orders",
+                    headers=self.headers, json=payload, timeout=15,
+                )
+                if r2.status_code >= 400:
+                    try:
+                        logger.error(f"  Market fallback also failed: {r2.status_code} {r2.text[:300]}")
+                    except Exception:
+                        pass
+                    r.raise_for_status()
+                return r2.json()
         r.raise_for_status()
         return r.json()
 
@@ -298,63 +323,67 @@ def _select_best_contract(
 # Trade execution
 # ═══════════════════════════════════════════════════════
 
-def _determine_grade(pick: Dict[str, Any]) -> Tuple[str, int]:
+def _determine_grade(pick: Dict[str, Any], force_minimum: bool = False) -> Tuple[str, int]:
     """
     Determine pick grade for position sizing based on institutional analysis.
 
     Backtest findings (Feb 9-13 week):
-      - Winners: ORM ≥ 0.70 (60%), avg 5.4 signals, base score 0.927
+      - Winners: ORM >= 0.70 (60%), avg 5.4 signals, base score 0.927
       - Losers:  ORM < 0.45, avg 2.8 signals, base score 0.856
 
     FEB 15 FIX: ORM=0.00 means "not computed" not "bad setup".
     Backtest proved 31 real winners had ORM=0 (e.g., CLF +140%, AFRM +132%).
     When ORM is missing, grade is determined by signals + base_score only.
 
-    Grade → contracts:
-      A+  (top-tier conviction)  → 5 contracts
-      A   (strong conviction)    → 5 contracts
-      B   (moderate conviction)  → 3 contracts
-      C   (low conviction)       → 0 contracts (SKIP)
+    MAR 5 FIX: Added force_minimum flag. When True (used for the #1 ranked
+    pick per direction), a minimum Grade B is guaranteed so at least 1 trade
+    fires per direction per scan. Also relaxed missing-ORM thresholds: picks
+    with 4+ signals and score >= 0.40 now qualify for B (was 0.65) — these
+    are high-signal-confluence picks that the strict score cutoff was blocking.
+
+    Grade -> contracts:
+      A+  (top-tier conviction)  -> 5 contracts
+      A   (strong conviction)    -> 5 contracts
+      B   (moderate conviction)  -> 3 contracts
+      C   (low conviction)       -> 0 contracts (SKIP)
     """
     orm = float(pick.get("_orm_score", 0) or 0)
     signals = pick.get("signals", [])
     signal_count = len(signals) if isinstance(signals, list) else 0
     base_score = float(pick.get("meta_score", pick.get("score", 0)) or 0)
-    
-    # Determine ORM status: computed (real value) vs missing/default (data gap)
-    # FEB 15 FIX: Use stored _orm_status from adapter. Fallback derivation
-    # only applies to legacy picks without the field.
+
     orm_status = pick.get("_orm_status", "computed" if orm > 0.001 else "missing")
 
     if orm_status == "computed":
-        # ORM was computed — use full 3-factor grading
-        # A+ grade: Exceptional on all metrics
         if orm >= 0.70 and signal_count >= 5 and base_score >= 0.85:
-            return "A+", CONTRACTS_PER_TRADE  # 5 contracts
+            return "A+", CONTRACTS_PER_TRADE
 
-        # A grade: Strong on most metrics
         if orm >= 0.60 and signal_count >= 3 and base_score >= 0.75:
-            return "A", CONTRACTS_PER_TRADE   # 5 contracts
+            return "A", CONTRACTS_PER_TRADE
 
-        # B grade: Meets minimum thresholds
         if orm >= 0.50 and signal_count >= 2 and base_score >= 0.65:
-            return "B", max(3, CONTRACTS_PER_TRADE - 2)  # 3 contracts
+            return "B", max(3, CONTRACTS_PER_TRADE - 2)
 
-        # C grade: Below thresholds — skip
+        if force_minimum:
+            return "B", max(2, CONTRACTS_PER_TRADE - 3)
+
         return "C", 0
     else:
-        # ORM is missing — grade by signals + base_score only (2-factor)
-        # Cannot achieve A+ without ORM confirmation, max is A
         if signal_count >= 5 and base_score >= 0.85:
-            return "A", CONTRACTS_PER_TRADE   # 5 contracts (capped at A, not A+)
+            return "A", CONTRACTS_PER_TRADE
 
         if signal_count >= 3 and base_score >= 0.75:
-            return "B", max(3, CONTRACTS_PER_TRADE - 2)  # 3 contracts
+            return "B", max(3, CONTRACTS_PER_TRADE - 2)
 
         if signal_count >= 2 and base_score >= 0.65:
-            return "B", max(3, CONTRACTS_PER_TRADE - 2)  # 3 contracts
+            return "B", max(3, CONTRACTS_PER_TRADE - 2)
 
-        # Weak on signals + score with no ORM — skip
+        if signal_count >= 4 and base_score >= 0.40:
+            return "B", max(2, CONTRACTS_PER_TRADE - 3)
+
+        if force_minimum and signal_count >= 2 and base_score >= 0.20:
+            return "B", max(2, CONTRACTS_PER_TRADE - 3)
+
         return "C", 0
 
 
@@ -364,6 +393,7 @@ def _execute_single_trade(
     session_label: str,
     db: TradeDB,
     client: AlpacaClient,
+    force_minimum: bool = False,
 ) -> Optional[str]:
     """
     Execute a single options trade for a pick.
@@ -379,14 +409,15 @@ def _execute_single_trade(
         return None
 
     # ── Grade-based position sizing ───────────────────
-    grade, contracts = _determine_grade(pick)
+    grade, contracts = _determine_grade(pick, force_minimum=force_minimum)
     pick["_grade"] = grade  # Store for upstream reporting
     if contracts == 0:
         logger.info(f"  ⚠️ {symbol}: Grade C (ORM={pick.get('_orm_score', 0):.2f}, "
                      f"signals={len(signals) if isinstance(signals, list) else 0}, "
                      f"score={score:.2f}) — SKIPPING trade")
         return None
-    logger.info(f"  📊 {symbol}: Grade {grade} → {contracts} contracts")
+    logger.info(f"  📊 {symbol}: Grade {grade} → {contracts} contracts"
+                f"{' [MIN_TRADE]' if force_minimum and grade == 'B' else ''}")
 
     # Get current stock price if not available
     if price <= 0:
@@ -443,27 +474,30 @@ def _execute_single_trade(
         )
     except Exception as e:
         logger.error(f"     ❌ Contract search failed for {symbol}: {e}")
-        # Record failed attempt
-        db.insert_trade({
-            "trade_id": trade_id, "session": session_label,
-            "scan_date": scan_date, "symbol": symbol,
-            "option_type": option_type, "underlying_price": price,
-            "meta_score": score, "meta_signals": signals,
-            "source_engine": source, "status": "cancelled",
-            "exit_reason": f"contract_search_failed: {e}",
-        })
+        try:
+            db.insert_trade({
+                "trade_id": trade_id, "session": session_label,
+                "scan_date": scan_date, "symbol": symbol,
+                "option_type": option_type, "underlying_price": float(price),
+                "meta_score": float(score), "meta_signals": signals,
+                "source_engine": str(source), "status": "cancelled",
+            })
+        except Exception:
+            pass
         return None
 
     if not contracts:
         logger.warning(f"     ⚠️ No contracts found for {symbol} {option_type.upper()}")
-        db.insert_trade({
-            "trade_id": trade_id, "session": session_label,
-            "scan_date": scan_date, "symbol": symbol,
-            "option_type": option_type, "underlying_price": price,
-            "meta_score": score, "meta_signals": signals,
-            "source_engine": source, "status": "cancelled",
-            "exit_reason": "no_contracts_found",
-        })
+        try:
+            db.insert_trade({
+                "trade_id": trade_id, "session": session_label,
+                "scan_date": scan_date, "symbol": symbol,
+                "option_type": option_type, "underlying_price": float(price),
+                "meta_score": float(score), "meta_signals": signals,
+                "source_engine": str(source), "status": "cancelled",
+            })
+        except Exception:
+            pass
         return None
 
     logger.info(f"     Found {len(contracts)} contracts")
@@ -653,17 +687,20 @@ def _execute_single_trade(
                 break
     
     # All retries exhausted or non-retryable error
-    logger.error(f"     ❌ Order failed after {MAX_ORDER_RETRIES} attempts for {symbol}: {last_error}")
-    db.insert_trade({
-        "trade_id": trade_id, "session": session_label,
-        "scan_date": scan_date, "symbol": symbol,
-        "option_symbol": occ_symbol, "option_type": option_type,
-        "strike_price": strike, "expiry_date": expiry,
-        "contracts": contracts, "entry_price": entry_price,
-        "underlying_price": price, "meta_score": score,
-        "meta_signals": signals, "source_engine": source,
-        "status": "cancelled", "exit_reason": f"order_failed_after_{MAX_ORDER_RETRIES}_retries: {last_error}",
-    })
+    logger.error(f"     ❌ Order failed after {attempt} attempt(s) for {symbol}: {last_error}")
+    try:
+        db.insert_trade({
+            "trade_id": trade_id, "session": session_label,
+            "scan_date": scan_date, "symbol": symbol,
+            "option_symbol": occ_symbol, "option_type": option_type,
+            "strike_price": float(strike), "expiry_date": str(expiry),
+            "contracts": int(contracts), "entry_price": float(entry_price),
+            "underlying_price": float(price), "meta_score": float(score),
+            "meta_signals": signals, "source_engine": str(source),
+            "status": "cancelled",
+        })
+    except Exception as db_err:
+        logger.error(f"     DB insert for cancelled trade also failed: {db_err}")
     return None
 
 
@@ -958,27 +995,47 @@ def execute_trades(
     puts_picks = cross_results.get("puts_through_moonshot", [])[:top_n_trades]
     logger.info(f"\n  🔴 Trading top {len(puts_picks)} PUT picks:")
 
+    put_traded = False
     for i, pick in enumerate(puts_picks, 1):
         logger.info(f"\n  --- PUT #{i}: {pick.get('symbol', '?')} ---")
         results["trades_attempted"] += 1
-        tid = _execute_single_trade(pick, "put", session_label, db, client)
-        if tid:
-            results["trades_placed"] += 1
-            results["trade_ids"].append(tid)
-        elif tid is None and pick.get("_grade", "") == "C":
-            results["skipped_grade_c"] += 1
+        force_min = (i == 1 and not put_traded)
+        try:
+            tid = _execute_single_trade(
+                pick, "put", session_label, db, client,
+                force_minimum=force_min,
+            )
+            if tid:
+                results["trades_placed"] += 1
+                results["trade_ids"].append(tid)
+                put_traded = True
+            elif tid is None and pick.get("_grade", "") == "C":
+                results["skipped_grade_c"] += 1
+        except Exception as e:
+            logger.error(f"  ❌ PUT #{i} {pick.get('symbol','?')} trade failed: {e}")
+            results["errors"] = results.get("errors", 0) + 1
 
     # ── Step 3: Execute new CALL trades ───────────────
     moon_picks = cross_results.get("moonshot_through_puts", [])[:top_n_trades]
     logger.info(f"\n  🟢 Trading top {len(moon_picks)} CALL picks:")
 
+    call_traded = False
     for i, pick in enumerate(moon_picks, 1):
         logger.info(f"\n  --- CALL #{i}: {pick.get('symbol', '?')} ---")
         results["trades_attempted"] += 1
-        tid = _execute_single_trade(pick, "call", session_label, db, client)
-        if tid:
-            results["trades_placed"] += 1
-            results["trade_ids"].append(tid)
+        force_min = (i == 1 and not call_traded)
+        try:
+            tid = _execute_single_trade(
+                pick, "call", session_label, db, client,
+                force_minimum=force_min,
+            )
+            if tid:
+                results["trades_placed"] += 1
+                results["trade_ids"].append(tid)
+                call_traded = True
+        except Exception as e:
+            logger.error(f"  ❌ CALL #{i} {pick.get('symbol','?')} trade failed: {e}")
+            results["errors"] = results.get("errors", 0) + 1
 
     # ── Summary ───────────────────────────────────────
     logger.info(f"\n  💰 TRADING SUMMARY ({session_label}):")
